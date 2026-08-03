@@ -39,7 +39,10 @@ class InMemoryStorage(BaseStorage):
         self.events: Dict[str, List[Dict[str, Any]]] = {}
         
     async def save_operation(self, op_id: str, data: Dict[str, Any]):
-        self.operations[op_id] = data
+        existing = self.operations.get(op_id)
+        new_data = dict(existing) if existing else {}
+        new_data.update(data)
+        self.operations[op_id] = new_data
         
     async def get_operation(self, op_id: str) -> Optional[Dict[str, Any]]:
         return self.operations.get(op_id)
@@ -76,7 +79,10 @@ class RedisStorage(BaseStorage):
         logger.info("Connected to Redis storage backend")
         
     async def save_operation(self, op_id: str, data: Dict[str, Any]):
-        await self.redis.hset("research:operations", op_id, json.dumps(data))
+        existing = await self.get_operation(op_id)
+        new_data = dict(existing) if existing else {}
+        new_data.update(data)
+        await self.redis.hset("research:operations", op_id, json.dumps(new_data))
         
     async def get_operation(self, op_id: str) -> Optional[Dict[str, Any]]:
         val = await self.redis.hget("research:operations", op_id)
