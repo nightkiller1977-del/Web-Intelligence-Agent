@@ -1,0 +1,222 @@
+openapi: 3.0.3
+info:
+  title: Web Intelligence Sidecar API
+  description: API Wrapper exposing GPT Researcher to AI Commander Control Plane
+  version: 1.0.0
+paths:
+  /health/live:
+    get:
+      summary: Liveness probe
+      description: Check if the sidecar process is alive and responsive.
+      responses:
+        '200':
+          description: Process is running
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ok
+  /health/ready:
+    get:
+      summary: Readiness probe
+      description: Probe connection status to storage backends and token configuration.
+      responses:
+        '200':
+          description: All dependencies ready
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ok
+                  gpt_researcher:
+                    type: boolean
+                  storage:
+                    type: boolean
+                  auth:
+                    type: boolean
+  /version:
+    get:
+      summary: Version information
+      responses:
+        '200':
+          description: Version metadata
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  service:
+                    type: string
+                  serviceVersion:
+                    type: string
+                  protocolVersion:
+                    type: string
+                  engine:
+                    type: object
+                    properties:
+                      name:
+                        type: string
+                      version:
+                        type: string
+  /capabilities:
+    get:
+      summary: Supported capabilities list
+      responses:
+        '200':
+          description: Capabilities metadata
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  service:
+                    type: string
+                  version:
+                    type: string
+                  protocol_version:
+                    type: string
+                  capabilities:
+                    type: object
+                    additionalProperties:
+                      type: boolean
+  /v1/research:
+    post:
+      summary: Submit a research request
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - operationId
+                - idempotencyKey
+                - attemptId
+                - query
+                - limits
+              properties:
+                operationId:
+                  type: string
+                idempotencyKey:
+                  type: string
+                attemptId:
+                  type: string
+                query:
+                  type: string
+                mode:
+                  type: string
+                  enum: [quick, standard, deep]
+                profile:
+                  type: string
+                limits:
+                  type: object
+                  required:
+                    - maximumDurationSeconds
+                    - maximumSearches
+                    - maximumPages
+                    - maximumSources
+                  properties:
+                    maximumDurationSeconds:
+                      type: integer
+                    maximumSearches:
+                      type: integer
+                    maximumPages:
+                      type: integer
+                    maximumSources:
+                      type: integer
+      responses:
+        '202':
+          description: Research operation queued successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  operationId:
+                    type: string
+                  status:
+                    type: string
+                    example: queued
+  /v1/research/{operationId}/events:
+    get:
+      summary: Subscribe to research progress events
+      parameters:
+        - name: operationId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Server-Sent Events stream of progress updates
+          content:
+            text/event-stream:
+              schema:
+                type: string
+  /v1/research/{operationId}/result:
+    get:
+      summary: Fetch finalized structured research result
+      parameters:
+        - name: operationId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Structured result payload
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  operationId:
+                    type: string
+                  status:
+                    type: string
+                  answer:
+                    type: string
+                  sources:
+                    type: array
+                    items:
+                      type: object
+                  evidence:
+                    type: array
+                    items:
+                      type: object
+                  claims:
+                    type: array
+                    items:
+                      type: object
+                  citations:
+                    type: array
+                    items:
+                      type: object
+  /v1/research/{operationId}/cancel:
+    post:
+      summary: Request active research operation cancellation
+      parameters:
+        - name: operationId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Cancellation request processed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  operationId:
+                    type: string
+                  status:
+                    type: string
+                    example: cancelled

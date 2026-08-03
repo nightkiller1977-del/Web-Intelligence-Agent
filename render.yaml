@@ -1,0 +1,33 @@
+# render.yaml blueprint configuration for Web-Intelligence-Agent
+services:
+  - type: web
+    name: web-intelligence-agent
+    env: docker
+    plan: standard
+    scaling:
+      minInstances: 1
+      maxInstances: 3
+      metricsPolicy:
+        - metric: cpu
+          threshold: 80
+    healthCheckPath: /health/live
+    numInstances: 1
+    envVars:
+      - key: STORAGE_BACKEND
+        value: redis
+      - key: REDIS_URL
+        fromService:
+          type: redis
+          name: web-intelligence-cache
+          property: connectionString
+      - key: MAX_CONCURRENT_OPS
+        value: "3"
+      - key: WEB_INTELLIGENCE_AUTH_TOKEN
+        generateValue: true
+        # Prevent auto-syncing secrets to VCS commits
+        sync: false
+
+  - type: redis
+    name: web-intelligence-cache
+    plan: free
+    ipAllowList: [] # Access restricted internally
