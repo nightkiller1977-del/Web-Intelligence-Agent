@@ -10,25 +10,25 @@ logger = logging.getLogger("web-intelligence")
 class BaseStorage:
     async def init(self):
         pass
-        
+
     async def save_operation(self, op_id: str, data: Dict[str, Any]):
         raise NotImplementedError()
-        
+
     async def get_operation(self, op_id: str) -> Optional[Dict[str, Any]]:
         raise NotImplementedError()
-        
+
     async def list_operations(self) -> Dict[str, Dict[str, Any]]:
         raise NotImplementedError()
-        
+
     async def delete_operation(self, op_id: str):
         raise NotImplementedError()
-        
+
     async def claim_lock(self, op_id: str, instance_id: str) -> bool:
         raise NotImplementedError()
-        
+
     async def push_progress_event(self, op_id: str, event: Dict[str, Any]):
         raise NotImplementedError()
-        
+
     async def get_progress_events(self, op_id: str) -> List[Dict[str, Any]]:
         raise NotImplementedError()
 
@@ -37,78 +37,104 @@ class InMemoryStorage(BaseStorage):
         self.operations: Dict[str, Dict[str, Any]] = {}
         self.locks: Dict[str, str] = {}
         self.events: Dict[str, List[Dict[str, Any]]] = {}
-        
+
     async def save_operation(self, op_id: str, data: Dict[str, Any]):
         existing = self.operations.get(op_id)
         new_data = dict(existing) if existing else {}
         new_data.update(data)
         self.operations[op_id] = new_data
-        
+
     async def get_operation(self, op_id: str) -> Optional[Dict[str, Any]]:
         return self.operations.get(op_id)
-        
+
     async def list_operations(self) -> Dict[str, Dict[str, Any]]:
         return self.operations
-        
+
     async def delete_operation(self, op_id: str):
         self.operations.pop(op_id, None)
         self.locks.pop(op_id, None)
         self.events.pop(op_id, None)
-        
+
     async def claim_lock(self, op_id: str, instance_id: str) -> bool:
         if op_id in self.locks and self.locks[op_id] != instance_id:
             return False
         self.locks[op_id] = instance_id
         return True
-        
+
     async def push_progress_event(self, op_id: str, event: Dict[str, Any]):
         if op_id not in self.events:
             self.events[op_id] = []
         self.events[op_id].append(event)
-        
+
     async def get_progress_events(self, op_id: str) -> List[Dict[str, Any]]:
         return self.events.get(op_id, [])
 
 class RedisStorage(BaseStorage):
     def __init__(self):
         self.redis = None
-        
+        self.fallback = InMemoryStorage()
+        self.degraded = False
+
     async def init(self):
-        import redis.asyncio as aioredis
-        self.redis = aioredis.from_url(settings.REDIS_URL, decode_responses=True)
-        logger.info("Connected to Redis storage backend")
-        
+        if not settings.REDIS_URL:
+            logger.warning("REDIS_URL is not configured; falling back to in-memory storage.")
+            self.degraded = True
+            return
+
+        try:
+            import redis.asyncio as aioredis
+            self.redis = aioredis.from_url(settings.REDIS_URL, decode_responses=True)
+            await self.redis.ping()
+            logger.info("Connected to Redis storage backend")
+        except Exception:
+            logger.exception("Unable to initialize Redis; falling back to in-memory storage.")
+            self.degraded = True
+
     async def save_operation(self, op_id: str, data: Dict[str, Any]):
+        if self.degraded:
+            return await self.fallback.save_operation(op_id, data)
         existing = await self.get_operation(op_id)
         new_data = dict(existing) if existing else {}
         new_data.update(data)
         await self.redis.hset("research:operations", op_id, json.dumps(new_data))
-        
+
     async def get_operation(self, op_id: str) -> Optional[Dict[str, Any]]:
+        if self.degraded:
+            return await self.fallback.get_operation(op_id)
         val = await self.redis.hget("research:operations", op_id)
         return json.loads(val) if val else None
-        
+
     async def list_operations(self) -> Dict[str, Dict[str, Any]]:
+        if self.degraded:
+            return await self.fallback.list_operations()
         vals = await self.redis.hgetall("research:operations")
         return {k: json.loads(v) for k, v in vals.items()}
-        
+
     async def delete_operation(self, op_id: str):
+        if self.degraded:
+            return await self.fallback.delete_operation(op_id)
         await self.redis.hdel("research:operations", op_id)
         await self.redis.delete(f"research:locks:{op_id}")
         await self.redis.delete(f"research:events:{op_id}")
-        
+
     async def claim_lock(self, op_id: str, instance_id: str) -> bool:
+        if self.degraded:
+            return await self.fallback.claim_lock(op_id, instance_id)
         # Atomic SET key NX EX 600 (Distributed Lock)
         lock_key = f"research:locks:{op_id}"
         success = await self.redis.set(lock_key, instance_id, nx=True, ex=600)
         return bool(success)
-        
+
     async def push_progress_event(self, op_id: str, event: Dict[str, Any]):
+        if self.degraded:
+            return await self.fallback.push_progress_event(op_id, event)
         stream_key = f"research:events:{op_id}"
         # Write to Redis Stream
         await self.redis.xadd(stream_key, {"event": json.dumps(event)}, maxlen=1000)
-        
+
     async def get_progress_events(self, op_id: str) -> List[Dict[str, Any]]:
+        if self.degraded:
+            return await self.fallback.get_progress_events(op_id)
         stream_key = f"research:events:{op_id}"
         try:
             raw_entries = await self.redis.xrange(stream_key)

@@ -2,12 +2,11 @@
 import asyncio
 import json
 import logging
-import uuid
-from fastapi import APIRouter, Header, HTTPException, Request, BackgroundTasks
+from fastapi import APIRouter, Header, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 from sse_starlette.sse import EventSourceResponse
 
-from app.config import settings
+from app.config import raw_header_credentials_allowed, settings
 from app.storage import storage
 from app.schemas import ResearchRequestInput, ResearchResultResponse, CapabilitiesInfo
 from app.cancellation import cancellation_manager
@@ -21,6 +20,14 @@ router = APIRouter()
 # Global counter to enforce process concurrency limits
 _active_ops_count = 0
 _concurrency_lock = asyncio.Lock()
+RAW_CREDENTIAL_HEADERS = ("X-LLM-Key", "X-Search-Key")
+
+def client_safe_error() -> dict:
+    return {
+        "code": "EXECUTION_ERROR",
+        "message": "Research execution failed. Check server logs for the redacted diagnostic details.",
+        "retryable": True
+    }
 
 @router.get("/health/live")
 async def health_live():
@@ -35,19 +42,21 @@ async def health_ready():
         from gpt_researcher import GPTResearcher
     except ImportError:
         gpt_researcher_ready = False
-        
+
     storage_ready = True
     try:
         # Perform a fast check on the storage backend
-        if settings.STORAGE_BACKEND == "redis":
+        if settings.STORAGE_BACKEND == "redis" and getattr(storage, "degraded", False):
+            storage_ready = False
+        elif settings.STORAGE_BACKEND == "redis":
             await storage.redis.ping()
     except Exception:
         storage_ready = False
-        
+
     auth_ready = bool(settings.AUTH_TOKEN)
-    
+
     status = "ok" if (gpt_researcher_ready and storage_ready) else "degraded"
-    
+
     return {
         "status": status,
         "gpt_researcher": gpt_researcher_ready,
@@ -87,7 +96,7 @@ async def capabilities():
 async def background_research_task(req: ResearchRequestInput, reporter: ProgressReporter, headers: dict):
     global _active_ops_count
     op_id = req.operationId
-    
+
     try:
         # Run execution loop
         result = await conduct_web_research(
@@ -99,10 +108,10 @@ async def background_research_task(req: ResearchRequestInput, reporter: Progress
             reporter=reporter,
             headers=headers
         )
-        
+
         # Save output result
         await storage.save_operation(op_id, result)
-        
+
     except asyncio.CancelledError:
         logger.warning(f"Operation {op_id} was cancelled during execution.")
         cancelled_state = {
@@ -116,42 +125,41 @@ async def background_research_task(req: ResearchRequestInput, reporter: Progress
         }
         await storage.save_operation(op_id, cancelled_state)
         await reporter.report("cancelled", "Research task cancelled.")
-        
-    except Exception as e:
-        logger.error(f"Execution failed for operation {op_id}: {e}")
+
+    except Exception:
+        logger.exception("Execution failed for operation %s", op_id)
         failed_state = {
             "operationId": op_id,
             "status": "failed",
             "mode": req.mode,
             "profile": req.profile,
-            "answer": f"An error occurred: {e}",
+            "answer": "Research execution failed.",
             "sources": [], "evidence": [], "claims": [], "citations": [], "searchesPerformed": [],
             "metrics": {"startedAt": "", "durationMs": 0, "searchesPerformed": 0, "pagesRead": 0, "sourcesConsidered": 0, "sourcesUsed": 0},
-            "error": {"code": "EXECUTION_ERROR", "message": str(e)[:500], "retryable": True}
+            "error": client_safe_error()
         }
         await storage.save_operation(op_id, failed_state)
-        await reporter.report("failed", f"Research task failed: {e}")
-        
+        await reporter.report("failed", "Research task failed. Check server logs for redacted diagnostics.")
+
     finally:
         cancellation_manager.unregister_task(op_id)
         async with _concurrency_lock:
             _active_ops_count = max(0, _active_ops_count - 1)
 
-@router.post("/v1/research")
+@router.post("/v1/research", status_code=status.HTTP_202_ACCEPTED)
 async def start_research(
     req: ResearchRequestInput,
     request: Request,
-    background_tasks: BackgroundTasks,
     idempotency_key: str = Header(None, alias="Idempotency-Key")
 ):
     global _active_ops_count
-    
+
     # 1. Enforce and reserve Concurrency slot atomically
     async with _concurrency_lock:
         if _active_ops_count >= settings.MAX_CONCURRENT_OPS:
             raise HTTPException(status_code=429, detail="Concurrency limit reached. Too many active operations.")
         _active_ops_count += 1
-            
+
     try:
         # 2. Enforce Idempotency Lookups
         lookup_key = idempotency_key or req.idempotencyKey
@@ -170,6 +178,14 @@ async def start_research(
         if query_str.lower().startswith(("http://", "https://")):
             if not is_safe_url(query_str, req.profile):
                 raise HTTPException(status_code=400, detail="SSRF Validation Error: Target query address is blocked.")
+
+        # 4. Reject raw credential headers outside local loopback mode.
+        if not raw_header_credentials_allowed():
+            if any(request.headers.get(header) for header in RAW_CREDENTIAL_HEADERS):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Raw provider credentials are accepted only in local deployment mode."
+                )
     except Exception as e:
         # Rollback reserved slot if validation fails
         async with _concurrency_lock:
@@ -177,7 +193,7 @@ async def start_research(
         raise e
 
     op_id = req.operationId
-    
+
     # Register operation shell
     await storage.save_operation(op_id, {
         "operationId": op_id,
@@ -188,20 +204,20 @@ async def start_research(
         "mode": req.mode,
         "profile": req.profile
     })
-    
+
     # Extract loopback credentials headers
     headers = {
         "X-LLM-Key": request.headers.get("X-LLM-Key", ""),
         "X-Search-Key": request.headers.get("X-Search-Key", "")
     }
-    
+
     reporter = ProgressReporter(op_id)
     await reporter.report("planning", "Request received. Research task queued.")
 
     # Spawn research execution task in background
     task = asyncio.create_task(background_research_task(req, reporter, headers))
     cancellation_manager.register_task(op_id, task)
-    
+
     return {"operationId": op_id, "status": "queued"}
 
 @router.get("/v1/research/{operation_id}/events")
@@ -215,7 +231,7 @@ async def get_research_events(operation_id: str):
                 for ev in events[last_idx:]:
                     yield {"data": json.dumps(ev)}
                 last_idx = len(events)
-                
+
             op = await storage.get_operation(operation_id)
             if op and op.get("status") in ("completed", "partial", "failed", "cancelled"):
                 # Yield any last residual events
@@ -223,9 +239,9 @@ async def get_research_events(operation_id: str):
                 for ev in events[last_idx:]:
                     yield {"data": json.dumps(ev)}
                 break
-                
+
             await asyncio.sleep(0.5)
-            
+
     return EventSourceResponse(event_generator())
 
 @router.get("/v1/research/{operation_id}/result", response_model=ResearchResultResponse)
@@ -233,7 +249,7 @@ async def get_research_result(operation_id: str):
     op = await storage.get_operation(operation_id)
     if not op:
         raise HTTPException(status_code=404, detail="Research operation not found")
-        
+
     return op
 
 @router.post("/v1/research/{operation_id}/cancel")
@@ -245,5 +261,5 @@ async def cancel_research(operation_id: str):
         if op:
             return {"operationId": operation_id, "status": op.get("status")}
         raise HTTPException(status_code=404, detail="Operation task not running or found")
-        
+
     return {"operationId": operation_id, "status": "cancelled"}

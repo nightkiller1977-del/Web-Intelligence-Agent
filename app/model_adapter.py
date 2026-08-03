@@ -3,6 +3,7 @@ import contextlib
 import os
 import contextvars
 from typing import Dict, Optional
+from app.config import raw_header_credentials_allowed
 
 # ContextVar storing a dict of request-scoped environment overrides
 request_env = contextvars.ContextVar("request_env", default=None)
@@ -49,6 +50,10 @@ class RequestEnvironmentManager:
 
     @contextlib.contextmanager
     def apply_keys(self):
+        if not raw_header_credentials_allowed():
+            yield
+            return
+
         # 1. Read loopback headers
         overrides = {}
         for header_name, env_name in self.key_map.items():

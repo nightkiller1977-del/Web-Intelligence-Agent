@@ -16,7 +16,7 @@ BLOCKED_NETWORKS = [
     ipaddress.ip_network("100.64.0.0/10"),       # Carrier-Grade NAT (RFC 6598)
     ipaddress.ip_network("224.0.0.0/4"),         # Multicast
     ipaddress.ip_network("0.0.0.0/8"),           # Current network
-    
+
     # IPv6 Ranges
     ipaddress.ip_network("::1/128"),             # Loopback
     ipaddress.ip_network("fc00::/7"),            # Unique Local Address (ULA)
@@ -47,6 +47,19 @@ PROFILE_DOMAINS = {
 def is_safe_ip(ip_str: str) -> bool:
     try:
         ip = ipaddress.ip_address(ip_str)
+        if getattr(ip, "ipv4_mapped", None):
+            ip = ip.ipv4_mapped
+
+        if (
+            ip.is_loopback
+            or ip.is_private
+            or ip.is_link_local
+            or ip.is_multicast
+            or ip.is_reserved
+            or ip.is_unspecified
+        ):
+            return False
+
         # Check against explicitly blocked networks
         for network in BLOCKED_NETWORKS:
             if ip in network:
@@ -60,10 +73,10 @@ def resolve_and_verify_host(hostname: str) -> bool:
         # Perform DNS lookup close to connection execution (mitigate DNS rebinding)
         addr_info = socket.getaddrinfo(hostname, None)
         ips = [info[4][0] for info in addr_info]
-        
+
         if not ips:
             return False
-            
+
         for ip in ips:
             # Strip IPv6 zone index if present
             clean_ip = ip.split('%')[0]
@@ -78,32 +91,32 @@ def resolve_and_verify_host(hostname: str) -> bool:
 def is_safe_url(url: str, profile: str = "general") -> bool:
     if not url:
         return False
-        
+
     try:
         parsed = urlparse(url)
         # Enforce scheme validation: block file://, gopher://, etc.
         if parsed.scheme not in ("http", "https"):
             logger.warning(f"SSRF validation blocked invalid scheme in URL: {url}")
             return False
-            
-        hostname = parsed.hostname
+
+        hostname = parsed.hostname.lower().rstrip(".") if parsed.hostname else None
         if not hostname:
             return False
-            
+
         # Enforce domain allowlist/denylist by profile
         profile_rules = PROFILE_DOMAINS.get(profile)
         if profile_rules:
             allowed = profile_rules.get("allowed", [])
             denied = profile_rules.get("denied", [])
-            
+
             # Domain suffix matching
             def match_domain(host, candidates):
                 return any(host == cand or host.endswith(f".{cand}") for cand in candidates)
-                
+
             if allowed and not match_domain(hostname, allowed):
                 logger.warning(f"Domain validation blocked host {hostname} outside allowed list for profile {profile}")
                 return False
-                
+
             if denied and match_domain(hostname, denied):
                 logger.warning(f"Domain validation blocked host {hostname} inside denied list for profile {profile}")
                 return False
