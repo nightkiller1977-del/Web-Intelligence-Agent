@@ -41,7 +41,8 @@ async def conduct_web_research(
     max_searches = limits.get("maximumSearches", 5)
     max_pages = limits.get("maximumPages", 10)
     max_sources = limits.get("maximumSources", 10)
-    max_memory = limits.get("maximumMemoryMb", 512)
+    from app.config import settings
+    max_memory = limits.get("maximumMemoryMb", settings.MAX_MEMORY_MB)
     
     # Determine gpt-researcher report types based on mode
     report_type = "research_report"
