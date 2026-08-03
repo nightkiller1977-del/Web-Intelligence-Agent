@@ -1,0 +1,73 @@
+# app/main.py
+import logging
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+
+from app.config import settings
+from app.storage import storage
+from app.api import router
+
+# Set up logging format
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+)
+logger = logging.getLogger("web-intelligence")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup: Initialize storage backend connection (e.g. Redis ping)
+    logger.info("Initializing storage backend lifecycle...")
+    await storage.init()
+    
+    yield
+    # Shutdown: Cleanups can be done here if necessary
+    logger.info("Shutting down storage backend connections...")
+
+app = FastAPI(
+    title="Web Intelligence Sidecar Service",
+    description="Python FastAPI sidecar wrapping GPT Researcher for AI Commander",
+    version="1.0.0",
+    lifespan=lifespan
+)
+
+# CORS Policy configuration (disabled by default in remote mode)
+if settings.CORS_ORIGINS:
+    origins = [o.strip() for o in settings.CORS_ORIGINS.split(",") if o.strip()]
+    logger.info(f"Applying CORS configurations for origins: {origins}")
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=origins,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+# Bearer Token Auth Middleware (Gating all operations routes)
+@app.middleware("http")
+async def verify_auth_token(request: Request, call_next):
+    # Exempt health checks and capabilities discovery from authorization checking
+    if request.url.path in ("/health/live", "/health/ready", "/capabilities", "/version"):
+        return await call_next(request)
+        
+    token = settings.AUTH_TOKEN
+    if token:
+        auth_header = request.headers.get("Authorization")
+        if not auth_header or not auth_header.startswith("Bearer "):
+            return JSONResponse(
+                status_code=401,
+                content={"detail": "Unauthorized: Missing authentication bearer token"}
+            )
+            
+        provided_token = auth_header.split(" ")[1]
+        if provided_token != token:
+            return JSONResponse(
+                status_code=401,
+                content={"detail": "Unauthorized: Invalid authentication credentials"}
+            )
+            
+    return await call_next(request)
+
+app.include_router(router)
