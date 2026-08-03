@@ -26,10 +26,18 @@ class BaseStorage:
     async def claim_lock(self, op_id: str, instance_id: str) -> bool:
         raise NotImplementedError()
 
+    async def claim_idempotency_key(self, key: str, op_id: str) -> Optional[str]:
+        """Atomically claim an idempotency key for op_id.
+        Returns None on success, or the existing op_id if already claimed."""
+        raise NotImplementedError()
+
     async def push_progress_event(self, op_id: str, event: Dict[str, Any]):
         raise NotImplementedError()
 
     async def get_progress_events(self, op_id: str) -> List[Dict[str, Any]]:
+        raise NotImplementedError()
+
+    async def mark_stale_operations(self):
         raise NotImplementedError()
 
 class InMemoryStorage(BaseStorage):
@@ -37,6 +45,7 @@ class InMemoryStorage(BaseStorage):
         self.operations: Dict[str, Dict[str, Any]] = {}
         self.locks: Dict[str, str] = {}
         self.events: Dict[str, List[Dict[str, Any]]] = {}
+        self.idempotency_keys: Dict[str, str] = {}
 
     async def save_operation(self, op_id: str, data: Dict[str, Any]):
         existing = self.operations.get(op_id)
@@ -61,6 +70,13 @@ class InMemoryStorage(BaseStorage):
         self.locks[op_id] = instance_id
         return True
 
+    async def claim_idempotency_key(self, key: str, op_id: str) -> Optional[str]:
+        existing = self.idempotency_keys.get(key)
+        if existing:
+            return existing
+        self.idempotency_keys[key] = op_id
+        return None
+
     async def push_progress_event(self, op_id: str, event: Dict[str, Any]):
         if op_id not in self.events:
             self.events[op_id] = []
@@ -68,6 +84,13 @@ class InMemoryStorage(BaseStorage):
 
     async def get_progress_events(self, op_id: str) -> List[Dict[str, Any]]:
         return self.events.get(op_id, [])
+
+    async def mark_stale_operations(self):
+        for op_id, op in list(self.operations.items()):
+            if op.get("status") in ("queued", "running"):
+                op["status"] = "failed"
+                op["error"] = {"code": "STALE_OPERATION", "message": "Operation was abandoned after a service restart.", "retryable": True}
+                logger.warning("Marked stale operation %s as failed", op_id)
 
 class RedisStorage(BaseStorage):
     def __init__(self):
@@ -120,10 +143,29 @@ class RedisStorage(BaseStorage):
     async def claim_lock(self, op_id: str, instance_id: str) -> bool:
         if self.degraded:
             return await self.fallback.claim_lock(op_id, instance_id)
-        # Atomic SET key NX EX 600 (Distributed Lock)
         lock_key = f"research:locks:{op_id}"
         success = await self.redis.set(lock_key, instance_id, nx=True, ex=600)
         return bool(success)
+
+    async def claim_idempotency_key(self, key: str, op_id: str) -> Optional[str]:
+        if self.degraded:
+            return await self.fallback.claim_idempotency_key(key, op_id)
+        idem_key = f"research:idempotency:{key}"
+        was_set = await self.redis.set(idem_key, op_id, nx=True, ex=86400)
+        if was_set:
+            return None
+        return await self.redis.get(idem_key)
+
+    async def mark_stale_operations(self):
+        if self.degraded:
+            return await self.fallback.mark_stale_operations()
+        ops = await self.list_operations()
+        for op_id, op in ops.items():
+            if op.get("status") in ("queued", "running"):
+                op["status"] = "failed"
+                op["error"] = {"code": "STALE_OPERATION", "message": "Operation was abandoned after a service restart.", "retryable": True}
+                await self.redis.hset("research:operations", op_id, json.dumps(op))
+                logger.warning("Marked stale operation %s as failed", op_id)
 
     async def push_progress_event(self, op_id: str, event: Dict[str, Any]):
         if self.degraded:

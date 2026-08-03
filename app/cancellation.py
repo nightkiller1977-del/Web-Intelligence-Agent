@@ -1,35 +1,82 @@
 # app/cancellation.py
 import asyncio
 import logging
-from typing import Dict
+from typing import Dict, Optional
 
 logger = logging.getLogger("web-intelligence")
+
+CANCEL_CHANNEL = "research:cancel"
+
 
 class CancellationManager:
     def __init__(self):
         self.active_tasks: Dict[str, asyncio.Task] = {}
+        self._redis = None
+        self._pubsub = None
+        self._listener_task: Optional[asyncio.Task] = None
+
+    async def init(self, redis_client=None):
+        if redis_client is None:
+            return
+        self._redis = redis_client
+        self._pubsub = redis_client.pubsub()
+        await self._pubsub.subscribe(CANCEL_CHANNEL)
+        self._listener_task = asyncio.create_task(self._listen())
+
+    async def _listen(self):
+        try:
+            async for msg in self._pubsub.listen():
+                if msg["type"] != "message":
+                    continue
+                op_id = msg["data"]
+                if isinstance(op_id, bytes):
+                    op_id = op_id.decode()
+                task = self.active_tasks.get(op_id)
+                if task and not task.done():
+                    logger.info("Received cross-instance cancel for operation %s", op_id)
+                    task.cancel()
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.exception("Cancellation listener died")
 
     def register_task(self, op_id: str, task: asyncio.Task):
         self.active_tasks[op_id] = task
-        logger.info(f"Registered active task for operation: {op_id}")
+        logger.info("Registered active task for operation: %s", op_id)
 
     def unregister_task(self, op_id: str):
         self.active_tasks.pop(op_id, None)
-        logger.debug(f"Unregistered task for operation: {op_id}")
+        logger.debug("Unregistered task for operation: %s", op_id)
 
     async def cancel_task(self, op_id: str) -> bool:
         task = self.active_tasks.get(op_id)
-        if not task:
-            logger.warning(f"No active task found to cancel for operation: {op_id}")
-            return False
-            
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            logger.info(f"Task successfully cancelled for operation: {op_id}")
-        
-        self.unregister_task(op_id)
-        return True
+        if task and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                logger.info("Task successfully cancelled for operation: %s", op_id)
+            self.unregister_task(op_id)
+            return True
+
+        # Task not on this instance — broadcast via Redis pub/sub
+        if self._redis:
+            logger.info("Broadcasting cancel for operation %s to other instances", op_id)
+            await self._redis.publish(CANCEL_CHANNEL, op_id)
+            return True
+
+        logger.warning("No active task found to cancel for operation: %s", op_id)
+        return False
+
+    async def shutdown(self):
+        if self._listener_task:
+            self._listener_task.cancel()
+            try:
+                await self._listener_task
+            except asyncio.CancelledError:
+                pass
+        if self._pubsub:
+            await self._pubsub.unsubscribe(CANCEL_CHANNEL)
+
 
 cancellation_manager = CancellationManager()

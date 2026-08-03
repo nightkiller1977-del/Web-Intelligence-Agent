@@ -113,4 +113,6 @@ Render deployments use the Blueprint template (`render.yaml`) and build directly
 3. Render will provision:
    - The FastAPI web service linked to `Dockerfile` with liveness checks at `/health/live`.
    - The Valkey database instance used for cluster queues.
-4. Load your OpenAI and Tavily API keys into Render's Secret Files under `/etc/secrets/api_keys.env`.
+4. Set your provider API keys (`OPENAI_API_KEY`, `TAVILY_API_KEY`) as **Environment Variables** in the Render service dashboard. These are injected directly into the container's `os.environ` at startup.
+
+> **Note on secrets flow:** In local mode the sidecar inherits API keys from the Electron control plane's `process.env`, which loads them from AI Commander's centralized SOPS-encrypted secrets store (`secrets.enc.env`). In remote mode, Render's native environment variable injection replaces that mechanism. Do not introduce a separate secrets file loader — credentials always flow through environment variables regardless of deployment mode.

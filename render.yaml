@@ -24,8 +24,13 @@ services:
         value: "3"
       - key: WEB_INTELLIGENCE_AUTH_TOKEN
         generateValue: true
-        # Prevent auto-syncing secrets to VCS commits
         sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: TAVILY_API_KEY
+        sync: false
+      - key: DEPLOYMENT_MODE
+        value: remote
 
   - type: redis
     name: web-intelligence-cache
