@@ -113,3 +113,22 @@ def is_safe_url(url: str, profile: str = "general") -> bool:
     except Exception as e:
         logger.error(f"Error during SSRF check for URL {url}: {e}")
         return False
+
+# Global process-wide SSRF Interceptor Hook
+import aiohttp
+
+_original_request = aiohttp.ClientSession._request
+
+async def patched_request(self, method, url, *args, **kwargs):
+    url_str = str(url)
+    # Perform DNS resolving and blocked ranges check
+    if not is_safe_url(url_str):
+        logger.error(f"SSRF Interceptor: Denied request to forbidden or local target address: {url_str}")
+        raise aiohttp.ClientConnectorError(
+            connection_key=None,
+            os_error=PermissionError(f"SSRF blocked connection to private or loopback target: {url_str}")
+        )
+    return await _original_request(self, method, url, *args, **kwargs)
+
+# Hook the request method globally
+aiohttp.ClientSession._request = patched_request

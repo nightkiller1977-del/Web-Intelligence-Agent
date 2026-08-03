@@ -89,17 +89,17 @@ class ErrorDetail(BaseModel):
 
 class ResearchResultResponse(BaseModel):
     operationId: str
-    status: str # completed, partial, failed, cancelled, interrupted
+    status: str # queued, running, completed, partial, failed, cancelled, interrupted
     providerId: str = "gpt-researcher"
     mode: str
     profile: str
-    answer: str
-    sources: List[ResearchSource]
-    evidence: List[ResearchEvidence]
-    claims: List[ResearchClaim]
-    citations: List[ResearchCitation]
-    searchesPerformed: List[str]
-    metrics: ResearchMetrics
+    answer: Optional[str] = None
+    sources: Optional[List[ResearchSource]] = None
+    evidence: Optional[List[ResearchEvidence]] = None
+    claims: Optional[List[ResearchClaim]] = None
+    citations: Optional[List[ResearchCitation]] = None
+    searchesPerformed: Optional[List[str]] = None
+    metrics: Optional[ResearchMetrics] = None
     degraded: Optional[bool] = False
     degradedReasons: Optional[List[str]] = None
     limitations: Optional[List[str]] = None

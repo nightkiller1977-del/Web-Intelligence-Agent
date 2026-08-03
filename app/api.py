@@ -146,27 +146,35 @@ async def start_research(
 ):
     global _active_ops_count
     
-    # 1. Enforce Concurrency Limits
+    # 1. Enforce and reserve Concurrency slot atomically
     async with _concurrency_lock:
         if _active_ops_count >= settings.MAX_CONCURRENT_OPS:
             raise HTTPException(status_code=429, detail="Concurrency limit reached. Too many active operations.")
-            
-    # 2. Enforce Idempotency Lookups
-    lookup_key = idempotency_key or req.idempotencyKey
-    if lookup_key:
-        ops = await storage.list_operations()
-        for existing_op_id, op_state in ops.items():
-            if op_state.get("idempotency_key") == lookup_key:
-                logger.info(f"Idempotency hit! Returning existing operation: {existing_op_id}")
-                return {"operationId": existing_op_id, "status": op_state.get("status")}
-
-    # 3. Secure initial query validation (check secrets, SSRF URLs if query is an explicit URL)
-    if is_safe_url(req.query, req.profile) is False and req.query.startswith(("http://", "https://")):
-        raise HTTPException(status_code=400, detail="SSRF Validation Error: Target query address is blocked.")
-        
-    # Increment active concurrency counter
-    async with _concurrency_lock:
         _active_ops_count += 1
+            
+    try:
+        # 2. Enforce Idempotency Lookups
+        lookup_key = idempotency_key or req.idempotencyKey
+        if lookup_key:
+            ops = await storage.list_operations()
+            for existing_op_id, op_state in ops.items():
+                if op_state.get("idempotency_key") == lookup_key:
+                    logger.info(f"Idempotency hit! Returning existing operation: {existing_op_id}")
+                    # Releasing reserved slot since we hit cache
+                    async with _concurrency_lock:
+                        _active_ops_count = max(0, _active_ops_count - 1)
+                    return {"operationId": existing_op_id, "status": op_state.get("status")}
+
+        # 3. Secure initial query validation (check secrets, SSRF URLs if query is an explicit URL)
+        query_str = req.query.strip()
+        if query_str.lower().startswith(("http://", "https://")):
+            if not is_safe_url(query_str, req.profile):
+                raise HTTPException(status_code=400, detail="SSRF Validation Error: Target query address is blocked.")
+    except Exception as e:
+        # Rollback reserved slot if validation fails
+        async with _concurrency_lock:
+            _active_ops_count = max(0, _active_ops_count - 1)
+        raise e
 
     op_id = req.operationId
     

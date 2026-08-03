@@ -8,6 +8,7 @@ from gpt_researcher import GPTResearcher
 from app.progress_adapter import ProgressReporter, GPTResearcherCallbackHandler
 from app.model_adapter import RequestEnvironmentManager
 from app.security import is_safe_url
+from app.config import settings
 
 logger = logging.getLogger("web-intelligence")
 
@@ -41,8 +42,7 @@ async def conduct_web_research(
     max_searches = limits.get("maximumSearches", 5)
     max_pages = limits.get("maximumPages", 10)
     max_sources = limits.get("maximumSources", 10)
-    from app.config import settings
-    max_memory = limits.get("maximumMemoryMb", settings.MAX_MEMORY_MB)
+    max_memory = limits.get("maximumMemoryMb") or settings.MAX_MEMORY_MB
     
     # Determine gpt-researcher report types based on mode
     report_type = "research_report"
@@ -78,7 +78,7 @@ async def conduct_web_research(
             while True:
                 await asyncio.sleep(1.0)
                 mem = get_memory_usage_mb()
-                if mem > 0.85 * max_memory:
+                if mem > 0.80 * max_memory:
                     logger.warning(f"Memory threshold exceeded: {mem:.1f}MB / {max_memory}MB limit. Triggering early synthesis.")
                     await reporter.report("synthesizing", f"Memory threshold exceeded ({mem:.1f}MB). Conducting early synthesis.", completed_units=80, total_units=100)
                     memory_cancelled = True
@@ -100,26 +100,39 @@ async def conduct_web_research(
             report_text = await asyncio.wait_for(run_loop(), timeout=float(max_duration))
             status = "completed"
             
-        except (asyncio.TimeoutError, asyncio.CancelledError) as e:
+        except asyncio.TimeoutError:
+            logger.warning(f"Research operation {op_id} hit duration limit of {max_duration}s. Synthesizing partial results.")
+            await reporter.report("synthesizing", "Research budget exceeded. Synthesizing partial results...")
+            try:
+                report_text = await asyncio.shield(researcher.write_report())
+                status = "partial"
+            except Exception as write_err:
+                report_text = f"Research execution timed out. Partial content could not be fully synthesized. Error: {write_err}"
+                status = "failed"
+                
+        except asyncio.CancelledError as e:
             if memory_cancelled:
                 logger.warning(f"Research operation {op_id} cancelled due to memory pressure limit.")
                 await reporter.report("synthesizing", "Memory limit exceeded. Spilling current context buffers to disk and synthesizing partial report.")
+                try:
+                    report_text = await asyncio.shield(researcher.write_report())
+                    status = "partial"
+                except Exception as write_err:
+                    report_text = f"Research execution hit memory limit. Partial content could not be fully synthesized. Error: {write_err}"
+                    status = "failed"
             else:
-                logger.warning(f"Research operation {op_id} hit duration limit or was cancelled. Synthesizing partial results.")
-                await reporter.report("synthesizing", "Research budget exceeded. Synthesizing partial results...")
-            
-            try:
-                report_text = await researcher.write_report()
-                status = "partial"
-            except Exception as write_err:
-                report_text = f"Research execution timed out or hit memory limit. Partial content could not be fully synthesized. Error: {write_err}"
-                status = "failed"
+                logger.warning(f"Research operation {op_id} explicitly cancelled by client.")
+                raise e
                 
         except Exception as e:
             logger.error(f"Error during research loop execution: {e}", exc_info=True)
             raise e
         finally:
             monitor_task.cancel()
+            try:
+                await monitor_task
+            except asyncio.CancelledError:
+                pass
 
         # Extract structured details
         # researcher.context is a text block or list of parsed segments
