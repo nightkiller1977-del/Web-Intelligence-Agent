@@ -7,22 +7,17 @@ from gpt_researcher import GPTResearcher
 
 from app.progress_adapter import ProgressReporter, GPTResearcherCallbackHandler
 from app.model_adapter import RequestEnvironmentManager
-from app.security import is_safe_url
+from app.security import is_safe_url, active_profile
 from app.config import settings
 
 logger = logging.getLogger("web-intelligence")
 
-import sys
-import resource
+import psutil
+import os
 
 def get_memory_usage_mb() -> float:
     try:
-        # ru_maxrss returns bytes on macOS, kilobytes on Linux
-        rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-        if sys.platform == 'darwin':
-            return rss / (1024 * 1024)
-        else:
-            return rss / 1024
+        return psutil.Process(os.getpid()).memory_info().rss / (1024 * 1024)
     except Exception:
         return 0.0
 
@@ -54,24 +49,36 @@ async def conduct_web_research(
     env_manager = RequestEnvironmentManager(headers)
     callbacks = GPTResearcherCallbackHandler(reporter)
 
-    # We run gpt-researcher inside the request env context
+    profile_token = active_profile.set(profile)
+    try:
+        return await _run_research(env_manager, callbacks, reporter, op_id, query, mode, profile, report_type, max_duration, max_searches, max_pages, max_sources, max_memory, headers)
+    finally:
+        active_profile.reset(profile_token)
+
+async def _run_research(env_manager, callbacks, reporter, op_id, query, mode, profile, report_type, max_duration, max_searches, max_pages, max_sources, max_memory, headers):
     with env_manager.apply_keys():
         await callbacks.on_planning("Initializing research configuration...")
 
-        # Initialize GPT Researcher
+        max_iterations = 2 if mode == "deep" else 1
+
         researcher = GPTResearcher(
             query=query,
             report_type=report_type,
-            max_iterations=2 if mode == "deep" else 1
+            max_iterations=max_iterations
         )
 
-        # Enforce budget overrides (e.g. limiting search iterations and pages)
-        researcher.cfg.max_search_results_per_query = max_searches
-        researcher.cfg.max_urls_per_query = max_pages
+        # Distribute the caller's total budget across iterations so the
+        # aggregate stays within the requested maximumSearches / maximumPages.
+        per_iter_searches = max(1, max_searches // max_iterations)
+        per_iter_pages = max(1, max_pages // max_iterations)
+        researcher.cfg.max_search_results_per_query = per_iter_searches
+        researcher.cfg.max_urls_per_query = per_iter_pages
 
-        # Setup memory monitoring task
+        SYNTHESIS_TIMEOUT = min(30, max_duration * 0.25)
+
         research_task = asyncio.current_task()
         memory_cancelled = False
+        client_cancel_event = asyncio.Event()
 
         async def monitor_memory():
             nonlocal memory_cancelled
@@ -79,7 +86,7 @@ async def conduct_web_research(
                 await asyncio.sleep(1.0)
                 mem = get_memory_usage_mb()
                 if mem > 0.80 * max_memory:
-                    logger.warning(f"Memory threshold exceeded: {mem:.1f}MB / {max_memory}MB limit. Triggering early synthesis.")
+                    logger.warning("Memory threshold exceeded: %.1fMB / %dMB limit. Triggering early synthesis.", mem, max_memory)
                     await reporter.report("synthesizing", f"Memory threshold exceeded ({mem:.1f}MB). Conducting early synthesis.", completed_units=80, total_units=100)
                     memory_cancelled = True
                     research_task.cancel()
@@ -87,7 +94,23 @@ async def conduct_web_research(
 
         monitor_task = asyncio.create_task(monitor_memory())
 
-        # Run execution with timeout and memory checks
+        async def bounded_synthesis(reason: str) -> tuple:
+            """Run write_report with a hard time cap. Returns (report_text, status)."""
+            try:
+                text = await asyncio.wait_for(researcher.write_report(), timeout=SYNTHESIS_TIMEOUT)
+                return text, "partial"
+            except asyncio.TimeoutError:
+                logger.warning("Partial synthesis timed out after %ss for operation %s (%s)", SYNTHESIS_TIMEOUT, op_id, reason)
+                return f"Research execution hit {reason}. Partial content could not be fully synthesized within the deadline.", "failed"
+            except asyncio.CancelledError:
+                if client_cancel_event.is_set():
+                    raise
+                logger.warning("Partial synthesis cancelled for operation %s (%s)", op_id, reason)
+                return f"Research execution hit {reason}. Synthesis was interrupted.", "failed"
+            except Exception:
+                logger.warning("Partial synthesis failed for operation %s (%s)", op_id, reason, exc_info=True)
+                return f"Research execution hit {reason}. Partial content could not be fully synthesized.", "failed"
+
         try:
             await callbacks.on_planning(f"Starting research loop (budget: {max_duration}s)...")
 
@@ -96,39 +119,27 @@ async def conduct_web_research(
                 report = await researcher.write_report()
                 return report
 
-            # Run researcher with dynamic budget timeout
             report_text = await asyncio.wait_for(run_loop(), timeout=float(max_duration))
             status = "completed"
 
         except asyncio.TimeoutError:
-            logger.warning(f"Research operation {op_id} hit duration limit of {max_duration}s. Synthesizing partial results.")
+            logger.warning("Research operation %s hit duration limit of %ss. Synthesizing partial results.", op_id, max_duration)
             await reporter.report("synthesizing", "Research budget exceeded. Synthesizing partial results...")
-            try:
-                report_text = await asyncio.shield(researcher.write_report())
-                status = "partial"
-            except Exception as write_err:
-                logger.warning("Partial synthesis failed after timeout for operation %s", op_id, exc_info=True)
-                report_text = "Research execution timed out. Partial content could not be fully synthesized."
-                status = "failed"
+            report_text, status = await bounded_synthesis("duration limit")
 
-        except asyncio.CancelledError as e:
+        except asyncio.CancelledError:
             if memory_cancelled:
-                logger.warning(f"Research operation {op_id} cancelled due to memory pressure limit.")
-                await reporter.report("synthesizing", "Memory limit exceeded. Spilling current context buffers to disk and synthesizing partial report.")
-                try:
-                    report_text = await asyncio.shield(researcher.write_report())
-                    status = "partial"
-                except Exception as write_err:
-                    logger.warning("Partial synthesis failed after memory pressure for operation %s", op_id, exc_info=True)
-                    report_text = "Research execution hit the memory limit. Partial content could not be fully synthesized."
-                    status = "failed"
+                logger.warning("Research operation %s cancelled due to memory pressure limit.", op_id)
+                await reporter.report("synthesizing", "Memory limit exceeded. Synthesizing partial report.")
+                report_text, status = await bounded_synthesis("memory pressure")
             else:
-                logger.warning(f"Research operation {op_id} explicitly cancelled by client.")
-                raise e
+                client_cancel_event.set()
+                logger.warning("Research operation %s explicitly cancelled by client.", op_id)
+                raise
 
         except Exception as e:
-            logger.error(f"Error during research loop execution: {e}", exc_info=True)
-            raise e
+            logger.error("Error during research loop execution: %s", e, exc_info=True)
+            raise
         finally:
             monitor_task.cancel()
             try:

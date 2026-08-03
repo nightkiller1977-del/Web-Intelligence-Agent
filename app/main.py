@@ -8,6 +8,7 @@ from fastapi.responses import JSONResponse
 
 from app.config import auth_is_configured, settings
 from app.storage import storage
+from app.cancellation import cancellation_manager
 from app.api import router
 
 # Set up logging format
@@ -19,12 +20,20 @@ logger = logging.getLogger("web-intelligence")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup: Initialize storage backend connection (e.g. Redis ping)
     logger.info("Initializing storage backend lifecycle...")
     await storage.init()
 
+    # Mark any operations left in queued/running state from a prior crash as failed
+    await storage.mark_stale_operations()
+
+    # Wire up cross-instance cancel pub/sub if Redis is available
+    redis_client = getattr(storage, "redis", None)
+    if redis_client and not getattr(storage, "degraded", False):
+        await cancellation_manager.init(redis_client)
+
     yield
-    # Shutdown: Cleanups can be done here if necessary
+
+    await cancellation_manager.shutdown()
     logger.info("Shutting down storage backend connections...")
 
 app = FastAPI(

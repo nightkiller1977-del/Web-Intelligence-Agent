@@ -161,17 +161,16 @@ async def start_research(
         _active_ops_count += 1
 
     try:
-        # 2. Enforce Idempotency Lookups
+        # 2. Atomic idempotency check-and-reserve
         lookup_key = idempotency_key or req.idempotencyKey
         if lookup_key:
-            ops = await storage.list_operations()
-            for existing_op_id, op_state in ops.items():
-                if op_state.get("idempotency_key") == lookup_key:
-                    logger.info(f"Idempotency hit! Returning existing operation: {existing_op_id}")
-                    # Releasing reserved slot since we hit cache
-                    async with _concurrency_lock:
-                        _active_ops_count = max(0, _active_ops_count - 1)
-                    return {"operationId": existing_op_id, "status": op_state.get("status")}
+            existing_op_id = await storage.claim_idempotency_key(lookup_key, req.operationId)
+            if existing_op_id:
+                logger.info("Idempotency hit for key %s, returning existing operation: %s", lookup_key, existing_op_id)
+                async with _concurrency_lock:
+                    _active_ops_count = max(0, _active_ops_count - 1)
+                op_state = await storage.get_operation(existing_op_id)
+                return {"operationId": existing_op_id, "status": op_state.get("status") if op_state else "unknown"}
 
         # 3. Secure initial query validation (check secrets, SSRF URLs if query is an explicit URL)
         query_str = req.query.strip()
