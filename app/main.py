@@ -1,11 +1,12 @@
 # app/main.py
 import logging
+import secrets
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from app.config import settings
+from app.config import auth_is_configured, settings
 from app.storage import storage
 from app.api import router
 
@@ -21,7 +22,7 @@ async def lifespan(app: FastAPI):
     # Startup: Initialize storage backend connection (e.g. Redis ping)
     logger.info("Initializing storage backend lifecycle...")
     await storage.init()
-    
+
     yield
     # Shutdown: Cleanups can be done here if necessary
     logger.info("Shutting down storage backend connections...")
@@ -51,23 +52,29 @@ async def verify_auth_token(request: Request, call_next):
     # Exempt health checks and capabilities discovery from authorization checking
     if request.url.path in ("/health/live", "/health/ready", "/capabilities", "/version"):
         return await call_next(request)
-        
+
     token = settings.AUTH_TOKEN
-    if token:
-        auth_header = request.headers.get("Authorization")
-        if not auth_header or not auth_header.startswith("Bearer "):
-            return JSONResponse(
-                status_code=401,
-                content={"detail": "Unauthorized: Missing authentication bearer token"}
-            )
-            
-        provided_token = auth_header.split(" ")[1]
-        if provided_token != token:
-            return JSONResponse(
-                status_code=401,
-                content={"detail": "Unauthorized: Invalid authentication credentials"}
-            )
-            
+    if not auth_is_configured():
+        logger.error("Authentication token is not configured; refusing protected request.")
+        return JSONResponse(
+            status_code=503,
+            content={"detail": "Service authentication is not configured"}
+        )
+
+    auth_header = request.headers.get("Authorization")
+    if not auth_header or not auth_header.startswith("Bearer "):
+        return JSONResponse(
+            status_code=401,
+            content={"detail": "Unauthorized: Missing authentication bearer token"}
+        )
+
+    provided_token = auth_header.removeprefix("Bearer ").strip()
+    if not secrets.compare_digest(provided_token, token):
+        return JSONResponse(
+            status_code=401,
+            content={"detail": "Unauthorized: Invalid authentication credentials"}
+        )
+
     return await call_next(request)
 
 app.include_router(router)

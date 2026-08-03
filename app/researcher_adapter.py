@@ -36,14 +36,14 @@ async def conduct_web_research(
     headers: Dict[str, str]
 ) -> Dict[str, Any]:
     start_time = time.time()
-    
+
     # Resolve budget parameters
     max_duration = limits.get("maximumDurationSeconds", 60)
     max_searches = limits.get("maximumSearches", 5)
     max_pages = limits.get("maximumPages", 10)
     max_sources = limits.get("maximumSources", 10)
     max_memory = limits.get("maximumMemoryMb") or settings.MAX_MEMORY_MB
-    
+
     # Determine gpt-researcher report types based on mode
     report_type = "research_report"
     if mode == "quick":
@@ -53,22 +53,22 @@ async def conduct_web_research(
 
     env_manager = RequestEnvironmentManager(headers)
     callbacks = GPTResearcherCallbackHandler(reporter)
-    
+
     # We run gpt-researcher inside the request env context
     with env_manager.apply_keys():
         await callbacks.on_planning("Initializing research configuration...")
-        
+
         # Initialize GPT Researcher
         researcher = GPTResearcher(
             query=query,
             report_type=report_type,
             max_iterations=2 if mode == "deep" else 1
         )
-        
+
         # Enforce budget overrides (e.g. limiting search iterations and pages)
         researcher.cfg.max_search_results_per_query = max_searches
         researcher.cfg.max_urls_per_query = max_pages
-        
+
         # Setup memory monitoring task
         research_task = asyncio.current_task()
         memory_cancelled = False
@@ -90,16 +90,16 @@ async def conduct_web_research(
         # Run execution with timeout and memory checks
         try:
             await callbacks.on_planning(f"Starting research loop (budget: {max_duration}s)...")
-            
+
             async def run_loop():
                 await researcher.conduct_research()
                 report = await researcher.write_report()
                 return report
-                
+
             # Run researcher with dynamic budget timeout
             report_text = await asyncio.wait_for(run_loop(), timeout=float(max_duration))
             status = "completed"
-            
+
         except asyncio.TimeoutError:
             logger.warning(f"Research operation {op_id} hit duration limit of {max_duration}s. Synthesizing partial results.")
             await reporter.report("synthesizing", "Research budget exceeded. Synthesizing partial results...")
@@ -107,9 +107,10 @@ async def conduct_web_research(
                 report_text = await asyncio.shield(researcher.write_report())
                 status = "partial"
             except Exception as write_err:
-                report_text = f"Research execution timed out. Partial content could not be fully synthesized. Error: {write_err}"
+                logger.warning("Partial synthesis failed after timeout for operation %s", op_id, exc_info=True)
+                report_text = "Research execution timed out. Partial content could not be fully synthesized."
                 status = "failed"
-                
+
         except asyncio.CancelledError as e:
             if memory_cancelled:
                 logger.warning(f"Research operation {op_id} cancelled due to memory pressure limit.")
@@ -118,12 +119,13 @@ async def conduct_web_research(
                     report_text = await asyncio.shield(researcher.write_report())
                     status = "partial"
                 except Exception as write_err:
-                    report_text = f"Research execution hit memory limit. Partial content could not be fully synthesized. Error: {write_err}"
+                    logger.warning("Partial synthesis failed after memory pressure for operation %s", op_id, exc_info=True)
+                    report_text = "Research execution hit the memory limit. Partial content could not be fully synthesized."
                     status = "failed"
             else:
                 logger.warning(f"Research operation {op_id} explicitly cancelled by client.")
                 raise e
-                
+
         except Exception as e:
             logger.error(f"Error during research loop execution: {e}", exc_info=True)
             raise e
@@ -134,15 +136,21 @@ async def conduct_web_research(
             except asyncio.CancelledError:
                 pass
 
-        # Extract structured details
-        # researcher.context is a text block or list of parsed segments
+        # Extract structured details. GPT Researcher exposes URLs reliably across
+        # versions, but evidence passages are not guaranteed through a stable API.
         raw_sources = researcher.get_source_urls()
-        
+        search_results = []
+        if hasattr(researcher, "get_search_results"):
+            try:
+                search_results = researcher.get_search_results() or []
+            except Exception:
+                logger.debug("Unable to read GPT Researcher search results", exc_info=True)
+
         sources = []
         evidence = []
         claims = []
         citations = []
-        
+
         # Verify SSRF on each retrieved source before presenting in final result
         safe_sources = []
         for i, url in enumerate(raw_sources):
@@ -163,39 +171,14 @@ async def conduct_web_research(
                 "retrievedAt": int(time.time() * 1000),
                 "sourceType": "web"
             })
-            
-            # Extract sample passage evidence
-            evidence_id = f"ev-{op_id}-{idx}"
-            evidence.append({
-                "id": evidence_id,
-                "sourceId": source_id,
-                "passage": f"Evidence passage retrieved from {url}"
-            })
-            
-            # Ground simple claims linked to evidence
-            claim_id = f"clm-{op_id}-{idx}"
-            claims.append({
-                "id": claim_id,
-                "text": f"Information claim verified from source {idx + 1}",
-                "evidenceIds": [evidence_id],
-                "confidence": 0.9 if status == "completed" else 0.6,
-                "verificationStatus": "supported" if status == "completed" else "inferred"
-            })
-            
-            citations.append({
-                "id": f"cit-{op_id}-{idx}",
-                "sourceId": source_id,
-                "evidenceIds": [evidence_id],
-                "claimIds": [claim_id]
-            })
 
         duration_ms = int((time.time() - start_time) * 1000)
-        
+
         metrics = {
             "startedAt": datetime_from_timestamp(start_time),
             "completedAt": datetime_from_timestamp(time.time()),
             "durationMs": duration_ms,
-            "searchesPerformed": len(researcher.get_search_results()),
+            "searchesPerformed": len(search_results),
             "pagesRead": len(raw_sources),
             "sourcesConsidered": len(raw_sources),
             "sourcesUsed": len(safe_sources)
@@ -211,8 +194,11 @@ async def conduct_web_research(
             "evidence": evidence,
             "claims": claims,
             "citations": citations,
-            "searchesPerformed": [res.get("query", "") for res in researcher.get_search_results()],
-            "metrics": metrics
+            "searchesPerformed": [res.get("query", "") for res in search_results if isinstance(res, dict)],
+            "metrics": metrics,
+            "limitations": [
+                "Structured evidence and claim verification were not emitted because the current GPT Researcher adapter exposes source URLs but not stable passage-level evidence."
+            ]
         }
 
 def datetime_from_timestamp(ts: float) -> str:
