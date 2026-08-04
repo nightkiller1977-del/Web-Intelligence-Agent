@@ -88,6 +88,13 @@ paths:
   /v1/research:
     post:
       summary: Submit a research request
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: false
+          schema:
+            type: string
+          description: Deterministic idempotency key. Required when idempotencyKey is omitted from the JSON body.
       requestBody:
         required: true
         content:
@@ -96,7 +103,6 @@ paths:
               type: object
               required:
                 - operationId
-                - idempotencyKey
                 - attemptId
                 - query
                 - limits
@@ -105,6 +111,7 @@ paths:
                   type: string
                 idempotencyKey:
                   type: string
+                  description: Deterministic idempotency key. Optional when the Idempotency-Key header is provided.
                 attemptId:
                   type: string
                 query:

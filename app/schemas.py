@@ -21,7 +21,7 @@ class RepositoryInput(BaseModel):
 
 class ResearchRequestInput(BaseModel):
     operationId: str = Field(..., description="Unique operation identifier")
-    idempotencyKey: str = Field(..., description="Deterministic key to prevent duplicate runs")
+    idempotencyKey: Optional[str] = Field(None, description="Deterministic key to prevent duplicate runs")
     attemptId: str = Field(..., description="UUID for retry attempts")
     query: str = Field(..., description="The user query or research topic")
     mode: str = Field("standard", description="Research mode: quick, standard, deep")
