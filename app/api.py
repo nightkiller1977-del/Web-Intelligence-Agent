@@ -13,6 +13,7 @@ from app.cancellation import cancellation_manager
 from app.progress_adapter import ProgressReporter
 from app.researcher_adapter import conduct_web_research
 from app.security import is_safe_url
+from app.metrics import research_duration, sources_fetched
 
 logger = logging.getLogger("web-intelligence")
 router = APIRouter()
@@ -26,6 +27,11 @@ UNSUPPORTED_MODEL_LIMIT_FIELDS = (
     "maximumModelTokens",
     "maximumModelCostUsd",
 )
+UNSUPPORTED_MODEL_PREFERENCE_FIELDS = (
+    "model_provider",
+    "model_name",
+)
+TERMINAL_STATUSES = ("completed", "partial", "failed", "cancelled")
 
 def client_safe_error() -> dict:
     return {
@@ -39,6 +45,13 @@ def unsupported_model_limit_fields(limits) -> list[str]:
         field
         for field in UNSUPPORTED_MODEL_LIMIT_FIELDS
         if getattr(limits, field, None) is not None
+    ]
+
+def unsupported_model_preference_fields(req: ResearchRequestInput) -> list[str]:
+    return [
+        field
+        for field in UNSUPPORTED_MODEL_PREFERENCE_FIELDS
+        if getattr(req, field, None) is not None
     ]
 
 @router.get("/health/live")
@@ -101,7 +114,9 @@ async def capabilities():
             "deep_research": True,
             "cancellations": True,
             "citations": True,
-            "ssrf_egress_blocking": True
+            "ssrf_egress_blocking": False,
+            "ssrf_url_query_validation": True,
+            "ssrf_source_result_redaction": True
         }
     }
 
@@ -123,6 +138,12 @@ async def background_research_task(req: ResearchRequestInput, reporter: Progress
 
         # Save output result
         await storage.save_operation(op_id, result)
+        metrics = result.get("metrics") or {}
+        research_duration.labels(
+            agent_profile=req.profile,
+            mode=req.mode
+        ).observe(metrics.get("durationMs", 0))
+        sources_fetched.labels(agent_profile=req.profile).observe(metrics.get("sourcesConsidered", 0))
 
     except asyncio.CancelledError:
         logger.warning(f"Operation {op_id} was cancelled during execution.")
@@ -166,22 +187,23 @@ async def start_research(
 ):
     global _active_ops_count
 
-    # 1. Enforce and reserve Concurrency slot atomically
-    async with _concurrency_lock:
-        if _active_ops_count >= settings.MAX_CONCURRENT_OPS:
-            raise HTTPException(status_code=429, detail="Concurrency limit reached. Too many active operations.")
-        _active_ops_count += 1
-
     lookup_key = idempotency_key or req.idempotencyKey
+    if not lookup_key:
+        raise HTTPException(
+            status_code=400,
+            detail="Idempotency-Key header or idempotencyKey body field is required."
+        )
+
     claimed_lookup_key = None
+    slot_reserved = False
     try:
-        # 2. Secure initial query validation (check secrets, SSRF URLs if query is an explicit URL)
+        # 1. Secure initial query validation (check secrets, SSRF URLs if query is an explicit URL)
         query_str = req.query.strip()
         if query_str.lower().startswith(("http://", "https://")):
             if not is_safe_url(query_str, req.profile):
                 raise HTTPException(status_code=400, detail="SSRF Validation Error: Target query address is blocked.")
 
-        # 3. Reject raw credential headers outside local loopback mode.
+        # 2. Reject raw credential headers outside local loopback mode.
         if not raw_header_credentials_allowed():
             if any(request.headers.get(header) for header in RAW_CREDENTIAL_HEADERS):
                 raise HTTPException(
@@ -200,22 +222,38 @@ async def start_research(
                 )
             )
 
-        # 4. Atomic idempotency check-and-reserve after request validation.
-        if lookup_key:
-            existing_op_id = await storage.claim_idempotency_key(lookup_key, req.operationId)
-            if existing_op_id:
-                logger.info("Idempotency hit for key %s, returning existing operation: %s", lookup_key, existing_op_id)
-                async with _concurrency_lock:
-                    _active_ops_count = max(0, _active_ops_count - 1)
-                op_state = await storage.get_operation(existing_op_id)
-                return {"operationId": existing_op_id, "status": op_state.get("status") if op_state else "unknown"}
-            claimed_lookup_key = lookup_key
+        unsupported_preferences = unsupported_model_preference_fields(req)
+        if unsupported_preferences:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Unsupported model preference fields: "
+                    f"{', '.join(unsupported_preferences)}. "
+                    "Configure model/provider defaults through deployment environment variables."
+                )
+            )
+
+        # 3. Atomic idempotency check-and-reserve before new-work concurrency limiting.
+        existing_op_id = await storage.claim_idempotency_key(lookup_key, req.operationId)
+        if existing_op_id:
+            logger.info("Idempotency hit for key %s, returning existing operation: %s", lookup_key, existing_op_id)
+            op_state = await storage.get_operation(existing_op_id)
+            return {"operationId": existing_op_id, "status": op_state.get("status") if op_state else "unknown"}
+        claimed_lookup_key = lookup_key
+
+        # 4. Enforce and reserve a concurrency slot only for new operations.
+        async with _concurrency_lock:
+            if _active_ops_count >= settings.MAX_CONCURRENT_OPS:
+                raise HTTPException(status_code=429, detail="Concurrency limit reached. Too many active operations.")
+            _active_ops_count += 1
+            slot_reserved = True
     except Exception as e:
         # Rollback reserved slot if validation fails
         if claimed_lookup_key:
             await storage.release_idempotency_key(claimed_lookup_key, req.operationId)
-        async with _concurrency_lock:
-            _active_ops_count = max(0, _active_ops_count - 1)
+        if slot_reserved:
+            async with _concurrency_lock:
+                _active_ops_count = max(0, _active_ops_count - 1)
         raise e
 
     op_id = req.operationId
@@ -250,8 +288,9 @@ async def start_research(
         if not task_started:
             if claimed_lookup_key:
                 await storage.release_idempotency_key(claimed_lookup_key, req.operationId)
-            async with _concurrency_lock:
-                _active_ops_count = max(0, _active_ops_count - 1)
+            if slot_reserved:
+                async with _concurrency_lock:
+                    _active_ops_count = max(0, _active_ops_count - 1)
         raise e
 
     return {"operationId": op_id, "status": "queued"}
@@ -259,6 +298,10 @@ async def start_research(
 @router.get("/v1/research/{operation_id}/events")
 async def get_research_events(operation_id: str):
     """Streams research progress updates as Server-Sent Events."""
+    op = await storage.get_operation(operation_id)
+    if not op:
+        raise HTTPException(status_code=404, detail="Research operation not found")
+
     async def event_generator():
         last_idx = 0
         while True:
@@ -269,7 +312,7 @@ async def get_research_events(operation_id: str):
                 last_idx = len(events)
 
             op = await storage.get_operation(operation_id)
-            if op and op.get("status") in ("completed", "partial", "failed", "cancelled"):
+            if op and op.get("status") in TERMINAL_STATUSES:
                 # Yield any last residual events
                 events = await storage.get_progress_events(operation_id)
                 for ev in events[last_idx:]:
@@ -285,6 +328,21 @@ async def get_research_result(operation_id: str):
     op = await storage.get_operation(operation_id)
     if not op:
         raise HTTPException(status_code=404, detail="Research operation not found")
+
+    if op.get("status") not in TERMINAL_STATUSES:
+        return {
+            "operationId": operation_id,
+            "status": op.get("status", "queued"),
+            "mode": op.get("mode", "standard"),
+            "profile": op.get("profile", "general"),
+            "answer": None,
+            "sources": [],
+            "evidence": [],
+            "claims": [],
+            "citations": [],
+            "searchesPerformed": [],
+            "metrics": None
+        }
 
     return op
 

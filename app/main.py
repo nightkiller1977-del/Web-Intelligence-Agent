@@ -4,7 +4,8 @@ import secrets
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
 from app.config import auth_is_configured, settings
 from app.storage import storage
@@ -24,7 +25,10 @@ async def lifespan(app: FastAPI):
     await storage.init()
 
     # Mark any operations left in queued/running state from a prior crash as failed
-    await storage.mark_stale_operations()
+    if settings.STORAGE_BACKEND != "redis" or getattr(storage, "degraded", False):
+        await storage.mark_stale_operations()
+    else:
+        logger.info("Skipping global stale-operation scan for shared Redis storage.")
 
     # Wire up cross-instance cancel pub/sub if Redis is available
     redis_client = getattr(storage, "redis", None)
@@ -59,7 +63,7 @@ if settings.CORS_ORIGINS:
 @app.middleware("http")
 async def verify_auth_token(request: Request, call_next):
     # Exempt health checks and capabilities discovery from authorization checking
-    if request.url.path in ("/health/live", "/health/ready", "/capabilities", "/version"):
+    if request.url.path in ("/health/live", "/health/ready", "/capabilities", "/version", "/metrics"):
         return await call_next(request)
 
     token = settings.AUTH_TOKEN
@@ -85,5 +89,9 @@ async def verify_auth_token(request: Request, call_next):
         )
 
     return await call_next(request)
+
+@app.get("/metrics")
+async def metrics():
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 app.include_router(router)

@@ -10,9 +10,9 @@ This service is designed to run in two modes:
 
 ## 1. Features
 - **Iterative Research Orchestration**: Plans and executes multi-query web searches, scrapes pages, and synthesizes answers using GPT Researcher.
-- **SSRF Hardened Egress**: Implements DNS pre-resolution checks, redirects auditing, and loops validation to block access to private IPv4/IPv6 subnets, carrier-grade NAT, and cloud metadata endpoints.
+- **SSRF Guardrails**: Validates explicit URL queries and redacts unsafe source URLs from final results to block private IPv4/IPv6 subnets, carrier-grade NAT, and cloud metadata endpoints where the sidecar controls validation.
 - **Isolate Request Keys**: Applies OpenAI and Tavily API credentials in request scopes only, preventing race conditions or process-wide leaks.
-- **Process Memory Spilling**: Monitored via a background daemon. If memory footprint exceeds 80%, fetches pause, data context spills to disk, and the sidecar synthesizes a partial response.
+- **Process Memory Guardrails**: Monitored via a background task. If memory footprint exceeds 80% of the configured limit, the sidecar stops the active research loop and attempts a bounded partial synthesis.
 - **Durable Event Streaming**: Emits live progress logs (`planning`, `searching`, `reading`, `synthesizing`, etc.) via Server-Sent Events (SSE) backed by Redis Streams in cluster mode.
 - **Task Cancellations**: Provides REST-based endpoints to abort running async loops.
 - **Prometheus Telemetry**: Counts spent token metrics (`research_cost_tokens_total`) and alerts if daily budget spend exceeds $50.
