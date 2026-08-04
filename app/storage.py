@@ -31,6 +31,11 @@ class BaseStorage:
         Returns None on success, or the existing op_id if already claimed."""
         raise NotImplementedError()
 
+    async def release_idempotency_key(self, key: str, op_id: Optional[str] = None) -> bool:
+        """Release a previously claimed idempotency key.
+        When op_id is provided, only releases keys still mapped to that operation."""
+        raise NotImplementedError()
+
     async def push_progress_event(self, op_id: str, event: Dict[str, Any]):
         raise NotImplementedError()
 
@@ -63,6 +68,9 @@ class InMemoryStorage(BaseStorage):
         self.operations.pop(op_id, None)
         self.locks.pop(op_id, None)
         self.events.pop(op_id, None)
+        for key, existing_op_id in list(self.idempotency_keys.items()):
+            if existing_op_id == op_id:
+                self.idempotency_keys.pop(key, None)
 
     async def claim_lock(self, op_id: str, instance_id: str) -> bool:
         if op_id in self.locks and self.locks[op_id] != instance_id:
@@ -76,6 +84,13 @@ class InMemoryStorage(BaseStorage):
             return existing
         self.idempotency_keys[key] = op_id
         return None
+
+    async def release_idempotency_key(self, key: str, op_id: Optional[str] = None) -> bool:
+        existing = self.idempotency_keys.get(key)
+        if not existing or (op_id is not None and existing != op_id):
+            return False
+        self.idempotency_keys.pop(key, None)
+        return True
 
     async def push_progress_event(self, op_id: str, event: Dict[str, Any]):
         if op_id not in self.events:
@@ -155,6 +170,17 @@ class RedisStorage(BaseStorage):
         if was_set:
             return None
         return await self.redis.get(idem_key)
+
+    async def release_idempotency_key(self, key: str, op_id: Optional[str] = None) -> bool:
+        if self.degraded:
+            return await self.fallback.release_idempotency_key(key, op_id)
+        idem_key = f"research:idempotency:{key}"
+        if op_id is not None:
+            existing = await self.redis.get(idem_key)
+            if existing != op_id:
+                return False
+        deleted = await self.redis.delete(idem_key)
+        return bool(deleted)
 
     async def mark_stale_operations(self):
         if self.degraded:

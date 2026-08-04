@@ -2,7 +2,7 @@
 import asyncio
 import logging
 import time
-from typing import Dict, Any, List
+from typing import Dict, Any
 from gpt_researcher import GPTResearcher
 
 from app.progress_adapter import ProgressReporter, GPTResearcherCallbackHandler
@@ -11,6 +11,11 @@ from app.security import is_safe_url, active_profile
 from app.config import settings
 
 logger = logging.getLogger("web-intelligence")
+UNSUPPORTED_MODEL_LIMIT_FIELDS = (
+    "maximumModelCalls",
+    "maximumModelTokens",
+    "maximumModelCostUsd",
+)
 
 import psutil
 import os
@@ -31,6 +36,16 @@ async def conduct_web_research(
     headers: Dict[str, str]
 ) -> Dict[str, Any]:
     start_time = time.time()
+
+    unsupported_limits = [
+        field for field in UNSUPPORTED_MODEL_LIMIT_FIELDS
+        if limits.get(field) is not None
+    ]
+    if unsupported_limits:
+        raise ValueError(
+            "Unsupported model budget limits: "
+            f"{', '.join(unsupported_limits)}"
+        )
 
     # Resolve budget parameters
     max_duration = limits.get("maximumDurationSeconds", 60)
@@ -115,8 +130,18 @@ async def _run_research(env_manager, callbacks, reporter, op_id, query, mode, pr
             await callbacks.on_planning(f"Starting research loop (budget: {max_duration}s)...")
 
             async def run_loop():
+                await callbacks.on_search(query, 1, max(1, max_searches))
                 await researcher.conduct_research()
+                raw_urls = researcher.get_source_urls() or []
+                await callbacks.on_read(
+                    raw_urls[0] if raw_urls else "",
+                    f"Retrieved {len(raw_urls)} source URL(s).",
+                    min(len(raw_urls), max_pages),
+                    max(1, max_pages)
+                )
+                await callbacks.on_synthesize("Synthesizing research report...")
                 report = await researcher.write_report()
+                await reporter.report("completed", "Research completed.", completed_units=100, total_units=100)
                 return report
 
             report_text = await asyncio.wait_for(run_loop(), timeout=float(max_duration))
@@ -149,7 +174,7 @@ async def _run_research(env_manager, callbacks, reporter, op_id, query, mode, pr
 
         # Extract structured details. GPT Researcher exposes URLs reliably across
         # versions, but evidence passages are not guaranteed through a stable API.
-        raw_sources = researcher.get_source_urls()
+        raw_sources = researcher.get_source_urls() or []
         search_results = []
         if hasattr(researcher, "get_search_results"):
             try:
