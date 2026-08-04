@@ -21,6 +21,11 @@ router = APIRouter()
 _active_ops_count = 0
 _concurrency_lock = asyncio.Lock()
 RAW_CREDENTIAL_HEADERS = ("X-LLM-Key", "X-Search-Key")
+UNSUPPORTED_MODEL_LIMIT_FIELDS = (
+    "maximumModelCalls",
+    "maximumModelTokens",
+    "maximumModelCostUsd",
+)
 
 def client_safe_error() -> dict:
     return {
@@ -28,6 +33,13 @@ def client_safe_error() -> dict:
         "message": "Research execution failed. Check server logs for the redacted diagnostic details.",
         "retryable": True
     }
+
+def unsupported_model_limit_fields(limits) -> list[str]:
+    return [
+        field
+        for field in UNSUPPORTED_MODEL_LIMIT_FIELDS
+        if getattr(limits, field, None) is not None
+    ]
 
 @router.get("/health/live")
 async def health_live():
@@ -160,9 +172,35 @@ async def start_research(
             raise HTTPException(status_code=429, detail="Concurrency limit reached. Too many active operations.")
         _active_ops_count += 1
 
+    lookup_key = idempotency_key or req.idempotencyKey
+    claimed_lookup_key = None
     try:
-        # 2. Atomic idempotency check-and-reserve
-        lookup_key = idempotency_key or req.idempotencyKey
+        # 2. Secure initial query validation (check secrets, SSRF URLs if query is an explicit URL)
+        query_str = req.query.strip()
+        if query_str.lower().startswith(("http://", "https://")):
+            if not is_safe_url(query_str, req.profile):
+                raise HTTPException(status_code=400, detail="SSRF Validation Error: Target query address is blocked.")
+
+        # 3. Reject raw credential headers outside local loopback mode.
+        if not raw_header_credentials_allowed():
+            if any(request.headers.get(header) for header in RAW_CREDENTIAL_HEADERS):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Raw provider credentials are accepted only in local deployment mode."
+                )
+
+        unsupported_limits = unsupported_model_limit_fields(req.limits)
+        if unsupported_limits:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Unsupported model budget limits: "
+                    f"{', '.join(unsupported_limits)}. "
+                    "Use duration, search, page, source, and memory limits for this adapter."
+                )
+            )
+
+        # 4. Atomic idempotency check-and-reserve after request validation.
         if lookup_key:
             existing_op_id = await storage.claim_idempotency_key(lookup_key, req.operationId)
             if existing_op_id:
@@ -171,51 +209,50 @@ async def start_research(
                     _active_ops_count = max(0, _active_ops_count - 1)
                 op_state = await storage.get_operation(existing_op_id)
                 return {"operationId": existing_op_id, "status": op_state.get("status") if op_state else "unknown"}
-
-        # 3. Secure initial query validation (check secrets, SSRF URLs if query is an explicit URL)
-        query_str = req.query.strip()
-        if query_str.lower().startswith(("http://", "https://")):
-            if not is_safe_url(query_str, req.profile):
-                raise HTTPException(status_code=400, detail="SSRF Validation Error: Target query address is blocked.")
-
-        # 4. Reject raw credential headers outside local loopback mode.
-        if not raw_header_credentials_allowed():
-            if any(request.headers.get(header) for header in RAW_CREDENTIAL_HEADERS):
-                raise HTTPException(
-                    status_code=400,
-                    detail="Raw provider credentials are accepted only in local deployment mode."
-                )
+            claimed_lookup_key = lookup_key
     except Exception as e:
         # Rollback reserved slot if validation fails
+        if claimed_lookup_key:
+            await storage.release_idempotency_key(claimed_lookup_key, req.operationId)
         async with _concurrency_lock:
             _active_ops_count = max(0, _active_ops_count - 1)
         raise e
 
     op_id = req.operationId
+    task_started = False
 
-    # Register operation shell
-    await storage.save_operation(op_id, {
-        "operationId": op_id,
-        "idempotency_key": lookup_key,
-        "attempt_id": req.attemptId,
-        "status": "queued",
-        "query": req.query,
-        "mode": req.mode,
-        "profile": req.profile
-    })
+    try:
+        # Register operation shell
+        await storage.save_operation(op_id, {
+            "operationId": op_id,
+            "idempotency_key": lookup_key,
+            "attempt_id": req.attemptId,
+            "status": "queued",
+            "query": req.query,
+            "mode": req.mode,
+            "profile": req.profile
+        })
 
-    # Extract loopback credentials headers
-    headers = {
-        "X-LLM-Key": request.headers.get("X-LLM-Key", ""),
-        "X-Search-Key": request.headers.get("X-Search-Key", "")
-    }
+        # Extract loopback credentials headers
+        headers = {
+            "X-LLM-Key": request.headers.get("X-LLM-Key", ""),
+            "X-Search-Key": request.headers.get("X-Search-Key", "")
+        }
 
-    reporter = ProgressReporter(op_id)
-    await reporter.report("planning", "Request received. Research task queued.")
+        reporter = ProgressReporter(op_id)
+        await reporter.report("planning", "Request received. Research task queued.")
 
-    # Spawn research execution task in background
-    task = asyncio.create_task(background_research_task(req, reporter, headers))
-    cancellation_manager.register_task(op_id, task)
+        # Spawn research execution task in background
+        task = asyncio.create_task(background_research_task(req, reporter, headers))
+        cancellation_manager.register_task(op_id, task)
+        task_started = True
+    except Exception as e:
+        if not task_started:
+            if claimed_lookup_key:
+                await storage.release_idempotency_key(claimed_lookup_key, req.operationId)
+            async with _concurrency_lock:
+                _active_ops_count = max(0, _active_ops_count - 1)
+        raise e
 
     return {"operationId": op_id, "status": "queued"}
 
@@ -253,7 +290,7 @@ async def get_research_result(operation_id: str):
 
 @router.post("/v1/research/{operation_id}/cancel")
 async def cancel_research(operation_id: str):
-    success = await cancellation_manager.cancel_task(operation_id)
+    success = await cancellation_manager.cancel_task(operation_id, storage.get_operation)
     if not success:
         # Check if operation was already finalized
         op = await storage.get_operation(operation_id)
