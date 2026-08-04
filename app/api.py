@@ -114,9 +114,10 @@ async def capabilities():
             "deep_research": True,
             "cancellations": True,
             "citations": True,
-            "ssrf_egress_blocking": False,
+            "ssrf_egress_blocking": True,
             "ssrf_url_query_validation": True,
-            "ssrf_source_result_redaction": True
+            "ssrf_source_result_redaction": True,
+            "ssrf_prefetch_http_guard": True
         }
     }
 

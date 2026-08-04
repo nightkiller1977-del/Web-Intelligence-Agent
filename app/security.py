@@ -1,9 +1,11 @@
 # app/security.py
 import ipaddress
+import contextlib
+import contextvars
 import logging
 import socket
+import threading
 from urllib.parse import urlparse
-from app.config import settings
 
 logger = logging.getLogger("web-intelligence")
 
@@ -127,23 +129,155 @@ def is_safe_url(url: str, profile: str = "general") -> bool:
         logger.error(f"Error during SSRF check for URL {url}: {e}")
         return False
 
-# Task-local profile for SSRF domain filtering in the interceptor
-import contextvars
-import aiohttp
+def is_safe_egress_url(url: str) -> bool:
+    if not url:
+        return False
+
+    try:
+        parsed = urlparse(url)
+        if parsed.scheme not in ("http", "https"):
+            logger.warning(f"SSRF egress validation blocked invalid scheme in URL: {url}")
+            return False
+
+        hostname = parsed.hostname.lower().rstrip(".") if parsed.hostname else None
+        if not hostname:
+            return False
+
+        return resolve_and_verify_host(hostname)
+    except Exception as e:
+        logger.error(f"Error during SSRF egress check for URL {url}: {e}")
+        return False
 
 active_profile: contextvars.ContextVar[str] = contextvars.ContextVar("active_profile", default="general")
+egress_protection_enabled: contextvars.ContextVar[bool] = contextvars.ContextVar("egress_protection_enabled", default=False)
+_protection_lock = threading.RLock()
+_protection_depth = 0
 
-_original_request = aiohttp.ClientSession._request
+def _egress_protection_active() -> bool:
+    if egress_protection_enabled.get():
+        return True
+    with _protection_lock:
+        return _protection_depth > 0
 
-async def patched_request(self, method, url, *args, **kwargs):
-    url_str = str(url)
-    profile = active_profile.get()
-    if not is_safe_url(url_str, profile):
-        logger.error("SSRF Interceptor: Denied request to %s (profile=%s)", url_str, profile)
-        raise aiohttp.ClientConnectorError(
-            connection_key=None,
-            os_error=PermissionError(f"SSRF blocked connection to private or loopback target: {url_str}")
-        )
-    return await _original_request(self, method, url, *args, **kwargs)
+def _ensure_safe_url(url: str):
+    if not _egress_protection_active():
+        return
+    if not is_safe_egress_url(str(url)):
+        logger.error("SSRF egress guard denied request to %s", url)
+        raise PermissionError(f"SSRF blocked outbound request: {url}")
 
-aiohttp.ClientSession._request = patched_request
+def _ensure_safe_host(host: str):
+    if not _egress_protection_active() or not host:
+        return
+    if not resolve_and_verify_host(str(host)):
+        logger.error("SSRF egress guard denied connection to host %s", host)
+        raise PermissionError(f"SSRF blocked outbound host: {host}")
+
+@contextlib.contextmanager
+def enforce_egress_protection(profile: str = "general"):
+    """Enable outbound URL/host validation for this research operation.
+
+    The context variable covers normal asyncio execution. The process-level
+    depth gives synchronous worker threads a conservative general-profile guard
+    when libraries move blocking fetch work out of the event loop.
+    """
+    global _protection_depth
+    profile_token = active_profile.set(profile)
+    enabled_token = egress_protection_enabled.set(True)
+    with _protection_lock:
+        _protection_depth += 1
+    try:
+        yield
+    finally:
+        with _protection_lock:
+            _protection_depth = max(0, _protection_depth - 1)
+        egress_protection_enabled.reset(enabled_token)
+        active_profile.reset(profile_token)
+
+
+try:
+    import aiohttp
+except ImportError:  # pragma: no cover - optional import during partial installs
+    aiohttp = None
+
+if aiohttp:
+    _original_aiohttp_request = aiohttp.ClientSession._request
+    _original_aiohttp_resolve_host = aiohttp.TCPConnector._resolve_host
+
+    async def patched_aiohttp_request(self, method, url, *args, **kwargs):
+        try:
+            _ensure_safe_url(str(url))
+        except PermissionError as exc:
+            raise aiohttp.ClientConnectorError(
+                connection_key=None,
+                os_error=exc
+            )
+        return await _original_aiohttp_request(self, method, url, *args, **kwargs)
+
+    async def patched_aiohttp_resolve_host(self, host, port, *args, **kwargs):
+        try:
+            _ensure_safe_host(host)
+        except PermissionError as exc:
+            raise aiohttp.ClientConnectorError(
+                connection_key=None,
+                os_error=exc
+            )
+        return await _original_aiohttp_resolve_host(self, host, port, *args, **kwargs)
+
+    aiohttp.ClientSession._request = patched_aiohttp_request
+    aiohttp.TCPConnector._resolve_host = patched_aiohttp_resolve_host
+
+
+try:
+    import requests
+except ImportError:  # pragma: no cover
+    requests = None
+
+if requests:
+    _original_requests_send = requests.sessions.Session.send
+
+    def patched_requests_send(self, request, **kwargs):
+        try:
+            _ensure_safe_url(request.url)
+        except PermissionError as exc:
+            raise requests.exceptions.ConnectionError(str(exc)) from exc
+        return _original_requests_send(self, request, **kwargs)
+
+    requests.sessions.Session.send = patched_requests_send
+
+
+try:
+    import httpx
+except ImportError:  # pragma: no cover
+    httpx = None
+
+if httpx:
+    _original_httpx_client_send = httpx.Client.send
+    _original_httpx_async_client_send = httpx.AsyncClient.send
+
+    def patched_httpx_client_send(self, request, *args, **kwargs):
+        try:
+            _ensure_safe_url(str(request.url))
+        except PermissionError as exc:
+            raise httpx.ConnectError(str(exc), request=request) from exc
+        return _original_httpx_client_send(self, request, *args, **kwargs)
+
+    async def patched_httpx_async_client_send(self, request, *args, **kwargs):
+        try:
+            _ensure_safe_url(str(request.url))
+        except PermissionError as exc:
+            raise httpx.ConnectError(str(exc), request=request) from exc
+        return await _original_httpx_async_client_send(self, request, *args, **kwargs)
+
+    httpx.Client.send = patched_httpx_client_send
+    httpx.AsyncClient.send = patched_httpx_async_client_send
+
+
+_original_socket_create_connection = socket.create_connection
+
+def patched_socket_create_connection(address, timeout=None, source_address=None, *args, **kwargs):
+    host = address[0] if isinstance(address, tuple) and address else None
+    _ensure_safe_host(host)
+    return _original_socket_create_connection(address, timeout, source_address, *args, **kwargs)
+
+socket.create_connection = patched_socket_create_connection

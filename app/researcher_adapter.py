@@ -7,7 +7,7 @@ from gpt_researcher import GPTResearcher
 
 from app.progress_adapter import ProgressReporter, GPTResearcherCallbackHandler
 from app.model_adapter import RequestEnvironmentManager
-from app.security import is_safe_url, active_profile
+from app.security import enforce_egress_protection, is_safe_url
 from app.config import settings
 
 logger = logging.getLogger("web-intelligence")
@@ -64,11 +64,8 @@ async def conduct_web_research(
     env_manager = RequestEnvironmentManager(headers)
     callbacks = GPTResearcherCallbackHandler(reporter)
 
-    profile_token = active_profile.set(profile)
-    try:
+    with enforce_egress_protection(profile):
         return await _run_research(env_manager, callbacks, reporter, op_id, query, mode, profile, report_type, max_duration, max_searches, max_pages, max_sources, max_memory, headers)
-    finally:
-        active_profile.reset(profile_token)
 
 async def _run_research(env_manager, callbacks, reporter, op_id, query, mode, profile, report_type, max_duration, max_searches, max_pages, max_sources, max_memory, headers):
     with env_manager.apply_keys():
