@@ -114,6 +114,38 @@ uvicorn app.main:app --host 127.0.0.1 --port 8080
 pytest
 ```
 
+### 5.3 Browser Testing
+
+The sidecar protects API routes with bearer-token authentication. If you open a protected route directly in a plain browser tab, the expected response is:
+
+```json
+{"detail":"Unauthorized: Missing authentication bearer token"}
+```
+
+For local browser testing, start the service with unauthenticated docs enabled:
+
+```bash
+WEB_INTELLIGENCE_AUTH_TOKEN=dev-token ALLOW_UNAUTHENTICATED_DOCS=true uvicorn app.main:app --host 127.0.0.1 --port 8081
+```
+
+Then open:
+
+- `http://127.0.0.1:8081/docs`
+- `http://127.0.0.1:8081/redoc`
+- `http://127.0.0.1:8081/openapi.json`
+
+Unauthenticated docs are only exposed when `DEPLOYMENT_MODE=local` and `ALLOW_UNAUTHENTICATED_DOCS=true`. Research, result, event, and cancel routes still require:
+
+```http
+Authorization: Bearer dev-token
+```
+
+Public local smoke-test URLs:
+
+- `http://127.0.0.1:8081/health/live`
+- `http://127.0.0.1:8081/capabilities`
+- `http://127.0.0.1:8081/metrics`
+
 ---
 
 ## 6. Remote Deployment (Render.com)
