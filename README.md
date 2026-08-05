@@ -4,7 +4,7 @@ The Web Intelligence Agent is a lightweight, production-ready Python FastAPI sid
 
 This service is designed to run in two modes:
 1. **Local Mode**: Spawned and managed locally by the Electron control plane on a dynamic loopback port with ephemeral token authentication.
-2. **Remote Mode**: Deployed as an auto-scaling, Docker-based container cluster on Render.com, backed by a Valkey/Redis instance for progress queues and distributed locking.
+2. **Remote Mode**: Deployed as an auto-scaling, Docker-based container cluster on Render.com, backed by a Valkey/Redis instance for shared operation state and progress streams.
 
 ---
 
@@ -15,7 +15,11 @@ This service is designed to run in two modes:
 - **Process Memory Guardrails**: Monitored via a background task. If memory footprint exceeds 80% of the configured limit, the sidecar stops the active research loop and attempts a bounded partial synthesis.
 - **Durable Event Streaming**: Emits live progress logs (`planning`, `searching`, `reading`, `synthesizing`, etc.) via Server-Sent Events (SSE) backed by Redis Streams in cluster mode.
 - **Task Cancellations**: Provides REST-based endpoints to abort running async loops.
-- **Prometheus Telemetry**: Counts spent token metrics (`research_cost_tokens_total`) and alerts if daily budget spend exceeds $50.
+- **Prometheus Telemetry**: Exposes research duration and fetched-source histograms.
+
+### Current Adapter Limits
+- Structured passage-level evidence, claim verification, and citation graph output are not emitted by the current GPT Researcher adapter. Responses include source URLs when GPT Researcher exposes them and include a `limitations` note explaining the missing structured fields.
+- `sourcePolicy`, model provider preferences, and model-call/token/cost budget limits are explicitly rejected. Configure provider defaults through environment variables and enforce source constraints before submitting requests.
 
 ---
 
@@ -60,7 +64,7 @@ Detailed OpenAPI documentation is available under `api/openapi.yaml`.
 ### 3.2 Operations Workflow
 - **`POST /v1/research`**: Enqueues a new query. Returns `202 Accepted` with the `operationId`. Supports idempotency key checks via `Idempotency-Key` header.
 - **`GET /v1/research/{operationId}/events`**: Server-Sent Events (SSE) stream of task progression logs.
-- **`GET /v1/research/{operationId}/result`**: Fetches the completed synthesis report, citations, claims, and evidence passages.
+- **`GET /v1/research/{operationId}/result`**: Fetches the completed synthesis report, source URLs, metrics, and adapter limitations.
 - **`POST /v1/research/{operationId}/cancel`**: Interrupts the active research task.
 
 ---
@@ -75,7 +79,6 @@ Detailed OpenAPI documentation is available under `api/openapi.yaml`.
 | `REDIS_URL` | `""` | Connection URL for Redis instances (e.g. `redis://red-xxx:6379`). |
 | `MAX_CONCURRENT_OPS` | `3` | Maximum number of concurrent research jobs allowed in the process. |
 | `MAX_MEMORY_MB` | `512` | Memory threshold limits (MB) prior to triggering early partial synthesis. |
-| `DAILY_SPEND_LIMIT_USD` | `50.0` | Alert threshold for token costs. |
 | `CORS_ORIGINS` | `""` | Comma-separated list of approved CORS domain origins. |
 
 ---
