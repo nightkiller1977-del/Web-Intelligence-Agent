@@ -80,7 +80,7 @@ async def health_ready():
 
     auth_ready = bool(settings.AUTH_TOKEN)
 
-    status = "ok" if (gpt_researcher_ready and storage_ready) else "degraded"
+    status = "ok" if (gpt_researcher_ready and storage_ready and auth_ready) else "degraded"
 
     return {
         "status": status,

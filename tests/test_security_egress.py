@@ -26,6 +26,14 @@ def test_actual_resolver_private_address_is_blocked():
             security._validate_resolved_hosts("example.test", resolved_hosts)
 
 
+def test_profile_policy_blocks_disallowed_public_hosts(monkeypatch):
+    monkeypatch.setattr(security, "resolve_and_verify_host", lambda _host: True)
+
+    with enforce_egress_protection("security"):
+        with pytest.raises(requests.exceptions.ConnectionError):
+            requests.get("https://pastebin.com/raw/example", timeout=0.1)
+
+
 def test_guard_does_not_affect_http_clients_when_disabled(monkeypatch):
     sent_urls = []
 
