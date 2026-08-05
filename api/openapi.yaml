@@ -67,7 +67,7 @@ paths:
   /capabilities:
     get:
       summary: Supported capabilities list
-      description: Capability booleans report the implemented adapter surface. Source-level citations, source policy, heuristic evidence and claim records, model budget limits, and model preferences are supported.
+      description: Capability booleans report the implemented adapter surface. Source-level citations, source policy, passage-level evidence and claim records, model budget limits, and model preferences are supported.
       responses:
         '200':
           description: Capabilities metadata
@@ -165,7 +165,7 @@ paths:
                         type: string
                 requireClaimVerification:
                   type: boolean
-                  description: Return heuristic source-linked claim verification records.
+                  description: Return source/context passage-backed claim verification records.
                 model_provider:
                   type: string
                   description: GPT Researcher LLM provider, for example openai. Must be provided with model_name.
@@ -251,7 +251,7 @@ paths:
   /v1/research/{operationId}/result:
     get:
       summary: Fetch finalized structured research result
-      description: Returns the synthesized answer, source URLs, source-level citation records, heuristic evidence and claims, metrics, and adapter limitations.
+      description: Returns the synthesized answer, source URLs, source-level citation records, passage-level evidence and claims, metrics, and adapter limitations.
       parameters:
         - name: operationId
           in: path

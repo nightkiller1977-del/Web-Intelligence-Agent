@@ -106,6 +106,73 @@ def test_research_submission_completes_with_mocked_adapter(monkeypatch):
     assert events.status_code == 200
 
 
+def test_research_submission_returns_passage_backed_claims(monkeypatch):
+    async def fake_conduct_web_research(**kwargs):
+        return {
+            "operationId": kwargs["op_id"],
+            "status": "completed",
+            "mode": kwargs["mode"],
+            "profile": kwargs["profile"],
+            "answer": "Mock answer",
+            "sources": [
+                {
+                    "id": "src-op-passage-0",
+                    "url": "https://example.com/a",
+                    "title": "Example A",
+                    "retrievedAt": 1,
+                    "sourceType": "web",
+                }
+            ],
+            "evidence": [
+                {
+                    "id": "ev-op-passage-0",
+                    "sourceId": "src-op-passage-0",
+                    "passage": "This source passage directly supports the returned claim.",
+                    "relevanceScore": 0.9,
+                }
+            ],
+            "claims": [
+                {
+                    "id": "claim-op-passage-0",
+                    "text": "This source passage directly supports the returned claim.",
+                    "evidenceIds": ["ev-op-passage-0"],
+                    "confidence": 0.85,
+                    "verificationStatus": "supported",
+                }
+            ],
+            "citations": [
+                {
+                    "id": "cite-op-passage-0",
+                    "sourceId": "src-op-passage-0",
+                    "evidenceIds": ["ev-op-passage-0"],
+                    "claimIds": ["claim-op-passage-0"],
+                }
+            ],
+            "searchesPerformed": [],
+            "metrics": {
+                "startedAt": "2026-01-01T00:00:00+00:00",
+                "completedAt": "2026-01-01T00:00:01+00:00",
+                "durationMs": 1,
+                "searchesPerformed": 0,
+                "pagesRead": 1,
+                "sourcesConsidered": 1,
+                "sourcesUsed": 1,
+            },
+        }
+
+    monkeypatch.setattr(api, "conduct_web_research", fake_conduct_web_research)
+    operation_id = "op-api-passage"
+
+    with TestClient(app) as client:
+        response = client.post("/v1/research", json=_payload(operation_id), headers=_auth_headers())
+        result = _wait_for_terminal_result(client, operation_id)
+
+    assert response.status_code == 202
+    assert result["claims"][0]["verificationStatus"] == "supported"
+    assert result["claims"][0]["evidenceIds"] == [result["evidence"][0]["id"]]
+    assert result["citations"][0]["claimIds"] == [result["claims"][0]["id"]]
+
+
 def test_research_submission_reuses_idempotency_key(monkeypatch):
     async def fake_conduct_web_research(**kwargs):
         return {

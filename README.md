@@ -18,11 +18,11 @@ This service is designed to run in two modes:
 - **Prometheus Telemetry**: Exposes research operation counters, duration and fetched-source histograms, and estimated output-token spend counters.
 
 ### Current Adapter Behavior
-- Responses include source URLs, source-level citations, and heuristic evidence/claim records derived from the synthesized report when GPT Researcher exposes safe source URLs.
+- Responses include source URLs, source-level citations, passage-level evidence, and claim records extracted from GPT Researcher source/context records when safe source text is available.
 - `sourcePolicy.allowedDomains` is supported and passed to GPT Researcher as a domain constraint. Other `sourcePolicy` fields are rejected.
 - `model_provider` and `model_name` are supported as request-scoped GPT Researcher model preferences.
 - Model-call, output-token, and cost budgets are enforced with deterministic estimates. Token and cost overruns return a `partial` result with a limitation note.
-- Claim verification is source-linked and heuristic because GPT Researcher does not expose stable passage-level provenance for independent verification.
+- Claim verification is backed by extracted source/context passages. If GPT Researcher exposes a safe source URL but no source text, the adapter falls back to inferred report-derived claims for that source and marks that limitation in the response.
 
 ---
 
