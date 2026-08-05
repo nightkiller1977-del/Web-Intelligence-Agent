@@ -22,3 +22,14 @@ def test_unknown_research_profile_is_rejected():
             profile="security-v2",
             limits=_limits()
         )
+
+
+def test_unknown_research_mode_is_rejected():
+    with pytest.raises(ValidationError):
+        ResearchRequestInput(
+            operationId="op-mode",
+            attemptId="attempt-mode",
+            query="test",
+            mode="Deep",
+            limits=_limits()
+        )

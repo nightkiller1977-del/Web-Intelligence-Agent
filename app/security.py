@@ -152,6 +152,8 @@ active_profile: contextvars.ContextVar[str] = contextvars.ContextVar("active_pro
 egress_protection_enabled: contextvars.ContextVar[bool] = contextvars.ContextVar("egress_protection_enabled", default=False)
 _protection_lock = threading.RLock()
 _protection_depth = 0
+_fallback_profile_stack: list[str] = []
+_DENY_ALL_PROFILE = "__deny_all__"
 
 def _egress_protection_active() -> bool:
     if egress_protection_enabled.get():
@@ -159,11 +161,26 @@ def _egress_protection_active() -> bool:
     with _protection_lock:
         return _protection_depth > 0
 
+def _active_egress_profile() -> str:
+    if egress_protection_enabled.get():
+        return active_profile.get()
+
+    with _protection_lock:
+        if not _fallback_profile_stack:
+            return "general"
+        unique_profiles = set(_fallback_profile_stack)
+        if len(unique_profiles) == 1:
+            return _fallback_profile_stack[-1]
+        logger.error("SSRF egress guard found overlapping profile contexts; failing closed")
+        return _DENY_ALL_PROFILE
+
 def _ensure_safe_url(url: str):
     if not _egress_protection_active():
         return
-    profile = active_profile.get()
-    is_safe = is_safe_url(str(url), profile) if profile != "general" else is_safe_egress_url(str(url))
+    profile = _active_egress_profile()
+    is_safe = False if profile == _DENY_ALL_PROFILE else (
+        is_safe_url(str(url), profile) if profile != "general" else is_safe_egress_url(str(url))
+    )
     if not is_safe:
         logger.error("SSRF egress guard denied request to %s", url)
         raise PermissionError(f"SSRF blocked outbound request: {url}")
@@ -171,7 +188,11 @@ def _ensure_safe_url(url: str):
 def _ensure_safe_host(host: str):
     if not _egress_protection_active() or not host:
         return
-    if not resolve_and_verify_host(str(host)):
+    profile = _active_egress_profile()
+    is_safe = False if profile == _DENY_ALL_PROFILE else (
+        is_safe_url(f"https://{host}", profile) if profile != "general" else resolve_and_verify_host(str(host))
+    )
+    if not is_safe:
         logger.error("SSRF egress guard denied connection to host %s", host)
         raise PermissionError(f"SSRF blocked outbound host: {host}")
 
@@ -217,11 +238,16 @@ def enforce_egress_protection(profile: str = "general"):
     enabled_token = egress_protection_enabled.set(True)
     with _protection_lock:
         _protection_depth += 1
+        _fallback_profile_stack.append(profile)
     try:
         yield
     finally:
         with _protection_lock:
             _protection_depth = max(0, _protection_depth - 1)
+            for index in range(len(_fallback_profile_stack) - 1, -1, -1):
+                if _fallback_profile_stack[index] == profile:
+                    _fallback_profile_stack.pop(index)
+                    break
         egress_protection_enabled.reset(enabled_token)
         active_profile.reset(profile_token)
 
@@ -313,10 +339,17 @@ if httpx:
 
 
 _original_socket_create_connection = socket.create_connection
+_original_socket_connect = socket.socket.connect
 
 def patched_socket_create_connection(address, timeout=None, source_address=None, *args, **kwargs):
     host = address[0] if isinstance(address, tuple) and address else None
     _ensure_safe_host(host)
     return _original_socket_create_connection(address, timeout, source_address, *args, **kwargs)
 
+def patched_socket_connect(self, address):
+    host = address[0] if isinstance(address, tuple) and address else None
+    _ensure_safe_host(host)
+    return _original_socket_connect(self, address)
+
 socket.create_connection = patched_socket_create_connection
+socket.socket.connect = patched_socket_connect
