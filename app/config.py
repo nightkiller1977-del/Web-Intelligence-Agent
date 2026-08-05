@@ -35,6 +35,7 @@ class Settings(BaseSettings):
     # CORS policies
     # Disabled by default in remote mode unless explicitly authorized
     CORS_ORIGINS: str = os.getenv("CORS_ORIGINS", "")
+    ALLOW_UNAUTHENTICATED_DOCS: bool = os.getenv("ALLOW_UNAUTHENTICATED_DOCS", "").lower() in ("1", "true", "yes")
 
 settings = Settings()
 
@@ -47,3 +48,6 @@ def auth_is_configured() -> bool:
 
 def raw_header_credentials_allowed() -> bool:
     return settings.DEPLOYMENT_MODE == "local"
+
+def unauthenticated_docs_allowed() -> bool:
+    return settings.DEPLOYMENT_MODE == "local" and settings.ALLOW_UNAUTHENTICATED_DOCS

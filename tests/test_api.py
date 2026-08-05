@@ -65,6 +65,25 @@ def test_capabilities_do_not_advertise_unimplemented_contract_features():
     assert capabilities["model_preferences"] is True
 
 
+def test_docs_require_authentication_by_default():
+    with TestClient(app) as client:
+        response = client.get("/docs")
+
+    assert response.status_code == 401
+
+
+def test_docs_can_be_exposed_for_local_browser_testing(monkeypatch):
+    monkeypatch.setattr(settings, "DEPLOYMENT_MODE", "local")
+    monkeypatch.setattr(settings, "ALLOW_UNAUTHENTICATED_DOCS", True)
+
+    with TestClient(app) as client:
+        docs = client.get("/docs")
+        openapi = client.get("/openapi.json")
+
+    assert docs.status_code == 200
+    assert openapi.status_code == 200
+
+
 def test_research_submission_completes_with_mocked_adapter(monkeypatch):
     async def fake_conduct_web_research(**kwargs):
         await kwargs["reporter"].report("completed", "Mock research completed.")
