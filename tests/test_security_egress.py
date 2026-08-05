@@ -45,6 +45,22 @@ def test_profile_policy_blocks_disallowed_public_hosts(monkeypatch):
             requests.get("https://pastebin.com/raw/example", timeout=0.1)
 
 
+def test_profile_policy_allows_provider_api_hosts(monkeypatch):
+    monkeypatch.setattr(security, "resolve_and_verify_host", lambda _host: True)
+
+    with enforce_egress_protection("security"):
+        security._ensure_safe_url("https://api.openai.com/v1/chat/completions")
+
+
+def test_search_provider_budget_is_enforced(monkeypatch):
+    monkeypatch.setattr(security, "resolve_and_verify_host", lambda _host: True)
+
+    with enforce_egress_protection("general", maximum_searches=1):
+        security._ensure_safe_url("https://api.tavily.com/search")
+        with pytest.raises(PermissionError):
+            security._ensure_safe_url("https://api.tavily.com/search")
+
+
 def test_profile_policy_is_preserved_for_thread_fallback(monkeypatch):
     monkeypatch.setattr(security, "resolve_and_verify_host", lambda _host: True)
 

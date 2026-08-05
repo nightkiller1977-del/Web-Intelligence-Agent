@@ -46,6 +46,31 @@ PROFILE_DOMAINS = {
     }
 }
 
+PROVIDER_API_HOSTS = {
+    "api.openai.com",
+    "api.anthropic.com",
+    "api.tavily.com",
+    "generativelanguage.googleapis.com",
+    "openrouter.ai"
+}
+
+SEARCH_PROVIDER_HOSTS = {
+    "api.tavily.com",
+    "google.serper.dev",
+    "serpapi.com",
+    "api.search.brave.com"
+}
+
+def _match_domain(host: str, candidates) -> bool:
+    return any(host == cand or host.endswith(f".{cand}") for cand in candidates)
+
+def _hostname_from_url(url: str) -> str | None:
+    try:
+        parsed = urlparse(url)
+        return parsed.hostname.lower().rstrip(".") if parsed.hostname else None
+    except Exception:
+        return None
+
 def is_safe_ip(ip_str: str) -> bool:
     try:
         ip = ipaddress.ip_address(ip_str)
@@ -111,15 +136,11 @@ def is_safe_url(url: str, profile: str = "general") -> bool:
             allowed = profile_rules.get("allowed", [])
             denied = profile_rules.get("denied", [])
 
-            # Domain suffix matching
-            def match_domain(host, candidates):
-                return any(host == cand or host.endswith(f".{cand}") for cand in candidates)
-
-            if allowed and not match_domain(hostname, allowed):
+            if allowed and not _match_domain(hostname, allowed):
                 logger.warning(f"Domain validation blocked host {hostname} outside allowed list for profile {profile}")
                 return False
 
-            if denied and match_domain(hostname, denied):
+            if denied and _match_domain(hostname, denied):
                 logger.warning(f"Domain validation blocked host {hostname} inside denied list for profile {profile}")
                 return False
 
@@ -150,9 +171,11 @@ def is_safe_egress_url(url: str) -> bool:
 
 active_profile: contextvars.ContextVar[str] = contextvars.ContextVar("active_profile", default="general")
 egress_protection_enabled: contextvars.ContextVar[bool] = contextvars.ContextVar("egress_protection_enabled", default=False)
+active_search_budget: contextvars.ContextVar[dict | None] = contextvars.ContextVar("active_search_budget", default=None)
 _protection_lock = threading.RLock()
 _protection_depth = 0
 _fallback_profile_stack: list[str] = []
+_fallback_search_budget_stack: list[dict | None] = []
 _DENY_ALL_PROFILE = "__deny_all__"
 
 def _egress_protection_active() -> bool:
@@ -174,16 +197,56 @@ def _active_egress_profile() -> str:
         logger.error("SSRF egress guard found overlapping profile contexts; failing closed")
         return _DENY_ALL_PROFILE
 
+def _active_search_budget() -> dict | None:
+    budget = active_search_budget.get()
+    if budget is not None:
+        return budget
+
+    with _protection_lock:
+        active_budgets = [budget for budget in _fallback_search_budget_stack if budget is not None]
+        if not active_budgets:
+            return None
+        if len(active_budgets) == 1:
+            return active_budgets[0]
+        logger.error("SSRF egress guard found overlapping search budgets; failing closed")
+        return {"remaining": 0}
+
+def _is_provider_api_url(url: str) -> bool:
+    hostname = _hostname_from_url(str(url))
+    return bool(hostname and _match_domain(hostname, PROVIDER_API_HOSTS))
+
+def _is_search_provider_url(url: str) -> bool:
+    hostname = _hostname_from_url(str(url))
+    return bool(hostname and _match_domain(hostname, SEARCH_PROVIDER_HOSTS))
+
+def _consume_search_budget(url: str):
+    if not _is_search_provider_url(url):
+        return
+
+    budget = _active_search_budget()
+    if budget is None:
+        return
+
+    with _protection_lock:
+        remaining = int(budget.get("remaining", 0))
+        if remaining <= 0:
+            logger.error("Search provider budget exhausted before request to %s", url)
+            raise PermissionError(f"Search budget exhausted before outbound request: {url}")
+        budget["remaining"] = remaining - 1
+
 def _ensure_safe_url(url: str):
     if not _egress_protection_active():
         return
     profile = _active_egress_profile()
     is_safe = False if profile == _DENY_ALL_PROFILE else (
-        is_safe_url(str(url), profile) if profile != "general" else is_safe_egress_url(str(url))
+        is_safe_egress_url(str(url)) if _is_provider_api_url(str(url))
+        else is_safe_url(str(url), profile) if profile != "general"
+        else is_safe_egress_url(str(url))
     )
     if not is_safe:
         logger.error("SSRF egress guard denied request to %s", url)
         raise PermissionError(f"SSRF blocked outbound request: {url}")
+    _consume_search_budget(str(url))
 
 def _ensure_safe_host(host: str):
     if not _egress_protection_active() or not host:
@@ -226,19 +289,22 @@ def _validate_resolved_hosts(host: str, resolved_hosts):
             raise PermissionError(f"SSRF blocked resolved address {clean_host} for host: {host}")
 
 @contextlib.contextmanager
-def enforce_egress_protection(profile: str = "general"):
+def enforce_egress_protection(profile: str = "general", maximum_searches: int | None = None):
     """Enable outbound URL/host validation for this research operation.
 
     The context variable covers normal asyncio execution. The process-level
     depth gives synchronous worker threads a conservative general-profile guard
     when libraries move blocking fetch work out of the event loop.
     """
+    search_budget = {"remaining": maximum_searches} if maximum_searches is not None else None
     global _protection_depth
     profile_token = active_profile.set(profile)
     enabled_token = egress_protection_enabled.set(True)
+    search_budget_token = active_search_budget.set(search_budget)
     with _protection_lock:
         _protection_depth += 1
         _fallback_profile_stack.append(profile)
+        _fallback_search_budget_stack.append(search_budget)
     try:
         yield
     finally:
@@ -248,6 +314,11 @@ def enforce_egress_protection(profile: str = "general"):
                 if _fallback_profile_stack[index] == profile:
                     _fallback_profile_stack.pop(index)
                     break
+            for index in range(len(_fallback_search_budget_stack) - 1, -1, -1):
+                if _fallback_search_budget_stack[index] is search_budget:
+                    _fallback_search_budget_stack.pop(index)
+                    break
+        active_search_budget.reset(search_budget_token)
         egress_protection_enabled.reset(enabled_token)
         active_profile.reset(profile_token)
 
