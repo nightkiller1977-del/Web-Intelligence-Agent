@@ -22,7 +22,7 @@ This service is designed to run in two modes:
 - Claim records are generated from synthesized report claims and verified by a separate passage-matching pass over available evidence, marking claims as `supported`, `partially-supported`, `unsupported`, or `conflicting`.
 - Source metadata is populated from GPT Researcher source/search records when available, including title, publisher, author, published date, and quality score.
 - `freshness` constraints are applied to the research prompt for recency-aware source selection.
-- `inputs.documents` and `inputs.repositories` are processed as bounded local first-party evidence. Their contents are not sent to external research providers unless `inputs.allowExternalUse=true`.
+- In local mode, `inputs.documents` and `inputs.repositories` are processed as bounded first-party evidence. Path-based inputs are ignored outside local mode, and their contents are not sent to external research providers unless `inputs.allowExternalUse=true`.
 - `sourcePolicy.allowedDomains` is supported and passed to GPT Researcher as a domain constraint. Other `sourcePolicy` fields are rejected.
 - `model_provider` and `model_name` are supported as request-scoped GPT Researcher model preferences.
 - Model-call, output-token, and cost budgets are enforced with deterministic estimates. Token and cost overruns return a `partial` result with a limitation note.

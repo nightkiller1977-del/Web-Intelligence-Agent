@@ -158,6 +158,7 @@ paths:
                 freshness:
                   type: object
                   description: Optional recency constraints applied to the research prompt.
+                  additionalProperties: false
                   properties:
                     since:
                       type: string
@@ -179,6 +180,7 @@ paths:
                 inputs:
                   type: object
                   description: Optional local first-party inputs processed as bounded evidence. Contents are not sent to external research providers unless allowExternalUse is true.
+                  additionalProperties: false
                   properties:
                     allowExternalUse:
                       type: boolean
@@ -187,6 +189,7 @@ paths:
                       type: array
                       items:
                         type: object
+                        additionalProperties: false
                         properties:
                           path:
                             type: string
@@ -196,6 +199,7 @@ paths:
                       type: array
                       items:
                         type: object
+                        additionalProperties: false
                         properties:
                           path:
                             type: string

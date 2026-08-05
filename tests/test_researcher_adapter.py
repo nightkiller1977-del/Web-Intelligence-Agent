@@ -79,7 +79,7 @@ def test_collect_passage_records_reads_research_sources_and_context():
     assert records[1]["url"] == "https://example.com/a"
 
 
-def test_build_structured_findings_from_passages_marks_claims_supported():
+def test_build_structured_findings_from_passages_extracts_evidence_for_claim_verification():
     sources = [
         {
             "id": "src-op-1-0",
@@ -182,6 +182,44 @@ def test_collect_input_context_processes_documents_without_external_use(tmp_path
     assert allow_external is False
     assert "independent claim verification" not in query
     assert "not sent to external research providers" in " ".join(limitations)
+
+
+def test_collect_input_context_requires_boolean_external_use(tmp_path):
+    document = tmp_path / "notes.md"
+    document.write_text("The local design requires independent claim verification.", encoding="utf-8")
+
+    chunks, allow_external = collect_input_context({
+        "documents": [{"path": str(document)}],
+        "allowExternalUse": "false",
+    })
+
+    assert chunks
+    assert allow_external is False
+
+
+def test_collect_input_context_disabled_outside_local_mode(monkeypatch, tmp_path):
+    import app.researcher_adapter as adapter
+
+    document = tmp_path / "notes.md"
+    document.write_text("remote mode should not read this", encoding="utf-8")
+    monkeypatch.setattr(adapter.settings, "DEPLOYMENT_MODE", "remote")
+
+    chunks, allow_external = collect_input_context({
+        "documents": [{"path": str(document)}],
+        "allowExternalUse": True,
+    })
+
+    assert chunks == []
+    assert allow_external is False
+
+
+def test_collect_repository_context_short_circuits_large_trees(tmp_path):
+    for index in range(20):
+        (tmp_path / f"file-{index:02}.md").write_text(f"content {index}", encoding="utf-8")
+
+    chunks, _ = collect_input_context({"repositories": [{"path": str(tmp_path)}]})
+
+    assert len(chunks) == 12
 
 
 def test_trim_to_token_budget_truncates_long_text():

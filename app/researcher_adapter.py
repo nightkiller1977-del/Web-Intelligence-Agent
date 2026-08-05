@@ -22,6 +22,8 @@ ESTIMATED_INPUT_TOKEN_RATE_USD = 0.0000025
 ESTIMATED_OUTPUT_TOKEN_RATE_USD = 0.000010
 MAX_INPUT_CONTEXT_BYTES = 120_000
 MAX_INPUT_FILE_BYTES = 40_000
+MAX_INPUT_CHUNKS = 12
+MAX_REPOSITORY_PATHS_VISITED = 500
 SUPPORTED_INPUT_EXTENSIONS = {
     ".md", ".markdown", ".txt", ".rst", ".py", ".js", ".jsx", ".ts", ".tsx",
     ".json", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".css", ".html", ".sql"
@@ -374,28 +376,40 @@ def collect_repository_context(repositories: list[dict]) -> list[dict]:
         root = Path(str(item["path"])).expanduser()
         if not root.is_dir():
             continue
-        for path in sorted(root.rglob("*")):
-            if len(chunks) >= 12:
+        visited = 0
+        for current_root, dirnames, filenames in os.walk(root):
+            dirnames[:] = [
+                dirname for dirname in dirnames
+                if dirname not in {".git", "node_modules", ".venv", "__pycache__", "dist", "build"}
+            ]
+            for filename in sorted(filenames):
+                if len(chunks) >= MAX_INPUT_CHUNKS or visited >= MAX_REPOSITORY_PATHS_VISITED:
+                    break
+                visited += 1
+                path = Path(current_root) / filename
+                if not path.is_file() or path.suffix.lower() not in SUPPORTED_INPUT_EXTENSIONS:
+                    continue
+                text = input_text_from_file(path)
+                if text:
+                    chunks.append({
+                        "label": str(path.relative_to(root)),
+                        "path": str(path),
+                        "repository": root.name,
+                        "branch": item.get("branch"),
+                        "text": text
+                    })
+            if len(chunks) >= MAX_INPUT_CHUNKS or visited >= MAX_REPOSITORY_PATHS_VISITED:
                 break
-            if ".git" in path.parts or not path.is_file() or path.suffix.lower() not in SUPPORTED_INPUT_EXTENSIONS:
-                continue
-            text = input_text_from_file(path)
-            if text:
-                chunks.append({
-                    "label": str(path.relative_to(root)),
-                    "path": str(path),
-                    "repository": root.name,
-                    "branch": item.get("branch"),
-                    "text": text
-                })
     return chunks
 
 def collect_input_context(inputs: Dict[str, Any] | None) -> tuple[list[dict], bool]:
     if not isinstance(inputs, dict):
         return [], False
+    if settings.DEPLOYMENT_MODE != "local":
+        return [], False
     chunks = []
-    documents = inputs.get("documents") or inputs.get("documentInputs") or []
-    repositories = inputs.get("repositories") or inputs.get("repositoryInputs") or []
+    documents = inputs.get("documents") or []
+    repositories = inputs.get("repositories") or []
     if isinstance(documents, list):
         chunks.extend(collect_document_context(documents))
     if isinstance(repositories, list):
@@ -413,7 +427,7 @@ def collect_input_context(inputs: Dict[str, Any] | None) -> tuple[list[dict], bo
             chunk["text"] = encoded[:remaining].decode("utf-8", errors="ignore")
         total_bytes += len(chunk["text"].encode("utf-8", errors="ignore"))
         bounded_chunks.append(chunk)
-    return bounded_chunks, bool(inputs.get("allowExternalUse"))
+    return bounded_chunks, inputs.get("allowExternalUse") is True
 
 def format_input_context_for_query(chunks: list[dict]) -> str:
     sections = []
