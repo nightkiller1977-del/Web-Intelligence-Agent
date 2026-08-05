@@ -196,6 +196,7 @@ async def start_research(
         )
 
     claimed_lookup_key = None
+    claimed_operation_id = False
     slot_reserved = False
     try:
         # 1. Secure initial query validation (check secrets, SSRF URLs if query is an explicit URL)
@@ -248,6 +249,14 @@ async def start_research(
             return {"operationId": existing_op_id, "status": op_state.get("status") if op_state else "unknown"}
         claimed_lookup_key = lookup_key
 
+        operation_claimed = await storage.claim_operation_id(req.operationId, lookup_key)
+        if not operation_claimed:
+            raise HTTPException(
+                status_code=409,
+                detail="operationId is already associated with a different idempotency key."
+            )
+        claimed_operation_id = True
+
         # 4. Enforce and reserve a concurrency slot only for new operations.
         async with _concurrency_lock:
             if _active_ops_count >= settings.MAX_CONCURRENT_OPS:
@@ -256,6 +265,8 @@ async def start_research(
             slot_reserved = True
     except Exception as e:
         # Rollback reserved slot if validation fails
+        if claimed_operation_id:
+            await storage.release_operation_id(req.operationId, lookup_key)
         if claimed_lookup_key:
             await storage.release_idempotency_key(claimed_lookup_key, req.operationId)
         if slot_reserved:
@@ -293,6 +304,8 @@ async def start_research(
         task_started = True
     except Exception as e:
         if not task_started:
+            if claimed_operation_id:
+                await storage.release_operation_id(req.operationId, lookup_key)
             if claimed_lookup_key:
                 await storage.release_idempotency_key(claimed_lookup_key, req.operationId)
             if slot_reserved:
