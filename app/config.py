@@ -1,9 +1,12 @@
 # app/config.py
 import os
 import secrets
+from pydantic import ConfigDict
 from pydantic_settings import BaseSettings
 
 class Settings(BaseSettings):
+    model_config = ConfigDict(env_file=".env", extra="allow")
+
     # Process Bindings
     HOST: str = "127.0.0.1"
     PORT: int = int(os.getenv("PORT", 8080))
@@ -32,10 +35,6 @@ class Settings(BaseSettings):
 
     # Spend & Costs limit
     DAILY_SPEND_LIMIT_USD: float = float(os.getenv("DAILY_SPEND_LIMIT_USD", 50.0))
-
-    class Config:
-        env_file = ".env"
-        extra = "allow"
 
 settings = Settings()
 
