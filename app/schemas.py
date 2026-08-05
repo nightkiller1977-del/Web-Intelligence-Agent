@@ -35,7 +35,7 @@ class ResearchRequestInput(BaseModel):
     limits: LimitConfig
     inputs: Optional[Dict[str, Any]] = None
     requireCitations: bool = True
-    requireClaimVerification: Optional[bool] = Field(False, description="Return heuristic source-linked claim verification records")
+    requireClaimVerification: Optional[bool] = Field(False, description="Return source/context passage-backed claim verification records")
     
     # Model preferences
     model_provider: Optional[str] = Field(None, description="GPT Researcher LLM provider, for example openai")
