@@ -79,6 +79,7 @@ Detailed OpenAPI documentation is available under `api/openapi.yaml`.
 | :--- | :--- | :--- |
 | `DEPLOYMENT_MODE` | `local` | Service deployment mode: `local` (Electron sidecar) or `remote` (Render). |
 | `WEB_INTELLIGENCE_AUTH_TOKEN` | `""` | Bearer token verified on incoming API requests (auto-generated in local mode). |
+| `ALLOW_UNAUTHENTICATED_DOCS` | `false` | When `true` in local mode, exposes `/docs`, `/redoc`, and `/openapi.json` for plain-browser testing. Ignored in remote mode. |
 | `STORAGE_BACKEND` | `local` | Persistence mode: `local` (in-memory dicts) or `redis` (Render Valkey cache). |
 | `REDIS_URL` | `""` | Connection URL for Redis instances (e.g. `redis://red-xxx:6379`). |
 | `MAX_CONCURRENT_OPS` | `3` | Maximum number of concurrent research jobs allowed in the process. |
