@@ -162,7 +162,9 @@ def _egress_protection_active() -> bool:
 def _ensure_safe_url(url: str):
     if not _egress_protection_active():
         return
-    if not is_safe_egress_url(str(url)):
+    profile = active_profile.get()
+    is_safe = is_safe_url(str(url), profile) if profile != "general" else is_safe_egress_url(str(url))
+    if not is_safe:
         logger.error("SSRF egress guard denied request to %s", url)
         raise PermissionError(f"SSRF blocked outbound request: {url}")
 
