@@ -75,3 +75,25 @@ def test_unknown_inputs_field_is_rejected():
             inputs={"attachments": []},
             limits=_limits()
         )
+
+
+def test_input_alias_fields_are_rejected():
+    with pytest.raises(ValidationError):
+        ResearchRequestInput(
+            operationId="op-input-alias",
+            attemptId="attempt-input-alias",
+            query="test",
+            inputs={"documentInputs": []},
+            limits=_limits()
+        )
+
+
+def test_allow_external_use_must_be_boolean():
+    with pytest.raises(ValidationError):
+        ResearchRequestInput(
+            operationId="op-input-bool",
+            attemptId="attempt-input-bool",
+            query="test",
+            inputs={"allowExternalUse": "false"},
+            limits=_limits()
+        )

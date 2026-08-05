@@ -5,7 +5,7 @@ from typing import List, Optional, Dict, Any
 SUPPORTED_MODES = {"quick", "standard", "deep"}
 SUPPORTED_PROFILES = {"general", "technical", "repair", "code-review", "security"}
 SUPPORTED_FRESHNESS_KEYS = {"since", "until", "maxAgeDays"}
-SUPPORTED_INPUT_KEYS = {"documents", "documentInputs", "repositories", "repositoryInputs", "allowExternalUse"}
+SUPPORTED_INPUT_KEYS = {"documents", "repositories", "allowExternalUse"}
 
 class LimitConfig(BaseModel):
     maximumDurationSeconds: int = Field(..., gt=0, le=3600, description="Maximum duration allowed in seconds")
@@ -84,6 +84,8 @@ class ResearchRequestInput(BaseModel):
         unsupported = set(value.keys()) - SUPPORTED_INPUT_KEYS
         if unsupported:
             raise ValueError(f"Unsupported inputs fields: {', '.join(sorted(unsupported))}")
+        if "allowExternalUse" in value and not isinstance(value["allowExternalUse"], bool):
+            raise ValueError("inputs.allowExternalUse must be a boolean")
         return value
 
 class ResearchSource(BaseModel):
