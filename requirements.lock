@@ -1,6 +1,6 @@
 # requirements.lock for Web-Intelligence-Agent FastAPI sidecar
 
-gpt-researcher==3.5.0
+gpt-researcher==0.16.0
 fastapi>=0.100.0,<1.0.0
 uvicorn>=0.20.0,<1.0.0
 sse-starlette>=1.6.0,<2.0.0
