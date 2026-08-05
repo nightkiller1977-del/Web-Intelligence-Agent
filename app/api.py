@@ -22,15 +22,6 @@ router = APIRouter()
 _active_ops_count = 0
 _concurrency_lock = asyncio.Lock()
 RAW_CREDENTIAL_HEADERS = ("X-LLM-Key", "X-Search-Key")
-UNSUPPORTED_MODEL_LIMIT_FIELDS = (
-    "maximumModelCalls",
-    "maximumModelTokens",
-    "maximumModelCostUsd",
-)
-UNSUPPORTED_MODEL_PREFERENCE_FIELDS = (
-    "model_provider",
-    "model_name",
-)
 TERMINAL_STATUSES = ("completed", "partial", "failed", "cancelled")
 
 def client_safe_error() -> dict:
@@ -39,20 +30,6 @@ def client_safe_error() -> dict:
         "message": "Research execution failed. Check server logs for the redacted diagnostic details.",
         "retryable": True
     }
-
-def unsupported_model_limit_fields(limits) -> list[str]:
-    return [
-        field
-        for field in UNSUPPORTED_MODEL_LIMIT_FIELDS
-        if getattr(limits, field, None) is not None
-    ]
-
-def unsupported_model_preference_fields(req: ResearchRequestInput) -> list[str]:
-    return [
-        field
-        for field in UNSUPPORTED_MODEL_PREFERENCE_FIELDS
-        if getattr(req, field, None) is not None
-    ]
 
 @router.get("/health/live")
 async def health_live():
@@ -115,11 +92,11 @@ async def capabilities():
             "cancellations": True,
             "source_level_citations": True,
             "citations": True,
-            "structured_evidence": False,
-            "claim_verification": False,
+            "structured_evidence": True,
+            "claim_verification": True,
             "source_policy": True,
-            "model_budget_limits": False,
-            "model_preferences": False,
+            "model_budget_limits": True,
+            "model_preferences": True,
             "ssrf_egress_blocking": True,
             "ssrf_url_query_validation": True,
             "ssrf_source_result_redaction": True,
@@ -143,6 +120,9 @@ async def background_research_task(req: ResearchRequestInput, reporter: Progress
             profile=req.profile,
             limits=req.limits.model_dump(),
             source_policy=req.sourcePolicy,
+            model_provider=req.model_provider,
+            model_name=req.model_name,
+            require_claim_verification=bool(req.requireClaimVerification),
             reporter=reporter,
             headers=headers
         )
@@ -221,26 +201,10 @@ async def start_research(
                     detail="Raw provider credentials are accepted only in local deployment mode."
                 )
 
-        unsupported_limits = unsupported_model_limit_fields(req.limits)
-        if unsupported_limits:
+        if bool(req.model_provider) != bool(req.model_name):
             raise HTTPException(
                 status_code=400,
-                detail=(
-                    "Unsupported model budget limits: "
-                    f"{', '.join(unsupported_limits)}. "
-                    "Use duration, search, page, source, and memory limits for this adapter."
-                )
-            )
-
-        unsupported_preferences = unsupported_model_preference_fields(req)
-        if unsupported_preferences:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "Unsupported model preference fields: "
-                    f"{', '.join(unsupported_preferences)}. "
-                    "Configure model/provider defaults through deployment environment variables."
-                )
+                detail="model_provider and model_name must be provided together."
             )
 
         unsupported_source_policy_keys = set((req.sourcePolicy or {}).keys()) - {"allowedDomains"}

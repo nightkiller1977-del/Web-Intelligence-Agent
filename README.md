@@ -17,10 +17,12 @@ This service is designed to run in two modes:
 - **Task Cancellations**: Provides REST-based endpoints to abort running async loops.
 - **Prometheus Telemetry**: Exposes research operation counters, duration and fetched-source histograms, and estimated output-token spend counters.
 
-### Current Adapter Limits
-- Structured passage-level evidence and claim verification are not emitted by the current GPT Researcher adapter. Responses include source URLs and source-level citation records when GPT Researcher exposes URLs, plus a `limitations` note explaining the missing structured fields.
+### Current Adapter Behavior
+- Responses include source URLs, source-level citations, and heuristic evidence/claim records derived from the synthesized report when GPT Researcher exposes safe source URLs.
 - `sourcePolicy.allowedDomains` is supported and passed to GPT Researcher as a domain constraint. Other `sourcePolicy` fields are rejected.
-- Model provider preferences and model-call/token/cost budget limits are explicitly rejected. Configure provider defaults through environment variables.
+- `model_provider` and `model_name` are supported as request-scoped GPT Researcher model preferences.
+- Model-call, output-token, and cost budgets are enforced with deterministic estimates. Token and cost overruns return a `partial` result with a limitation note.
+- Claim verification is source-linked and heuristic because GPT Researcher does not expose stable passage-level provenance for independent verification.
 
 ---
 
