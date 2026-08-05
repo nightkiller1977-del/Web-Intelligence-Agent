@@ -33,3 +33,23 @@ def test_unknown_research_mode_is_rejected():
             mode="Deep",
             limits=_limits()
         )
+
+
+def test_non_positive_limits_are_rejected():
+    with pytest.raises(ValidationError):
+        LimitConfig(
+            maximumDurationSeconds=0,
+            maximumSearches=1,
+            maximumPages=1,
+            maximumSources=1
+        )
+
+
+def test_blank_query_is_rejected():
+    with pytest.raises(ValidationError):
+        ResearchRequestInput(
+            operationId="op-blank",
+            attemptId="attempt-blank",
+            query="   ",
+            limits=_limits()
+        )

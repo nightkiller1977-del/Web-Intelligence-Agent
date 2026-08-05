@@ -6,40 +6,40 @@ SUPPORTED_MODES = {"quick", "standard", "deep"}
 SUPPORTED_PROFILES = {"general", "technical", "repair", "code-review", "security"}
 
 class LimitConfig(BaseModel):
-    maximumDurationSeconds: int = Field(..., description="Maximum duration allowed in seconds")
-    maximumSearches: int = Field(..., description="Maximum search queries to perform")
-    maximumPages: int = Field(..., description="Maximum pages to scrape")
-    maximumSources: int = Field(..., description="Maximum sources to return in results")
-    maximumMemoryMb: Optional[int] = Field(None, description="Per-operation memory guardrail in MB")
-    maximumModelCalls: Optional[int] = Field(None, description="Unsupported by the GPT Researcher adapter")
-    maximumModelTokens: Optional[int] = Field(None, description="Unsupported by the GPT Researcher adapter")
-    maximumModelCostUsd: Optional[float] = Field(None, description="Unsupported by the GPT Researcher adapter")
+    maximumDurationSeconds: int = Field(..., gt=0, le=3600, description="Maximum duration allowed in seconds")
+    maximumSearches: int = Field(..., gt=0, le=100, description="Maximum search queries to perform")
+    maximumPages: int = Field(..., gt=0, le=500, description="Maximum pages to scrape")
+    maximumSources: int = Field(..., gt=0, le=100, description="Maximum sources to return in results")
+    maximumMemoryMb: Optional[int] = Field(None, gt=0, le=262144, description="Per-operation memory guardrail in MB")
+    maximumModelCalls: Optional[int] = Field(None, gt=0, description="Maximum estimated model calls allowed")
+    maximumModelTokens: Optional[int] = Field(None, gt=0, description="Maximum estimated output tokens allowed")
+    maximumModelCostUsd: Optional[float] = Field(None, gt=0, description="Maximum estimated model cost allowed in USD")
 
 class DocumentInput(BaseModel):
-    path: str
+    path: str = Field(..., min_length=1)
     displayName: Optional[str] = None
 
 class RepositoryInput(BaseModel):
-    path: str
+    path: str = Field(..., min_length=1)
     branch: Optional[str] = None
 
 class ResearchRequestInput(BaseModel):
-    operationId: str = Field(..., description="Unique operation identifier")
-    idempotencyKey: Optional[str] = Field(None, description="Deterministic key to prevent duplicate runs")
-    attemptId: str = Field(..., description="UUID for retry attempts")
-    query: str = Field(..., description="The user query or research topic")
+    operationId: str = Field(..., min_length=1, max_length=128, description="Unique operation identifier")
+    idempotencyKey: Optional[str] = Field(None, min_length=1, max_length=256, description="Deterministic key to prevent duplicate runs")
+    attemptId: str = Field(..., min_length=1, max_length=128, description="UUID for retry attempts")
+    query: str = Field(..., min_length=1, max_length=8000, description="The user query or research topic")
     mode: str = Field("standard", description="Research mode: quick, standard, deep")
     profile: str = Field("general", description="Research profile: general, technical, repair, etc.")
     freshness: Optional[Dict[str, str]] = None
-    sourcePolicy: Optional[Dict[str, Any]] = Field(None, description="Unsupported by the GPT Researcher adapter")
+    sourcePolicy: Optional[Dict[str, Any]] = Field(None, description="Optional source policy. Only allowedDomains is supported.")
     limits: LimitConfig
     inputs: Optional[Dict[str, Any]] = None
     requireCitations: bool = True
-    requireClaimVerification: Optional[bool] = Field(False, description="Unsupported by the GPT Researcher adapter")
+    requireClaimVerification: Optional[bool] = Field(False, description="Return source/context passage-backed claim verification records")
     
     # Model preferences
-    model_provider: Optional[str] = Field(None, description="Unsupported by the GPT Researcher adapter")
-    model_name: Optional[str] = Field(None, description="Unsupported by the GPT Researcher adapter")
+    model_provider: Optional[str] = Field(None, description="GPT Researcher LLM provider, for example openai")
+    model_name: Optional[str] = Field(None, description="GPT Researcher LLM model name")
 
     @field_validator("mode")
     @classmethod
@@ -55,6 +55,13 @@ class ResearchRequestInput(BaseModel):
         if value not in SUPPORTED_PROFILES:
             supported = ", ".join(sorted(SUPPORTED_PROFILES))
             raise ValueError(f"Unsupported research profile '{value}'. Supported profiles: {supported}")
+        return value
+
+    @field_validator("query")
+    @classmethod
+    def validate_query(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("query must not be blank")
         return value
 
 class ResearchSource(BaseModel):
