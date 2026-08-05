@@ -173,6 +173,35 @@ def _ensure_safe_host(host: str):
         logger.error("SSRF egress guard denied connection to host %s", host)
         raise PermissionError(f"SSRF blocked outbound host: {host}")
 
+def _validate_resolved_hosts(host: str, resolved_hosts):
+    if not _egress_protection_active():
+        return
+
+    for resolved in resolved_hosts or []:
+        resolved_host = None
+        if isinstance(resolved, dict):
+            resolved_host = resolved.get("host") or resolved.get("hostname")
+        elif isinstance(resolved, tuple) and len(resolved) >= 5:
+            resolved_host = resolved[4][0]
+
+        if not resolved_host:
+            continue
+
+        clean_host = str(resolved_host).split("%")[0]
+        try:
+            ipaddress.ip_address(clean_host)
+            is_safe = is_safe_ip(clean_host)
+        except ValueError:
+            is_safe = resolve_and_verify_host(clean_host)
+
+        if not is_safe:
+            logger.error(
+                "SSRF egress guard denied resolved address %s for host %s",
+                clean_host,
+                host
+            )
+            raise PermissionError(f"SSRF blocked resolved address {clean_host} for host: {host}")
+
 @contextlib.contextmanager
 def enforce_egress_protection(profile: str = "general"):
     """Enable outbound URL/host validation for this research operation.
@@ -222,7 +251,15 @@ if aiohttp:
                 connection_key=None,
                 os_error=exc
             )
-        return await _original_aiohttp_resolve_host(self, host, port, *args, **kwargs)
+        resolved_hosts = await _original_aiohttp_resolve_host(self, host, port, *args, **kwargs)
+        try:
+            _validate_resolved_hosts(host, resolved_hosts)
+        except PermissionError as exc:
+            raise aiohttp.ClientConnectorError(
+                connection_key=None,
+                os_error=exc
+            )
+        return resolved_hosts
 
     aiohttp.ClientSession._request = patched_aiohttp_request
     aiohttp.TCPConnector._resolve_host = patched_aiohttp_resolve_host
