@@ -36,6 +36,14 @@ class BaseStorage:
         When op_id is provided, only releases keys still mapped to that operation."""
         raise NotImplementedError()
 
+    async def claim_operation_id(self, op_id: str, idempotency_key: str) -> bool:
+        """Atomically reserve operation_id for an idempotency key."""
+        raise NotImplementedError()
+
+    async def release_operation_id(self, op_id: str, idempotency_key: Optional[str] = None) -> bool:
+        """Release a previously reserved operation_id."""
+        raise NotImplementedError()
+
     async def push_progress_event(self, op_id: str, event: Dict[str, Any]):
         raise NotImplementedError()
 
@@ -51,6 +59,7 @@ class InMemoryStorage(BaseStorage):
         self.locks: Dict[str, str] = {}
         self.events: Dict[str, List[Dict[str, Any]]] = {}
         self.idempotency_keys: Dict[str, str] = {}
+        self.operation_claims: Dict[str, str] = {}
 
     async def save_operation(self, op_id: str, data: Dict[str, Any]):
         existing = self.operations.get(op_id)
@@ -68,6 +77,7 @@ class InMemoryStorage(BaseStorage):
         self.operations.pop(op_id, None)
         self.locks.pop(op_id, None)
         self.events.pop(op_id, None)
+        self.operation_claims.pop(op_id, None)
         for key, existing_op_id in list(self.idempotency_keys.items()):
             if existing_op_id == op_id:
                 self.idempotency_keys.pop(key, None)
@@ -90,6 +100,27 @@ class InMemoryStorage(BaseStorage):
         if not existing or (op_id is not None and existing != op_id):
             return False
         self.idempotency_keys.pop(key, None)
+        return True
+
+    async def claim_operation_id(self, op_id: str, idempotency_key: str) -> bool:
+        existing_claim = self.operation_claims.get(op_id)
+        if existing_claim:
+            return existing_claim == idempotency_key
+
+        existing_operation = self.operations.get(op_id)
+        if existing_operation:
+            existing_key = existing_operation.get("idempotency_key")
+            if existing_key and existing_key != idempotency_key:
+                return False
+
+        self.operation_claims[op_id] = idempotency_key
+        return True
+
+    async def release_operation_id(self, op_id: str, idempotency_key: Optional[str] = None) -> bool:
+        existing_claim = self.operation_claims.get(op_id)
+        if not existing_claim or (idempotency_key is not None and existing_claim != idempotency_key):
+            return False
+        self.operation_claims.pop(op_id, None)
         return True
 
     async def push_progress_event(self, op_id: str, event: Dict[str, Any]):
@@ -154,6 +185,7 @@ class RedisStorage(BaseStorage):
         await self.redis.hdel("research:operations", op_id)
         await self.redis.delete(f"research:locks:{op_id}")
         await self.redis.delete(f"research:events:{op_id}")
+        await self.redis.delete(f"research:operation_claims:{op_id}")
 
     async def claim_lock(self, op_id: str, instance_id: str) -> bool:
         if self.degraded:
@@ -180,6 +212,60 @@ class RedisStorage(BaseStorage):
             if existing != op_id:
                 return False
         deleted = await self.redis.delete(idem_key)
+        return bool(deleted)
+
+    async def claim_operation_id(self, op_id: str, idempotency_key: str) -> bool:
+        if self.degraded:
+            return await self.fallback.claim_operation_id(op_id, idempotency_key)
+
+        claim_key = f"research:operation_claims:{op_id}"
+        script = """
+        local operations_key = KEYS[1]
+        local claim_key = KEYS[2]
+        local op_id = ARGV[1]
+        local idempotency_key = ARGV[2]
+        local ttl_seconds = tonumber(ARGV[3])
+
+        local operation = redis.call('HGET', operations_key, op_id)
+        if operation then
+            local ok, decoded = pcall(cjson.decode, operation)
+            if ok and decoded['idempotency_key'] and decoded['idempotency_key'] ~= idempotency_key then
+                return 0
+            end
+        end
+
+        local existing_claim = redis.call('GET', claim_key)
+        if existing_claim then
+            if existing_claim == idempotency_key then
+                return 1
+            end
+            return 0
+        end
+
+        redis.call('SET', claim_key, idempotency_key, 'EX', ttl_seconds)
+        return 1
+        """
+        claimed = await self.redis.eval(
+            script,
+            2,
+            "research:operations",
+            claim_key,
+            op_id,
+            idempotency_key,
+            86400
+        )
+        return bool(claimed)
+
+    async def release_operation_id(self, op_id: str, idempotency_key: Optional[str] = None) -> bool:
+        if self.degraded:
+            return await self.fallback.release_operation_id(op_id, idempotency_key)
+
+        claim_key = f"research:operation_claims:{op_id}"
+        if idempotency_key is not None:
+            existing = await self.redis.get(claim_key)
+            if existing != idempotency_key:
+                return False
+        deleted = await self.redis.delete(claim_key)
         return bool(deleted)
 
     async def mark_stale_operations(self):

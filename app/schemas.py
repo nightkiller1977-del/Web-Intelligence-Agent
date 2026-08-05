@@ -2,6 +2,7 @@
 from pydantic import BaseModel, Field, field_validator
 from typing import List, Optional, Dict, Any
 
+SUPPORTED_MODES = {"quick", "standard", "deep"}
 SUPPORTED_PROFILES = {"general", "technical", "repair", "code-review", "security"}
 
 class LimitConfig(BaseModel):
@@ -38,6 +39,14 @@ class ResearchRequestInput(BaseModel):
     # Model preferences
     model_provider: Optional[str] = None
     model_name: Optional[str] = None
+
+    @field_validator("mode")
+    @classmethod
+    def validate_mode(cls, value: str) -> str:
+        if value not in SUPPORTED_MODES:
+            supported = ", ".join(sorted(SUPPORTED_MODES))
+            raise ValueError(f"Unsupported research mode '{value}'. Supported modes: {supported}")
+        return value
 
     @field_validator("profile")
     @classmethod
