@@ -15,11 +15,12 @@ This service is designed to run in two modes:
 - **Process Memory Guardrails**: Monitored via a background task. If memory footprint exceeds 80% of the configured limit, the sidecar stops the active research loop and attempts a bounded partial synthesis.
 - **Durable Event Streaming**: Emits live progress logs (`planning`, `searching`, `reading`, `synthesizing`, etc.) via Server-Sent Events (SSE) backed by Redis Streams in cluster mode.
 - **Task Cancellations**: Provides REST-based endpoints to abort running async loops.
-- **Prometheus Telemetry**: Exposes research duration and fetched-source histograms.
+- **Prometheus Telemetry**: Exposes research operation counters, duration and fetched-source histograms, and estimated output-token spend counters.
 
 ### Current Adapter Limits
-- Structured passage-level evidence, claim verification, and citation graph output are not emitted by the current GPT Researcher adapter. Responses include source URLs when GPT Researcher exposes them and include a `limitations` note explaining the missing structured fields.
-- `sourcePolicy`, model provider preferences, and model-call/token/cost budget limits are explicitly rejected. Configure provider defaults through environment variables and enforce source constraints before submitting requests.
+- Structured passage-level evidence and claim verification are not emitted by the current GPT Researcher adapter. Responses include source URLs and source-level citation records when GPT Researcher exposes URLs, plus a `limitations` note explaining the missing structured fields.
+- `sourcePolicy.allowedDomains` is supported and passed to GPT Researcher as a domain constraint. Other `sourcePolicy` fields are rejected.
+- Model provider preferences and model-call/token/cost budget limits are explicitly rejected. Configure provider defaults through environment variables.
 
 ---
 
@@ -59,12 +60,13 @@ Detailed OpenAPI documentation is available under `api/openapi.yaml`.
 - **`GET /health/live`**: Fast liveness probe checking process response (used by Render).
 - **`GET /health/ready`**: Probes storage backends (Redis) and engine dependencies.
 - **`GET /capabilities`**: Lists active features supported by the sidecar.
+- **`GET /metrics`**: Prometheus metrics for operation outcomes, duration, fetched sources, and estimated output tokens.
 - **`GET /version`**: Returns service and gpt-researcher version strings.
 
 ### 3.2 Operations Workflow
 - **`POST /v1/research`**: Enqueues a new query. Returns `202 Accepted` with the `operationId`. Supports idempotency key checks via `Idempotency-Key` header.
 - **`GET /v1/research/{operationId}/events`**: Server-Sent Events (SSE) stream of task progression logs.
-- **`GET /v1/research/{operationId}/result`**: Fetches the completed synthesis report, source URLs, metrics, and adapter limitations.
+- **`GET /v1/research/{operationId}/result`**: Fetches the completed synthesis report, source URLs, source-level citations, metrics, and adapter limitations.
 - **`POST /v1/research/{operationId}/cancel`**: Interrupts the active research task.
 
 ---
@@ -79,6 +81,7 @@ Detailed OpenAPI documentation is available under `api/openapi.yaml`.
 | `REDIS_URL` | `""` | Connection URL for Redis instances (e.g. `redis://red-xxx:6379`). |
 | `MAX_CONCURRENT_OPS` | `3` | Maximum number of concurrent research jobs allowed in the process. |
 | `MAX_MEMORY_MB` | `512` | Memory threshold limits (MB) prior to triggering early partial synthesis. |
+| `DAILY_SPEND_LIMIT_USD` | `50.0` | Warning threshold for estimated output-token spend. |
 | `CORS_ORIGINS` | `""` | Comma-separated list of approved CORS domain origins. |
 
 ---
@@ -103,6 +106,9 @@ pip install -r requirements.lock
 
 # 4. Spin up the FastAPI server locally
 uvicorn app.main:app --host 127.0.0.1 --port 8080
+
+# 5. Run the sidecar test suite
+pytest
 ```
 
 ---
