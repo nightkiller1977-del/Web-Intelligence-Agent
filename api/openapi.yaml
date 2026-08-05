@@ -67,6 +67,7 @@ paths:
   /capabilities:
     get:
       summary: Supported capabilities list
+      description: Capability booleans report the implemented adapter surface. Structured evidence, claim verification, source policies, model budget limits, and model preferences are currently unsupported.
       responses:
         '200':
           description: Capabilities metadata
@@ -121,6 +122,18 @@ paths:
                   enum: [quick, standard, deep]
                 profile:
                   type: string
+                sourcePolicy:
+                  type: object
+                  description: Unsupported by the GPT Researcher adapter. Requests including this field are rejected.
+                requireClaimVerification:
+                  type: boolean
+                  description: Unsupported by the GPT Researcher adapter.
+                model_provider:
+                  type: string
+                  description: Unsupported by the GPT Researcher adapter. Configure provider defaults through environment variables.
+                model_name:
+                  type: string
+                  description: Unsupported by the GPT Researcher adapter. Configure model defaults through environment variables.
                 limits:
                   type: object
                   required:
@@ -137,6 +150,19 @@ paths:
                       type: integer
                     maximumSources:
                       type: integer
+                    maximumMemoryMb:
+                      type: integer
+                      description: Per-operation memory guardrail in MB.
+                    maximumModelCalls:
+                      type: integer
+                      description: Unsupported by the GPT Researcher adapter. Requests including this field are rejected.
+                    maximumModelTokens:
+                      type: integer
+                      description: Unsupported by the GPT Researcher adapter. Requests including this field are rejected.
+                    maximumModelCostUsd:
+                      type: number
+                      format: float
+                      description: Unsupported by the GPT Researcher adapter. Requests including this field are rejected.
       responses:
         '202':
           description: Research operation queued successfully
@@ -169,6 +195,7 @@ paths:
   /v1/research/{operationId}/result:
     get:
       summary: Fetch finalized structured research result
+      description: Returns the synthesized answer, source URLs, metrics, and adapter limitations. Passage-level evidence, claims, and citation graph arrays are currently empty because the adapter does not expose stable passage-level data.
       parameters:
         - name: operationId
           in: path

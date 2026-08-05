@@ -10,9 +10,10 @@ class LimitConfig(BaseModel):
     maximumSearches: int = Field(..., description="Maximum search queries to perform")
     maximumPages: int = Field(..., description="Maximum pages to scrape")
     maximumSources: int = Field(..., description="Maximum sources to return in results")
-    maximumModelCalls: Optional[int] = None
-    maximumModelTokens: Optional[int] = None
-    maximumModelCostUsd: Optional[float] = None
+    maximumMemoryMb: Optional[int] = Field(None, description="Per-operation memory guardrail in MB")
+    maximumModelCalls: Optional[int] = Field(None, description="Unsupported by the GPT Researcher adapter")
+    maximumModelTokens: Optional[int] = Field(None, description="Unsupported by the GPT Researcher adapter")
+    maximumModelCostUsd: Optional[float] = Field(None, description="Unsupported by the GPT Researcher adapter")
 
 class DocumentInput(BaseModel):
     path: str
@@ -30,15 +31,15 @@ class ResearchRequestInput(BaseModel):
     mode: str = Field("standard", description="Research mode: quick, standard, deep")
     profile: str = Field("general", description="Research profile: general, technical, repair, etc.")
     freshness: Optional[Dict[str, str]] = None
-    sourcePolicy: Optional[Dict[str, Any]] = None
+    sourcePolicy: Optional[Dict[str, Any]] = Field(None, description="Unsupported by the GPT Researcher adapter")
     limits: LimitConfig
     inputs: Optional[Dict[str, Any]] = None
     requireCitations: bool = True
-    requireClaimVerification: Optional[bool] = False
+    requireClaimVerification: Optional[bool] = Field(False, description="Unsupported by the GPT Researcher adapter")
     
     # Model preferences
-    model_provider: Optional[str] = None
-    model_name: Optional[str] = None
+    model_provider: Optional[str] = Field(None, description="Unsupported by the GPT Researcher adapter")
+    model_name: Optional[str] = Field(None, description="Unsupported by the GPT Researcher adapter")
 
     @field_validator("mode")
     @classmethod
