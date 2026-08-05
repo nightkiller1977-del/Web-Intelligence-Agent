@@ -234,6 +234,12 @@ async def start_research(
                 )
             )
 
+        if req.sourcePolicy:
+            raise HTTPException(
+                status_code=400,
+                detail="sourcePolicy is not supported by this adapter yet. Omit it or enforce source constraints before submitting the request."
+            )
+
         # 3. Atomic idempotency check-and-reserve before new-work concurrency limiting.
         existing_op_id = await storage.claim_idempotency_key(lookup_key, req.operationId)
         if existing_op_id:

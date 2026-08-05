@@ -18,6 +18,14 @@ def test_httpx_private_url_blocked_when_egress_guard_enabled():
             httpx.get("http://169.254.169.254/latest/meta-data", timeout=0.1)
 
 
+def test_actual_resolver_private_address_is_blocked():
+    resolved_hosts = [{"hostname": "example.test", "host": "169.254.169.254", "port": 80}]
+
+    with enforce_egress_protection():
+        with pytest.raises(PermissionError):
+            security._validate_resolved_hosts("example.test", resolved_hosts)
+
+
 def test_guard_does_not_affect_http_clients_when_disabled(monkeypatch):
     sent_urls = []
 

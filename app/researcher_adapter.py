@@ -59,7 +59,7 @@ async def conduct_web_research(
     if mode == "quick":
         report_type = "outline_report"
     elif mode == "deep":
-        report_type = "detailed_report"
+        report_type = "deep"
 
     env_manager = RequestEnvironmentManager(headers)
     callbacks = GPTResearcherCallbackHandler(reporter)
@@ -75,14 +75,14 @@ async def _run_research(env_manager, callbacks, reporter, op_id, query, mode, pr
 
         researcher = GPTResearcher(
             query=query,
-            report_type=report_type,
-            max_iterations=max_iterations
+            report_type=report_type
         )
 
         # Distribute the caller's total budget across iterations so the
         # aggregate stays within the requested maximumSearches / maximumPages.
         per_iter_searches = max(1, max_searches // max_iterations)
         per_iter_pages = max(1, max_pages // max_iterations)
+        researcher.cfg.max_iterations = max_iterations
         researcher.cfg.max_search_results_per_query = per_iter_searches
         researcher.cfg.max_urls_per_query = per_iter_pages
 
