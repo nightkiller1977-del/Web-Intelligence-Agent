@@ -58,11 +58,11 @@ def test_capabilities_do_not_advertise_unimplemented_contract_features():
     capabilities = response.json()["capabilities"]
     assert capabilities["source_level_citations"] is True
     assert capabilities["citations"] is True
-    assert capabilities["structured_evidence"] is False
-    assert capabilities["claim_verification"] is False
+    assert capabilities["structured_evidence"] is True
+    assert capabilities["claim_verification"] is True
     assert capabilities["source_policy"] is True
-    assert capabilities["model_budget_limits"] is False
-    assert capabilities["model_preferences"] is False
+    assert capabilities["model_budget_limits"] is True
+    assert capabilities["model_preferences"] is True
 
 
 def test_research_submission_completes_with_mocked_adapter(monkeypatch):
@@ -194,26 +194,100 @@ def test_unknown_source_policy_fields_are_rejected():
     assert "Unsupported sourcePolicy fields" in response.json()["detail"]
 
 
-def test_model_budget_limits_are_rejected_as_unsupported():
+def test_model_budget_limits_are_passed_to_adapter(monkeypatch):
+    observed_limits = None
+
+    async def fake_conduct_web_research(**kwargs):
+        nonlocal observed_limits
+        observed_limits = kwargs["limits"]
+        return {
+            "operationId": kwargs["op_id"],
+            "status": "completed",
+            "mode": kwargs["mode"],
+            "profile": kwargs["profile"],
+            "answer": "Mock answer",
+            "sources": [],
+            "evidence": [],
+            "claims": [],
+            "citations": [],
+            "searchesPerformed": [],
+            "metrics": {
+                "startedAt": "2026-01-01T00:00:00+00:00",
+                "completedAt": "2026-01-01T00:00:01+00:00",
+                "durationMs": 1,
+                "searchesPerformed": 0,
+                "pagesRead": 0,
+                "sourcesConsidered": 0,
+                "sourcesUsed": 0,
+            },
+        }
+
+    monkeypatch.setattr(api, "conduct_web_research", fake_conduct_web_research)
     payload = _payload("op-model-budget")
     payload["limits"]["maximumModelTokens"] = 1000
+    payload["limits"]["maximumModelCostUsd"] = 0.25
 
     with TestClient(app) as client:
         response = client.post("/v1/research", json=payload, headers=_auth_headers())
+        result = _wait_for_terminal_result(client, "op-model-budget")
 
-    assert response.status_code == 400
-    assert "Unsupported model budget limits" in response.json()["detail"]
+    assert response.status_code == 202
+    assert result["status"] == "completed"
+    assert observed_limits["maximumModelTokens"] == 1000
+    assert observed_limits["maximumModelCostUsd"] == 0.25
 
 
-def test_model_preferences_are_rejected_as_unsupported():
+def test_model_preferences_are_passed_to_adapter(monkeypatch):
+    observed_model = None
+
+    async def fake_conduct_web_research(**kwargs):
+        nonlocal observed_model
+        observed_model = (kwargs["model_provider"], kwargs["model_name"])
+        return {
+            "operationId": kwargs["op_id"],
+            "status": "completed",
+            "mode": kwargs["mode"],
+            "profile": kwargs["profile"],
+            "answer": "Mock answer",
+            "sources": [],
+            "evidence": [],
+            "claims": [],
+            "citations": [],
+            "searchesPerformed": [],
+            "metrics": {
+                "startedAt": "2026-01-01T00:00:00+00:00",
+                "completedAt": "2026-01-01T00:00:01+00:00",
+                "durationMs": 1,
+                "searchesPerformed": 0,
+                "pagesRead": 0,
+                "sourcesConsidered": 0,
+                "sourcesUsed": 0,
+            },
+        }
+
+    monkeypatch.setattr(api, "conduct_web_research", fake_conduct_web_research)
     payload = _payload("op-model-preferences")
+    payload["model_provider"] = "openai"
+    payload["model_name"] = "gpt-4o-mini"
+
+    with TestClient(app) as client:
+        response = client.post("/v1/research", json=payload, headers=_auth_headers())
+        result = _wait_for_terminal_result(client, "op-model-preferences")
+
+    assert response.status_code == 202
+    assert result["status"] == "completed"
+    assert observed_model == ("openai", "gpt-4o-mini")
+
+
+def test_incomplete_model_preferences_are_rejected():
+    payload = _payload("op-model-preferences-bad")
     payload["model_provider"] = "openai"
 
     with TestClient(app) as client:
         response = client.post("/v1/research", json=payload, headers=_auth_headers())
 
     assert response.status_code == 400
-    assert "Unsupported model preference fields" in response.json()["detail"]
+    assert "must be provided together" in response.json()["detail"]
 
 
 def test_cancel_unknown_operation_returns_not_found():

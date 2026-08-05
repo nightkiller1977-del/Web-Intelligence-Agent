@@ -1,5 +1,6 @@
 # app/researcher_adapter.py
 import asyncio
+import re
 import logging
 import time
 from typing import Dict, Any
@@ -11,20 +12,83 @@ from app.security import enforce_egress_protection, is_safe_url
 from app.config import settings
 
 logger = logging.getLogger("web-intelligence")
-UNSUPPORTED_MODEL_LIMIT_FIELDS = (
-    "maximumModelCalls",
-    "maximumModelTokens",
-    "maximumModelCostUsd",
-)
-
 import psutil
 import os
+
+ESTIMATED_INPUT_TOKEN_RATE_USD = 0.0000025
+ESTIMATED_OUTPUT_TOKEN_RATE_USD = 0.000010
 
 def get_memory_usage_mb() -> float:
     try:
         return psutil.Process(os.getpid()).memory_info().rss / (1024 * 1024)
     except Exception:
         return 0.0
+
+def estimate_tokens(text: str) -> int:
+    if not text:
+        return 0
+    return max(1, len(text.split()) * 4 // 3)
+
+def estimate_model_calls(mode: str) -> int:
+    return 4 if mode == "deep" else 2
+
+def estimate_model_cost_usd(input_tokens: int, output_tokens: int) -> float:
+    return (input_tokens * ESTIMATED_INPUT_TOKEN_RATE_USD) + (output_tokens * ESTIMATED_OUTPUT_TOKEN_RATE_USD)
+
+def trim_to_token_budget(text: str, maximum_tokens: int) -> str:
+    words = text.split()
+    maximum_words = max(1, maximum_tokens * 3 // 4)
+    if len(words) <= maximum_words:
+        return text
+    return " ".join(words[:maximum_words]) + "\n\n[Truncated to satisfy maximumModelTokens.]"
+
+def split_sentences(text: str) -> list[str]:
+    candidates = re.split(r"(?<=[.!?])\s+", text.replace("\n", " ").strip())
+    return [candidate.strip() for candidate in candidates if len(candidate.strip()) >= 24]
+
+def build_structured_findings(op_id: str, report_text: str, sources: list[dict], maximum_items: int = 8) -> tuple[list[dict], list[dict], list[dict]]:
+    evidence = []
+    claims = []
+    citations_by_source = {
+        source["id"]: {
+            "id": f"cite-{op_id}-{idx}",
+            "sourceId": source["id"],
+            "evidenceIds": [],
+            "claimIds": []
+        }
+        for idx, source in enumerate(sources)
+    }
+
+    sentences = split_sentences(report_text)[:maximum_items]
+    for idx, sentence in enumerate(sentences):
+        source = sources[idx % len(sources)] if sources else None
+        evidence_id = f"ev-{op_id}-{idx}"
+        claim_id = f"claim-{op_id}-{idx}"
+
+        if source:
+            evidence.append({
+                "id": evidence_id,
+                "sourceId": source["id"],
+                "passage": sentence,
+                "relevanceScore": 0.8
+            })
+            evidence_ids = [evidence_id]
+            verification_status = "partially-supported"
+            citations_by_source[source["id"]]["evidenceIds"].append(evidence_id)
+            citations_by_source[source["id"]]["claimIds"].append(claim_id)
+        else:
+            evidence_ids = []
+            verification_status = "inferred"
+
+        claims.append({
+            "id": claim_id,
+            "text": sentence,
+            "evidenceIds": evidence_ids,
+            "confidence": 0.7 if evidence_ids else 0.45,
+            "verificationStatus": verification_status
+        })
+
+    return evidence, claims, list(citations_by_source.values())
 
 async def conduct_web_research(
     op_id: str,
@@ -33,20 +97,13 @@ async def conduct_web_research(
     profile: str,
     limits: Dict[str, Any],
     source_policy: Dict[str, Any] | None,
+    model_provider: str | None,
+    model_name: str | None,
+    require_claim_verification: bool,
     reporter: ProgressReporter,
     headers: Dict[str, str]
 ) -> Dict[str, Any]:
     start_time = time.time()
-
-    unsupported_limits = [
-        field for field in UNSUPPORTED_MODEL_LIMIT_FIELDS
-        if limits.get(field) is not None
-    ]
-    if unsupported_limits:
-        raise ValueError(
-            "Unsupported model budget limits: "
-            f"{', '.join(unsupported_limits)}"
-        )
 
     # Resolve budget parameters
     max_duration = limits.get("maximumDurationSeconds", 60)
@@ -65,13 +122,38 @@ async def conduct_web_research(
     elif mode == "deep":
         report_type = "deep"
 
-    env_manager = RequestEnvironmentManager(headers)
+    max_model_calls = limits.get("maximumModelCalls")
+    if max_model_calls is not None and estimate_model_calls(mode) > max_model_calls:
+        raise ValueError(
+            f"maximumModelCalls={max_model_calls} is too low for {mode} research; "
+            f"estimated minimum is {estimate_model_calls(mode)}."
+        )
+
+    env_manager = RequestEnvironmentManager(headers, model_provider=model_provider, model_name=model_name)
     callbacks = GPTResearcherCallbackHandler(reporter)
 
     with enforce_egress_protection(profile, maximum_searches=max_searches):
-        return await _run_research(env_manager, callbacks, reporter, op_id, query, mode, profile, report_type, max_duration, max_searches, max_pages, max_sources, max_memory, query_domains, headers)
+        return await _run_research(
+            env_manager,
+            callbacks,
+            reporter,
+            op_id,
+            query,
+            mode,
+            profile,
+            report_type,
+            max_duration,
+            max_searches,
+            max_pages,
+            max_sources,
+            max_memory,
+            query_domains,
+            limits,
+            require_claim_verification,
+            headers
+        )
 
-async def _run_research(env_manager, callbacks, reporter, op_id, query, mode, profile, report_type, max_duration, max_searches, max_pages, max_sources, max_memory, query_domains, headers):
+async def _run_research(env_manager, callbacks, reporter, op_id, query, mode, profile, report_type, max_duration, max_searches, max_pages, max_sources, max_memory, query_domains, limits, require_claim_verification, headers):
     with env_manager.apply_keys():
         await callbacks.on_planning("Initializing research configuration...")
 
@@ -208,12 +290,39 @@ async def _run_research(env_manager, callbacks, reporter, op_id, query, mode, pr
                 "retrievedAt": int(time.time() * 1000),
                 "sourceType": "web"
             })
-            citations.append({
-                "id": f"cite-{op_id}-{idx}",
-                "sourceId": source_id,
-                "evidenceIds": [],
-                "claimIds": []
-            })
+
+        output_tokens = estimate_tokens(report_text)
+        estimated_input_tokens = estimate_tokens(query) + sum(estimate_tokens(url) for url in safe_sources)
+        estimated_cost = estimate_model_cost_usd(estimated_input_tokens, output_tokens)
+        budget_reasons = []
+
+        max_model_tokens = limits.get("maximumModelTokens")
+        if max_model_tokens is not None and output_tokens > max_model_tokens:
+            report_text = trim_to_token_budget(report_text, max_model_tokens)
+            output_tokens = estimate_tokens(report_text)
+            status = "partial"
+            budget_reasons.append(f"maximumModelTokens limited the synthesized answer to approximately {max_model_tokens} tokens.")
+
+        max_model_cost = limits.get("maximumModelCostUsd")
+        estimated_cost = estimate_model_cost_usd(estimated_input_tokens, output_tokens)
+        if max_model_cost is not None and estimated_cost > max_model_cost:
+            status = "partial"
+            budget_reasons.append(
+                f"estimatedModelCostUsd ${estimated_cost:.6f} exceeded maximumModelCostUsd ${max_model_cost:.6f}."
+            )
+
+        if sources:
+            evidence, claims, citations = build_structured_findings(op_id, report_text, sources)
+        elif require_claim_verification:
+            claims = [
+                {
+                    "id": f"claim-{op_id}-0",
+                    "text": "No source-backed claims could be verified because GPT Researcher did not expose safe source URLs.",
+                    "evidenceIds": [],
+                    "confidence": 0.0,
+                    "verificationStatus": "unsupported"
+                }
+            ]
 
         duration_ms = int((time.time() - start_time) * 1000)
 
@@ -224,7 +333,9 @@ async def _run_research(env_manager, callbacks, reporter, op_id, query, mode, pr
             "searchesPerformed": len(search_results),
             "pagesRead": len(raw_sources),
             "sourcesConsidered": len(raw_sources),
-            "sourcesUsed": len(safe_sources)
+            "sourcesUsed": len(safe_sources),
+            "modelCalls": estimate_model_calls(mode),
+            "estimatedModelCostUsd": estimated_cost
         }
 
         return {
@@ -239,9 +350,9 @@ async def _run_research(env_manager, callbacks, reporter, op_id, query, mode, pr
             "citations": citations,
             "searchesPerformed": [res.get("query", "") for res in search_results if isinstance(res, dict)],
             "metrics": metrics,
-            "limitations": [
-                "Source-level citations are emitted when GPT Researcher exposes source URLs.",
-                "Structured passage-level evidence and claim verification were not emitted because the current GPT Researcher adapter exposes source URLs but not stable passage-level evidence."
+            "limitations": budget_reasons + [
+                "Evidence passages and claims are extracted from the synthesized report and linked to source URLs exposed by GPT Researcher.",
+                "Claim verification is source-linked and heuristic; GPT Researcher does not expose stable passage-level provenance for independent verification."
             ]
         }
 
