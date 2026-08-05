@@ -349,15 +349,18 @@ def input_text_from_file(path: Path) -> str:
     if not path.is_file() or path.suffix.lower() not in SUPPORTED_INPUT_EXTENSIONS:
         return ""
     try:
-        raw = path.read_bytes()[:MAX_INPUT_FILE_BYTES]
+        with path.open("rb") as input_file:
+            raw = input_file.read(MAX_INPUT_FILE_BYTES)
         return raw.decode("utf-8", errors="replace")
     except OSError:
         logger.warning("Unable to read input file: %s", path)
         return ""
 
-def collect_document_context(documents: list[dict]) -> list[dict]:
+def collect_document_context(documents: list[dict], remaining_chunks: int = MAX_INPUT_CHUNKS) -> list[dict]:
     chunks = []
     for item in documents:
+        if len(chunks) >= remaining_chunks:
+            break
         if not isinstance(item, dict) or not item.get("path"):
             continue
         path = Path(str(item["path"])).expanduser()
@@ -370,9 +373,11 @@ def collect_document_context(documents: list[dict]) -> list[dict]:
             })
     return chunks
 
-def collect_repository_context(repositories: list[dict]) -> list[dict]:
+def collect_repository_context(repositories: list[dict], remaining_chunks: int = MAX_INPUT_CHUNKS) -> list[dict]:
     chunks = []
     for item in repositories:
+        if len(chunks) >= remaining_chunks:
+            break
         if not isinstance(item, dict) or not item.get("path"):
             continue
         root = Path(str(item["path"])).expanduser()
@@ -385,7 +390,7 @@ def collect_repository_context(repositories: list[dict]) -> list[dict]:
                 if dirname not in {".git", "node_modules", ".venv", "__pycache__", "dist", "build"}
             ]
             for filename in sorted(filenames):
-                if len(chunks) >= MAX_INPUT_CHUNKS or visited >= MAX_REPOSITORY_PATHS_VISITED:
+                if len(chunks) >= remaining_chunks or visited >= MAX_REPOSITORY_PATHS_VISITED:
                     break
                 visited += 1
                 path = Path(current_root) / filename
@@ -400,7 +405,7 @@ def collect_repository_context(repositories: list[dict]) -> list[dict]:
                         "branch": item.get("branch"),
                         "text": text
                     })
-            if len(chunks) >= MAX_INPUT_CHUNKS or visited >= MAX_REPOSITORY_PATHS_VISITED:
+            if len(chunks) >= remaining_chunks or visited >= MAX_REPOSITORY_PATHS_VISITED:
                 break
     return chunks
 
@@ -413,9 +418,9 @@ def collect_input_context(inputs: Dict[str, Any] | None) -> tuple[list[dict], bo
     documents = inputs.get("documents") or []
     repositories = inputs.get("repositories") or []
     if isinstance(documents, list):
-        chunks.extend(collect_document_context(documents))
-    if isinstance(repositories, list):
-        chunks.extend(collect_repository_context(repositories))
+        chunks.extend(collect_document_context(documents, MAX_INPUT_CHUNKS))
+    if isinstance(repositories, list) and len(chunks) < MAX_INPUT_CHUNKS:
+        chunks.extend(collect_repository_context(repositories, MAX_INPUT_CHUNKS - len(chunks)))
 
     total_bytes = 0
     bounded_chunks = []

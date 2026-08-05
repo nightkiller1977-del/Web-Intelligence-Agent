@@ -224,6 +224,34 @@ def test_input_text_from_file_disabled_outside_local_mode(monkeypatch, tmp_path)
     assert input_text_from_file(document) == ""
 
 
+def test_input_text_from_file_reads_only_capped_bytes(tmp_path):
+    document = tmp_path / "large.md"
+    document.write_text("a" * 50_000, encoding="utf-8")
+
+    text = input_text_from_file(document)
+
+    assert len(text) == 40_000
+
+
+def test_collect_input_context_caps_documents_before_repository_reads(tmp_path):
+    documents = []
+    for index in range(20):
+        document = tmp_path / f"doc-{index:02}.md"
+        document.write_text(f"document {index}", encoding="utf-8")
+        documents.append({"path": str(document)})
+
+    repository_file = tmp_path / "repo-extra.md"
+    repository_file.write_text("repository content", encoding="utf-8")
+
+    chunks, _ = collect_input_context({
+        "documents": documents,
+        "repositories": [{"path": str(tmp_path)}],
+    })
+
+    assert len(chunks) == 12
+    assert all(chunk["label"].startswith("doc-") for chunk in chunks)
+
+
 def test_collect_repository_context_short_circuits_large_trees(tmp_path):
     for index in range(20):
         (tmp_path / f"file-{index:02}.md").write_text(f"content {index}", encoding="utf-8")
