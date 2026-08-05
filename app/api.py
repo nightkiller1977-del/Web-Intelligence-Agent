@@ -113,7 +113,12 @@ async def capabilities():
             "standard_research": True,
             "deep_research": True,
             "cancellations": True,
-            "citations": True,
+            "citations": False,
+            "structured_evidence": False,
+            "claim_verification": False,
+            "source_policy": False,
+            "model_budget_limits": False,
+            "model_preferences": False,
             "ssrf_egress_blocking": True,
             "ssrf_url_query_validation": True,
             "ssrf_source_result_redaction": True,
@@ -132,7 +137,7 @@ async def background_research_task(req: ResearchRequestInput, reporter: Progress
             query=req.query,
             mode=req.mode,
             profile=req.profile,
-            limits=req.limits.dict(),
+            limits=req.limits.model_dump(),
             reporter=reporter,
             headers=headers
         )

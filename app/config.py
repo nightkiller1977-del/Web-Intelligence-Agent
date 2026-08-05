@@ -3,8 +3,11 @@ import os
 import secrets
 from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings
+from pydantic_settings import SettingsConfigDict
 
 class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=".env", extra="allow")
+
     # Process Bindings
     HOST: str = "127.0.0.1"
     PORT: int = int(os.getenv("PORT", 8080))
@@ -24,8 +27,6 @@ class Settings(BaseSettings):
     # 'local' (in-memory/SQLite) vs. 'redis' (production queues on Render)
     STORAGE_BACKEND: str = os.getenv("STORAGE_BACKEND", "local")
     REDIS_URL: str = os.getenv("REDIS_URL", "")
-    DATABASE_URL: str = os.getenv("DATABASE_URL", "")
-
     # Concurrency and Budgets
     MAX_CONCURRENT_OPS: int = int(os.getenv("MAX_CONCURRENT_OPS", 3))
     MAX_MEMORY_MB: int = int(os.getenv("MAX_MEMORY_MB", 512))
@@ -33,13 +34,6 @@ class Settings(BaseSettings):
     # CORS policies
     # Disabled by default in remote mode unless explicitly authorized
     CORS_ORIGINS: str = os.getenv("CORS_ORIGINS", "")
-
-    # Spend & Costs limit
-    DAILY_SPEND_LIMIT_USD: float = float(os.getenv("DAILY_SPEND_LIMIT_USD", 50.0))
-
-    class Config:
-        env_file = ".env"
-        extra = "allow"
 
 settings = Settings()
 

@@ -23,9 +23,6 @@ class BaseStorage:
     async def delete_operation(self, op_id: str):
         raise NotImplementedError()
 
-    async def claim_lock(self, op_id: str, instance_id: str) -> bool:
-        raise NotImplementedError()
-
     async def claim_idempotency_key(self, key: str, op_id: str) -> Optional[str]:
         """Atomically claim an idempotency key for op_id.
         Returns None on success, or the existing op_id if already claimed."""
@@ -56,7 +53,6 @@ class BaseStorage:
 class InMemoryStorage(BaseStorage):
     def __init__(self):
         self.operations: Dict[str, Dict[str, Any]] = {}
-        self.locks: Dict[str, str] = {}
         self.events: Dict[str, List[Dict[str, Any]]] = {}
         self.idempotency_keys: Dict[str, str] = {}
         self.operation_claims: Dict[str, str] = {}
@@ -75,18 +71,11 @@ class InMemoryStorage(BaseStorage):
 
     async def delete_operation(self, op_id: str):
         self.operations.pop(op_id, None)
-        self.locks.pop(op_id, None)
         self.events.pop(op_id, None)
         self.operation_claims.pop(op_id, None)
         for key, existing_op_id in list(self.idempotency_keys.items()):
             if existing_op_id == op_id:
                 self.idempotency_keys.pop(key, None)
-
-    async def claim_lock(self, op_id: str, instance_id: str) -> bool:
-        if op_id in self.locks and self.locks[op_id] != instance_id:
-            return False
-        self.locks[op_id] = instance_id
-        return True
 
     async def claim_idempotency_key(self, key: str, op_id: str) -> Optional[str]:
         existing = self.idempotency_keys.get(key)
@@ -183,16 +172,8 @@ class RedisStorage(BaseStorage):
         if self.degraded:
             return await self.fallback.delete_operation(op_id)
         await self.redis.hdel("research:operations", op_id)
-        await self.redis.delete(f"research:locks:{op_id}")
         await self.redis.delete(f"research:events:{op_id}")
         await self.redis.delete(f"research:operation_claims:{op_id}")
-
-    async def claim_lock(self, op_id: str, instance_id: str) -> bool:
-        if self.degraded:
-            return await self.fallback.claim_lock(op_id, instance_id)
-        lock_key = f"research:locks:{op_id}"
-        success = await self.redis.set(lock_key, instance_id, nx=True, ex=600)
-        return bool(success)
 
     async def claim_idempotency_key(self, key: str, op_id: str) -> Optional[str]:
         if self.degraded:
