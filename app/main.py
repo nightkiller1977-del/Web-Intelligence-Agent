@@ -7,7 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
-from app.config import auth_is_configured, settings
+from app.config import auth_is_configured, settings, unauthenticated_docs_allowed
 from app.storage import storage
 from app.cancellation import cancellation_manager
 from app.api import router
@@ -18,6 +18,8 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 )
 logger = logging.getLogger("web-intelligence")
+PUBLIC_PATHS = {"/health/live", "/health/ready", "/capabilities", "/version", "/metrics"}
+DOCS_PATHS = {"/docs", "/redoc", "/openapi.json", "/docs/oauth2-redirect"}
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -63,7 +65,10 @@ if settings.CORS_ORIGINS:
 @app.middleware("http")
 async def verify_auth_token(request: Request, call_next):
     # Exempt health checks and capabilities discovery from authorization checking
-    if request.url.path in ("/health/live", "/health/ready", "/capabilities", "/version", "/metrics"):
+    if request.url.path in PUBLIC_PATHS:
+        return await call_next(request)
+
+    if request.url.path in DOCS_PATHS and unauthenticated_docs_allowed():
         return await call_next(request)
 
     token = settings.AUTH_TOKEN
