@@ -64,7 +64,7 @@ async def conduct_web_research(
     env_manager = RequestEnvironmentManager(headers)
     callbacks = GPTResearcherCallbackHandler(reporter)
 
-    with enforce_egress_protection(profile):
+    with enforce_egress_protection(profile, maximum_searches=max_searches):
         return await _run_research(env_manager, callbacks, reporter, op_id, query, mode, profile, report_type, max_duration, max_searches, max_pages, max_sources, max_memory, headers)
 
 async def _run_research(env_manager, callbacks, reporter, op_id, query, mode, profile, report_type, max_duration, max_searches, max_pages, max_sources, max_memory, headers):
@@ -78,12 +78,11 @@ async def _run_research(env_manager, callbacks, reporter, op_id, query, mode, pr
             report_type=report_type
         )
 
-        # Distribute the caller's total budget across iterations so the
-        # aggregate stays within the requested maximumSearches / maximumPages.
-        per_iter_searches = max(1, max_searches // max_iterations)
+        # maximumSearches is enforced at the outbound search-provider boundary.
+        # Keep per-query result/page fanout bounded by source/page limits.
         per_iter_pages = max(1, max_pages // max_iterations)
         researcher.cfg.max_iterations = max_iterations
-        researcher.cfg.max_search_results_per_query = per_iter_searches
+        researcher.cfg.max_search_results_per_query = max(1, max_sources)
         researcher.cfg.max_urls_per_query = per_iter_pages
 
         SYNTHESIS_TIMEOUT = min(30, max_duration * 0.25)
