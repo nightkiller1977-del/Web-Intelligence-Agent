@@ -53,3 +53,25 @@ def test_blank_query_is_rejected():
             query="   ",
             limits=_limits()
         )
+
+
+def test_unknown_freshness_field_is_rejected():
+    with pytest.raises(ValidationError):
+        ResearchRequestInput(
+            operationId="op-freshness",
+            attemptId="attempt-freshness",
+            query="test",
+            freshness={"before": "2026-08-01"},
+            limits=_limits()
+        )
+
+
+def test_unknown_inputs_field_is_rejected():
+    with pytest.raises(ValidationError):
+        ResearchRequestInput(
+            operationId="op-inputs",
+            attemptId="attempt-inputs",
+            query="test",
+            inputs={"attachments": []},
+            limits=_limits()
+        )

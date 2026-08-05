@@ -4,6 +4,8 @@ from typing import List, Optional, Dict, Any
 
 SUPPORTED_MODES = {"quick", "standard", "deep"}
 SUPPORTED_PROFILES = {"general", "technical", "repair", "code-review", "security"}
+SUPPORTED_FRESHNESS_KEYS = {"since", "until", "maxAgeDays"}
+SUPPORTED_INPUT_KEYS = {"documents", "documentInputs", "repositories", "repositoryInputs", "allowExternalUse"}
 
 class LimitConfig(BaseModel):
     maximumDurationSeconds: int = Field(..., gt=0, le=3600, description="Maximum duration allowed in seconds")
@@ -62,6 +64,26 @@ class ResearchRequestInput(BaseModel):
     def validate_query(cls, value: str) -> str:
         if not value.strip():
             raise ValueError("query must not be blank")
+        return value
+
+    @field_validator("freshness")
+    @classmethod
+    def validate_freshness(cls, value: Optional[Dict[str, str]]) -> Optional[Dict[str, str]]:
+        if value is None:
+            return value
+        unsupported = set(value.keys()) - SUPPORTED_FRESHNESS_KEYS
+        if unsupported:
+            raise ValueError(f"Unsupported freshness fields: {', '.join(sorted(unsupported))}")
+        return value
+
+    @field_validator("inputs")
+    @classmethod
+    def validate_inputs(cls, value: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        if value is None:
+            return value
+        unsupported = set(value.keys()) - SUPPORTED_INPUT_KEYS
+        if unsupported:
+            raise ValueError(f"Unsupported inputs fields: {', '.join(sorted(unsupported))}")
         return value
 
 class ResearchSource(BaseModel):
