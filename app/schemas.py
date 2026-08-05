@@ -1,6 +1,8 @@
 # app/schemas.py
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from typing import List, Optional, Dict, Any
+
+SUPPORTED_PROFILES = {"general", "technical", "repair", "code-review", "security"}
 
 class LimitConfig(BaseModel):
     maximumDurationSeconds: int = Field(..., description="Maximum duration allowed in seconds")
@@ -36,6 +38,14 @@ class ResearchRequestInput(BaseModel):
     # Model preferences
     model_provider: Optional[str] = None
     model_name: Optional[str] = None
+
+    @field_validator("profile")
+    @classmethod
+    def validate_profile(cls, value: str) -> str:
+        if value not in SUPPORTED_PROFILES:
+            supported = ", ".join(sorted(SUPPORTED_PROFILES))
+            raise ValueError(f"Unsupported research profile '{value}'. Supported profiles: {supported}")
+        return value
 
 class ResearchSource(BaseModel):
     id: str
