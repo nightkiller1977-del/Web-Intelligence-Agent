@@ -11,9 +11,9 @@ class LimitConfig(BaseModel):
     maximumPages: int = Field(..., gt=0, le=500, description="Maximum pages to scrape")
     maximumSources: int = Field(..., gt=0, le=100, description="Maximum sources to return in results")
     maximumMemoryMb: Optional[int] = Field(None, gt=0, le=262144, description="Per-operation memory guardrail in MB")
-    maximumModelCalls: Optional[int] = Field(None, gt=0, description="Unsupported by the GPT Researcher adapter")
-    maximumModelTokens: Optional[int] = Field(None, gt=0, description="Unsupported by the GPT Researcher adapter")
-    maximumModelCostUsd: Optional[float] = Field(None, gt=0, description="Unsupported by the GPT Researcher adapter")
+    maximumModelCalls: Optional[int] = Field(None, gt=0, description="Maximum estimated model calls allowed")
+    maximumModelTokens: Optional[int] = Field(None, gt=0, description="Maximum estimated output tokens allowed")
+    maximumModelCostUsd: Optional[float] = Field(None, gt=0, description="Maximum estimated model cost allowed in USD")
 
 class DocumentInput(BaseModel):
     path: str = Field(..., min_length=1)
@@ -31,15 +31,15 @@ class ResearchRequestInput(BaseModel):
     mode: str = Field("standard", description="Research mode: quick, standard, deep")
     profile: str = Field("general", description="Research profile: general, technical, repair, etc.")
     freshness: Optional[Dict[str, str]] = None
-    sourcePolicy: Optional[Dict[str, Any]] = Field(None, description="Unsupported by the GPT Researcher adapter")
+    sourcePolicy: Optional[Dict[str, Any]] = Field(None, description="Optional source policy. Only allowedDomains is supported.")
     limits: LimitConfig
     inputs: Optional[Dict[str, Any]] = None
     requireCitations: bool = True
-    requireClaimVerification: Optional[bool] = Field(False, description="Unsupported by the GPT Researcher adapter")
+    requireClaimVerification: Optional[bool] = Field(False, description="Return heuristic source-linked claim verification records")
     
     # Model preferences
-    model_provider: Optional[str] = Field(None, description="Unsupported by the GPT Researcher adapter")
-    model_name: Optional[str] = Field(None, description="Unsupported by the GPT Researcher adapter")
+    model_provider: Optional[str] = Field(None, description="GPT Researcher LLM provider, for example openai")
+    model_name: Optional[str] = Field(None, description="GPT Researcher LLM model name")
 
     @field_validator("mode")
     @classmethod
