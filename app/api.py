@@ -13,7 +13,7 @@ from app.cancellation import cancellation_manager
 from app.progress_adapter import ProgressReporter
 from app.researcher_adapter import conduct_web_research
 from app.security import is_safe_url
-from app.metrics import research_duration, sources_fetched
+from app.metrics import observe_research_result
 
 logger = logging.getLogger("web-intelligence")
 router = APIRouter()
@@ -113,10 +113,11 @@ async def capabilities():
             "standard_research": True,
             "deep_research": True,
             "cancellations": True,
-            "citations": False,
+            "source_level_citations": True,
+            "citations": True,
             "structured_evidence": False,
             "claim_verification": False,
-            "source_policy": False,
+            "source_policy": True,
             "model_budget_limits": False,
             "model_preferences": False,
             "ssrf_egress_blocking": True,
@@ -131,6 +132,9 @@ async def background_research_task(req: ResearchRequestInput, reporter: Progress
     op_id = req.operationId
 
     try:
+        await storage.save_operation(op_id, {"status": "running"})
+        await reporter.report("planning", "Research task started.")
+
         # Run execution loop
         result = await conduct_web_research(
             op_id=op_id,
@@ -138,18 +142,15 @@ async def background_research_task(req: ResearchRequestInput, reporter: Progress
             mode=req.mode,
             profile=req.profile,
             limits=req.limits.model_dump(),
+            source_policy=req.sourcePolicy,
             reporter=reporter,
             headers=headers
         )
 
         # Save output result
         await storage.save_operation(op_id, result)
-        metrics = result.get("metrics") or {}
-        research_duration.labels(
-            agent_profile=req.profile,
-            mode=req.mode
-        ).observe(metrics.get("durationMs", 0))
-        sources_fetched.labels(agent_profile=req.profile).observe(metrics.get("sourcesConsidered", 0))
+        observe_research_result(result)
+        await reporter.report(result["status"], f"Research task {result['status']}.")
 
     except asyncio.CancelledError:
         logger.warning(f"Operation {op_id} was cancelled during execution.")
@@ -163,6 +164,7 @@ async def background_research_task(req: ResearchRequestInput, reporter: Progress
             "metrics": {"startedAt": "", "durationMs": 0, "searchesPerformed": 0, "pagesRead": 0, "sourcesConsidered": 0, "sourcesUsed": 0}
         }
         await storage.save_operation(op_id, cancelled_state)
+        observe_research_result(cancelled_state)
         await reporter.report("cancelled", "Research task cancelled.")
 
     except Exception:
@@ -178,6 +180,7 @@ async def background_research_task(req: ResearchRequestInput, reporter: Progress
             "error": client_safe_error()
         }
         await storage.save_operation(op_id, failed_state)
+        observe_research_result(failed_state)
         await reporter.report("failed", "Research task failed. Check server logs for redacted diagnostics.")
 
     finally:
@@ -240,10 +243,15 @@ async def start_research(
                 )
             )
 
-        if req.sourcePolicy:
+        unsupported_source_policy_keys = set((req.sourcePolicy or {}).keys()) - {"allowedDomains"}
+        if unsupported_source_policy_keys:
             raise HTTPException(
                 status_code=400,
-                detail="sourcePolicy is not supported by this adapter yet. Omit it or enforce source constraints before submitting the request."
+                detail=(
+                    "Unsupported sourcePolicy fields: "
+                    f"{', '.join(sorted(unsupported_source_policy_keys))}. "
+                    "Only allowedDomains is supported."
+                )
             )
 
         # 3. Atomic idempotency check-and-reserve before new-work concurrency limiting.
