@@ -32,6 +32,7 @@ async def conduct_web_research(
     mode: str,
     profile: str,
     limits: Dict[str, Any],
+    source_policy: Dict[str, Any] | None,
     reporter: ProgressReporter,
     headers: Dict[str, str]
 ) -> Dict[str, Any]:
@@ -53,6 +54,9 @@ async def conduct_web_research(
     max_pages = limits.get("maximumPages", 10)
     max_sources = limits.get("maximumSources", 10)
     max_memory = limits.get("maximumMemoryMb") or settings.MAX_MEMORY_MB
+    query_domains = None
+    if isinstance(source_policy, dict) and isinstance(source_policy.get("allowedDomains"), list):
+        query_domains = source_policy["allowedDomains"]
 
     # Determine gpt-researcher report types based on mode
     report_type = "research_report"
@@ -65,9 +69,9 @@ async def conduct_web_research(
     callbacks = GPTResearcherCallbackHandler(reporter)
 
     with enforce_egress_protection(profile, maximum_searches=max_searches):
-        return await _run_research(env_manager, callbacks, reporter, op_id, query, mode, profile, report_type, max_duration, max_searches, max_pages, max_sources, max_memory, headers)
+        return await _run_research(env_manager, callbacks, reporter, op_id, query, mode, profile, report_type, max_duration, max_searches, max_pages, max_sources, max_memory, query_domains, headers)
 
-async def _run_research(env_manager, callbacks, reporter, op_id, query, mode, profile, report_type, max_duration, max_searches, max_pages, max_sources, max_memory, headers):
+async def _run_research(env_manager, callbacks, reporter, op_id, query, mode, profile, report_type, max_duration, max_searches, max_pages, max_sources, max_memory, query_domains, headers):
     with env_manager.apply_keys():
         await callbacks.on_planning("Initializing research configuration...")
 
@@ -75,7 +79,8 @@ async def _run_research(env_manager, callbacks, reporter, op_id, query, mode, pr
 
         researcher = GPTResearcher(
             query=query,
-            report_type=report_type
+            report_type=report_type,
+            query_domains=query_domains
         )
 
         # maximumSearches is enforced at the outbound search-provider boundary.
@@ -203,6 +208,12 @@ async def _run_research(env_manager, callbacks, reporter, op_id, query, mode, pr
                 "retrievedAt": int(time.time() * 1000),
                 "sourceType": "web"
             })
+            citations.append({
+                "id": f"cite-{op_id}-{idx}",
+                "sourceId": source_id,
+                "evidenceIds": [],
+                "claimIds": []
+            })
 
         duration_ms = int((time.time() - start_time) * 1000)
 
@@ -229,7 +240,8 @@ async def _run_research(env_manager, callbacks, reporter, op_id, query, mode, pr
             "searchesPerformed": [res.get("query", "") for res in search_results if isinstance(res, dict)],
             "metrics": metrics,
             "limitations": [
-                "Structured evidence and claim verification were not emitted because the current GPT Researcher adapter exposes source URLs but not stable passage-level evidence."
+                "Source-level citations are emitted when GPT Researcher exposes source URLs.",
+                "Structured passage-level evidence and claim verification were not emitted because the current GPT Researcher adapter exposes source URLs but not stable passage-level evidence."
             ]
         }
 

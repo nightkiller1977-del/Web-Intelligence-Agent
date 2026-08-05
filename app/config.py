@@ -30,6 +30,7 @@ class Settings(BaseSettings):
     # Concurrency and Budgets
     MAX_CONCURRENT_OPS: int = int(os.getenv("MAX_CONCURRENT_OPS", 3))
     MAX_MEMORY_MB: int = int(os.getenv("MAX_MEMORY_MB", 512))
+    DAILY_SPEND_LIMIT_USD: float = float(os.getenv("DAILY_SPEND_LIMIT_USD", 50.0))
 
     # CORS policies
     # Disabled by default in remote mode unless explicitly authorized
