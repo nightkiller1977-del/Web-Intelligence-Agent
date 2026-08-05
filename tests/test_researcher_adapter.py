@@ -13,6 +13,7 @@ from app.researcher_adapter import (
     collect_source_metadata,
     estimate_model_calls,
     estimate_model_cost_usd,
+    input_text_from_file,
     verify_claims_against_evidence,
     trim_to_token_budget,
 )
@@ -211,6 +212,16 @@ def test_collect_input_context_disabled_outside_local_mode(monkeypatch, tmp_path
 
     assert chunks == []
     assert allow_external is False
+
+
+def test_input_text_from_file_disabled_outside_local_mode(monkeypatch, tmp_path):
+    import app.researcher_adapter as adapter
+
+    document = tmp_path / "notes.md"
+    document.write_text("remote mode should not read this", encoding="utf-8")
+    monkeypatch.setattr(adapter.settings, "DEPLOYMENT_MODE", "remote")
+
+    assert input_text_from_file(document) == ""
 
 
 def test_collect_repository_context_short_circuits_large_trees(tmp_path):

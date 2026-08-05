@@ -344,6 +344,8 @@ def freshness_instruction(freshness: Dict[str, str] | None) -> str:
     return "; ".join(parts)
 
 def input_text_from_file(path: Path) -> str:
+    if settings.DEPLOYMENT_MODE != "local":
+        return ""
     if not path.is_file() or path.suffix.lower() not in SUPPORTED_INPUT_EXTENSIONS:
         return ""
     try:
