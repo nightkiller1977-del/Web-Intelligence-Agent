@@ -154,6 +154,7 @@ class TestIdempotency:
 
         payload = {
             "operationId": "op-dup-1",
+            "attemptId": "attempt-dup-1",
             "query": "latest Python releases",
             "mode": "standard",
             "profile": "general",
@@ -206,6 +207,7 @@ class TestRedisLocking:
                     "/v1/research",
                     json={
                         "operationId": op_id,
+                        "attemptId": f"attempt-{op_id}",
                         "query": f"test query {op_id}",
                         "mode": "standard",
                         "profile": "general",
@@ -216,7 +218,10 @@ class TestRedisLocking:
                             "maximumSources": 5
                         }
                     },
-                    headers=headers
+                    headers={
+                        **headers,
+                        "Idempotency-Key": f"idem-key-concurrent-{op_id}"
+                    }
                 )
                 return response.status_code
             except Exception as e:
@@ -258,6 +263,7 @@ class TestConcurrencyLimiting:
                     "/v1/research",
                     json={
                         "operationId": f"op-limit-{i}",
+                        "attemptId": f"attempt-limit-{i}",
                         "query": f"query {i}",
                         "mode": "standard",
                         "profile": "general",
@@ -268,7 +274,10 @@ class TestConcurrencyLimiting:
                             "maximumSources": 5
                         }
                     },
-                    headers=headers,
+                    headers={
+                        **headers,
+                        "Idempotency-Key": f"idem-key-limit-{i}"
+                    },
                     timeout=0.5  # Don't wait long for each request
                 )
                 responses.append(response.status_code)
