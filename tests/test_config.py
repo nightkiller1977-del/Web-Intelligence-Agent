@@ -1,7 +1,8 @@
 from app.config import Settings
 
 
-def test_auth_token_loads_from_documented_dotenv_name(tmp_path):
+def test_auth_token_loads_from_documented_dotenv_name(tmp_path, monkeypatch):
+    monkeypatch.delenv("WEB_INTELLIGENCE_AUTH_TOKEN", raising=False)
     env_file = tmp_path / ".env"
     env_file.write_text("WEB_INTELLIGENCE_AUTH_TOKEN=dotenv-token\n")
 
