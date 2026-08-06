@@ -41,8 +41,10 @@ class RequestEnvironmentManager:
     Safely applies request-specific LLM and Search credentials to the task-local context
     without mutating the process-wide os.environ, preventing credential leaks or race conditions.
     """
-    def __init__(self, headers: Dict[str, str]):
+    def __init__(self, headers: Dict[str, str], model_provider: Optional[str] = None, model_name: Optional[str] = None):
         self.headers = headers
+        self.model_provider = model_provider
+        self.model_name = model_name
         self.key_map = {
             "X-LLM-Key": "OPENAI_API_KEY",
             "X-Search-Key": "TAVILY_API_KEY"
@@ -50,16 +52,16 @@ class RequestEnvironmentManager:
 
     @contextlib.contextmanager
     def apply_keys(self):
-        if not raw_header_credentials_allowed():
-            yield
-            return
-
-        # 1. Read loopback headers
         overrides = {}
-        for header_name, env_name in self.key_map.items():
-            val = self.headers.get(header_name) or self.headers.get(header_name.lower())
-            if val:
-                overrides[env_name] = val
+        if raw_header_credentials_allowed():
+            for header_name, env_name in self.key_map.items():
+                val = self.headers.get(header_name) or self.headers.get(header_name.lower())
+                if val:
+                    overrides[env_name] = val
+        if self.model_provider and self.model_name:
+            llm = f"{self.model_provider}:{self.model_name}"
+            overrides["FAST_LLM"] = llm
+            overrides["SMART_LLM"] = llm
 
         # 2. Inherit current overrides and merge
         current = request_env.get()

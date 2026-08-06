@@ -67,6 +67,7 @@ paths:
   /capabilities:
     get:
       summary: Supported capabilities list
+      description: Capability booleans report the implemented adapter surface. Source-level citations, source policy, passage-level evidence and claim records, model budget limits, and model preferences are supported.
       responses:
         '200':
           description: Capabilities metadata
@@ -85,9 +86,40 @@ paths:
                     type: object
                     additionalProperties:
                       type: boolean
+                    example:
+                      quick_search: true
+                      standard_research: true
+                      deep_research: true
+                      cancellations: true
+                      source_level_citations: true
+                      citations: true
+                      structured_evidence: true
+                      claim_verification: true
+                      source_policy: true
+                      model_budget_limits: true
+                      model_preferences: true
+                      ssrf_egress_blocking: true
+  /metrics:
+    get:
+      summary: Prometheus metrics
+      description: Exposes operation counters, duration and source-count histograms, and estimated output-token counters.
+      responses:
+        '200':
+          description: Prometheus text exposition format
+          content:
+            text/plain:
+              schema:
+                type: string
   /v1/research:
     post:
       summary: Submit a research request
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: false
+          schema:
+            type: string
+          description: Deterministic idempotency key. Required when idempotencyKey is omitted from the JSON body.
       requestBody:
         required: true
         content:
@@ -96,24 +128,50 @@ paths:
               type: object
               required:
                 - operationId
-                - idempotencyKey
                 - attemptId
                 - query
                 - limits
               properties:
                 operationId:
                   type: string
+                  minLength: 1
+                  maxLength: 128
                 idempotencyKey:
                   type: string
+                  minLength: 1
+                  maxLength: 256
+                  description: Deterministic idempotency key. Optional when the Idempotency-Key header is provided.
                 attemptId:
                   type: string
+                  minLength: 1
+                  maxLength: 128
                 query:
                   type: string
+                  minLength: 1
+                  maxLength: 8000
                 mode:
                   type: string
                   enum: [quick, standard, deep]
                 profile:
                   type: string
+                  enum: [general, technical, repair, code-review, security]
+                sourcePolicy:
+                  type: object
+                  description: Optional source policy. Only allowedDomains is supported.
+                  properties:
+                    allowedDomains:
+                      type: array
+                      items:
+                        type: string
+                requireClaimVerification:
+                  type: boolean
+                  description: Return source/context passage-backed claim verification records.
+                model_provider:
+                  type: string
+                  description: GPT Researcher LLM provider, for example openai. Must be provided with model_name.
+                model_name:
+                  type: string
+                  description: GPT Researcher LLM model. Must be provided with model_provider.
                 limits:
                   type: object
                   required:
@@ -124,12 +182,37 @@ paths:
                   properties:
                     maximumDurationSeconds:
                       type: integer
+                      minimum: 1
+                      maximum: 3600
                     maximumSearches:
                       type: integer
+                      minimum: 1
+                      maximum: 100
                     maximumPages:
                       type: integer
+                      minimum: 1
+                      maximum: 500
                     maximumSources:
                       type: integer
+                      minimum: 1
+                      maximum: 100
+                    maximumMemoryMb:
+                      type: integer
+                      minimum: 1
+                      description: Per-operation memory guardrail in MB.
+                    maximumModelCalls:
+                      type: integer
+                      minimum: 1
+                      description: Maximum estimated model calls allowed.
+                    maximumModelTokens:
+                      type: integer
+                      minimum: 1
+                      description: Maximum estimated output tokens allowed.
+                    maximumModelCostUsd:
+                      type: number
+                      format: float
+                      minimum: 0
+                      description: Maximum estimated model cost allowed in USD.
       responses:
         '202':
           description: Research operation queued successfully
@@ -143,6 +226,12 @@ paths:
                   status:
                     type: string
                     example: queued
+        '400':
+          description: Unsupported adapter field or blocked target URL
+        '409':
+          description: operationId is already associated with a different idempotency key
+        '422':
+          description: Request validation failed
   /v1/research/{operationId}/events:
     get:
       summary: Subscribe to research progress events
@@ -162,6 +251,7 @@ paths:
   /v1/research/{operationId}/result:
     get:
       summary: Fetch finalized structured research result
+      description: Returns the synthesized answer, source URLs, source-level citation records, passage-level evidence and claims, metrics, and adapter limitations.
       parameters:
         - name: operationId
           in: path

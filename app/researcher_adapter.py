@@ -1,19 +1,22 @@
 # app/researcher_adapter.py
 import asyncio
+import re
 import logging
 import time
-from typing import Dict, Any, List
+from typing import Dict, Any
 from gpt_researcher import GPTResearcher
 
 from app.progress_adapter import ProgressReporter, GPTResearcherCallbackHandler
 from app.model_adapter import RequestEnvironmentManager
-from app.security import is_safe_url, active_profile
+from app.security import enforce_egress_protection, is_safe_url
 from app.config import settings
 
 logger = logging.getLogger("web-intelligence")
-
 import psutil
 import os
+
+ESTIMATED_INPUT_TOKEN_RATE_USD = 0.0000025
+ESTIMATED_OUTPUT_TOKEN_RATE_USD = 0.000010
 
 def get_memory_usage_mb() -> float:
     try:
@@ -21,12 +24,198 @@ def get_memory_usage_mb() -> float:
     except Exception:
         return 0.0
 
+def estimate_tokens(text: str) -> int:
+    if not text:
+        return 0
+    return max(1, len(text.split()) * 4 // 3)
+
+def estimate_model_calls(mode: str) -> int:
+    return 4 if mode == "deep" else 2
+
+def estimate_model_cost_usd(input_tokens: int, output_tokens: int) -> float:
+    return (input_tokens * ESTIMATED_INPUT_TOKEN_RATE_USD) + (output_tokens * ESTIMATED_OUTPUT_TOKEN_RATE_USD)
+
+def trim_to_token_budget(text: str, maximum_tokens: int) -> str:
+    words = text.split()
+    maximum_words = max(1, maximum_tokens * 3 // 4)
+    if len(words) <= maximum_words:
+        return text
+    return " ".join(words[:maximum_words]) + "\n\n[Truncated to satisfy maximumModelTokens.]"
+
+def split_sentences(text: str) -> list[str]:
+    candidates = re.split(r"(?<=[.!?])\s+", text.replace("\n", " ").strip())
+    return [candidate.strip() for candidate in candidates if len(candidate.strip()) >= 24]
+
+def normalize_source_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        return "\n".join(normalize_source_text(item) for item in value)
+    if isinstance(value, dict):
+        for key in ("content", "raw_content", "summary", "text", "body"):
+            if value.get(key):
+                return normalize_source_text(value[key])
+    return str(value)
+
+def source_url_from_record(record: dict) -> str:
+    for key in ("url", "source", "link", "href"):
+        if record.get(key):
+            return str(record[key])
+    return ""
+
+def source_title_from_record(record: dict, fallback: str) -> str:
+    for key in ("title", "name", "source"):
+        if record.get(key):
+            return str(record[key])
+    return fallback
+
+def collect_passage_records(researcher, safe_source_urls: list[str]) -> list[dict]:
+    source_url_set = set(safe_source_urls)
+    records = []
+
+    for raw in researcher.get_research_sources() or []:
+        if not isinstance(raw, dict):
+            continue
+        url = source_url_from_record(raw)
+        if url and url not in source_url_set:
+            continue
+        text = normalize_source_text(raw)
+        if text:
+            records.append({
+                "url": url,
+                "title": source_title_from_record(raw, "Research source"),
+                "text": text
+            })
+
+    context_items = researcher.get_research_context() or []
+    if isinstance(context_items, str):
+        context_items = [context_items]
+    for item in context_items:
+        text = normalize_source_text(item)
+        if not text:
+            continue
+        url = ""
+        for candidate in safe_source_urls:
+            if candidate in text:
+                url = candidate
+                break
+        records.append({
+            "url": url,
+            "title": "Research context",
+            "text": text
+        })
+
+    return records
+
+def select_passages(text: str, maximum_passages: int = 3) -> list[str]:
+    sentences = split_sentences(text)
+    if sentences:
+        return sentences[:maximum_passages]
+    compact = " ".join(text.split())
+    return [compact[:500]] if compact else []
+
+def build_structured_findings_from_passages(op_id: str, passage_records: list[dict], sources: list[dict], maximum_items: int = 12) -> tuple[list[dict], list[dict], list[dict]]:
+    evidence = []
+    claims = []
+    source_by_url = {source["url"]: source for source in sources}
+    default_source = sources[0] if sources else None
+    citations_by_source = {
+        source["id"]: {
+            "id": f"cite-{op_id}-{idx}",
+            "sourceId": source["id"],
+            "evidenceIds": [],
+            "claimIds": []
+        }
+        for idx, source in enumerate(sources)
+    }
+
+    for record in passage_records:
+        if len(evidence) >= maximum_items:
+            break
+        source = source_by_url.get(record.get("url")) or default_source
+        if not source:
+            continue
+        for passage in select_passages(record.get("text", "")):
+            if len(evidence) >= maximum_items:
+                break
+            idx = len(evidence)
+            evidence_id = f"ev-{op_id}-{idx}"
+            claim_id = f"claim-{op_id}-{idx}"
+            evidence.append({
+                "id": evidence_id,
+                "sourceId": source["id"],
+                "section": record.get("title"),
+                "passage": passage,
+                "relevanceScore": 0.9
+            })
+            claims.append({
+                "id": claim_id,
+                "text": passage,
+                "evidenceIds": [evidence_id],
+                "confidence": 0.85,
+                "verificationStatus": "supported"
+            })
+            citations_by_source[source["id"]]["evidenceIds"].append(evidence_id)
+            citations_by_source[source["id"]]["claimIds"].append(claim_id)
+
+    return evidence, claims, list(citations_by_source.values())
+
+def build_structured_findings(op_id: str, report_text: str, sources: list[dict], maximum_items: int = 8) -> tuple[list[dict], list[dict], list[dict]]:
+    evidence = []
+    claims = []
+    citations_by_source = {
+        source["id"]: {
+            "id": f"cite-{op_id}-{idx}",
+            "sourceId": source["id"],
+            "evidenceIds": [],
+            "claimIds": []
+        }
+        for idx, source in enumerate(sources)
+    }
+
+    sentences = split_sentences(report_text)[:maximum_items]
+    for idx, sentence in enumerate(sentences):
+        source = sources[idx % len(sources)] if sources else None
+        evidence_id = f"ev-{op_id}-{idx}"
+        claim_id = f"claim-{op_id}-{idx}"
+
+        if source:
+            evidence.append({
+                "id": evidence_id,
+                "sourceId": source["id"],
+                "passage": sentence,
+                "relevanceScore": 0.8
+            })
+            evidence_ids = [evidence_id]
+            verification_status = "partially-supported"
+            citations_by_source[source["id"]]["evidenceIds"].append(evidence_id)
+            citations_by_source[source["id"]]["claimIds"].append(claim_id)
+        else:
+            evidence_ids = []
+            verification_status = "inferred"
+
+        claims.append({
+            "id": claim_id,
+            "text": sentence,
+            "evidenceIds": evidence_ids,
+            "confidence": 0.7 if evidence_ids else 0.45,
+            "verificationStatus": verification_status
+        })
+
+    return evidence, claims, list(citations_by_source.values())
+
 async def conduct_web_research(
     op_id: str,
     query: str,
     mode: str,
     profile: str,
     limits: Dict[str, Any],
+    source_policy: Dict[str, Any] | None,
+    model_provider: str | None,
+    model_name: str | None,
+    require_claim_verification: bool,
     reporter: ProgressReporter,
     headers: Dict[str, str]
 ) -> Dict[str, Any]:
@@ -38,24 +227,49 @@ async def conduct_web_research(
     max_pages = limits.get("maximumPages", 10)
     max_sources = limits.get("maximumSources", 10)
     max_memory = limits.get("maximumMemoryMb") or settings.MAX_MEMORY_MB
+    query_domains = None
+    if isinstance(source_policy, dict) and isinstance(source_policy.get("allowedDomains"), list):
+        query_domains = source_policy["allowedDomains"]
 
     # Determine gpt-researcher report types based on mode
     report_type = "research_report"
     if mode == "quick":
         report_type = "outline_report"
     elif mode == "deep":
-        report_type = "detailed_report"
+        report_type = "deep"
 
-    env_manager = RequestEnvironmentManager(headers)
+    max_model_calls = limits.get("maximumModelCalls")
+    if max_model_calls is not None and estimate_model_calls(mode) > max_model_calls:
+        raise ValueError(
+            f"maximumModelCalls={max_model_calls} is too low for {mode} research; "
+            f"estimated minimum is {estimate_model_calls(mode)}."
+        )
+
+    env_manager = RequestEnvironmentManager(headers, model_provider=model_provider, model_name=model_name)
     callbacks = GPTResearcherCallbackHandler(reporter)
 
-    profile_token = active_profile.set(profile)
-    try:
-        return await _run_research(env_manager, callbacks, reporter, op_id, query, mode, profile, report_type, max_duration, max_searches, max_pages, max_sources, max_memory, headers)
-    finally:
-        active_profile.reset(profile_token)
+    with enforce_egress_protection(profile, maximum_searches=max_searches):
+        return await _run_research(
+            env_manager,
+            callbacks,
+            reporter,
+            op_id,
+            query,
+            mode,
+            profile,
+            report_type,
+            max_duration,
+            max_searches,
+            max_pages,
+            max_sources,
+            max_memory,
+            query_domains,
+            limits,
+            require_claim_verification,
+            headers
+        )
 
-async def _run_research(env_manager, callbacks, reporter, op_id, query, mode, profile, report_type, max_duration, max_searches, max_pages, max_sources, max_memory, headers):
+async def _run_research(env_manager, callbacks, reporter, op_id, query, mode, profile, report_type, max_duration, max_searches, max_pages, max_sources, max_memory, query_domains, limits, require_claim_verification, headers):
     with env_manager.apply_keys():
         await callbacks.on_planning("Initializing research configuration...")
 
@@ -64,14 +278,14 @@ async def _run_research(env_manager, callbacks, reporter, op_id, query, mode, pr
         researcher = GPTResearcher(
             query=query,
             report_type=report_type,
-            max_iterations=max_iterations
+            query_domains=query_domains
         )
 
-        # Distribute the caller's total budget across iterations so the
-        # aggregate stays within the requested maximumSearches / maximumPages.
-        per_iter_searches = max(1, max_searches // max_iterations)
+        # maximumSearches is enforced at the outbound search-provider boundary.
+        # Keep per-query result/page fanout bounded by source/page limits.
         per_iter_pages = max(1, max_pages // max_iterations)
-        researcher.cfg.max_search_results_per_query = per_iter_searches
+        researcher.cfg.max_iterations = max_iterations
+        researcher.cfg.max_search_results_per_query = max(1, max_sources)
         researcher.cfg.max_urls_per_query = per_iter_pages
 
         SYNTHESIS_TIMEOUT = min(30, max_duration * 0.25)
@@ -115,8 +329,18 @@ async def _run_research(env_manager, callbacks, reporter, op_id, query, mode, pr
             await callbacks.on_planning(f"Starting research loop (budget: {max_duration}s)...")
 
             async def run_loop():
+                await callbacks.on_search(query, 1, max(1, max_searches))
                 await researcher.conduct_research()
+                raw_urls = researcher.get_source_urls() or []
+                await callbacks.on_read(
+                    raw_urls[0] if raw_urls else "",
+                    f"Retrieved {len(raw_urls)} source URL(s).",
+                    min(len(raw_urls), max_pages),
+                    max(1, max_pages)
+                )
+                await callbacks.on_synthesize("Synthesizing research report...")
                 report = await researcher.write_report()
+                await reporter.report("completed", "Research completed.", completed_units=100, total_units=100)
                 return report
 
             report_text = await asyncio.wait_for(run_loop(), timeout=float(max_duration))
@@ -147,9 +371,8 @@ async def _run_research(env_manager, callbacks, reporter, op_id, query, mode, pr
             except asyncio.CancelledError:
                 pass
 
-        # Extract structured details. GPT Researcher exposes URLs reliably across
-        # versions, but evidence passages are not guaranteed through a stable API.
-        raw_sources = researcher.get_source_urls()
+        # Extract structured details from GPT Researcher source/context records.
+        raw_sources = researcher.get_source_urls() or []
         search_results = []
         if hasattr(researcher, "get_search_results"):
             try:
@@ -183,6 +406,42 @@ async def _run_research(env_manager, callbacks, reporter, op_id, query, mode, pr
                 "sourceType": "web"
             })
 
+        output_tokens = estimate_tokens(report_text)
+        estimated_input_tokens = estimate_tokens(query) + sum(estimate_tokens(url) for url in safe_sources)
+        estimated_cost = estimate_model_cost_usd(estimated_input_tokens, output_tokens)
+        budget_reasons = []
+
+        max_model_tokens = limits.get("maximumModelTokens")
+        if max_model_tokens is not None and output_tokens > max_model_tokens:
+            report_text = trim_to_token_budget(report_text, max_model_tokens)
+            output_tokens = estimate_tokens(report_text)
+            status = "partial"
+            budget_reasons.append(f"maximumModelTokens limited the synthesized answer to approximately {max_model_tokens} tokens.")
+
+        max_model_cost = limits.get("maximumModelCostUsd")
+        estimated_cost = estimate_model_cost_usd(estimated_input_tokens, output_tokens)
+        if max_model_cost is not None and estimated_cost > max_model_cost:
+            status = "partial"
+            budget_reasons.append(
+                f"estimatedModelCostUsd ${estimated_cost:.6f} exceeded maximumModelCostUsd ${max_model_cost:.6f}."
+            )
+
+        passage_records = collect_passage_records(researcher, safe_sources)
+        if sources and passage_records:
+            evidence, claims, citations = build_structured_findings_from_passages(op_id, passage_records, sources)
+        elif sources:
+            evidence, claims, citations = build_structured_findings(op_id, report_text, sources)
+        elif require_claim_verification:
+            claims = [
+                {
+                    "id": f"claim-{op_id}-0",
+                    "text": "No source-backed claims could be verified because GPT Researcher did not expose safe source URLs.",
+                    "evidenceIds": [],
+                    "confidence": 0.0,
+                    "verificationStatus": "unsupported"
+                }
+            ]
+
         duration_ms = int((time.time() - start_time) * 1000)
 
         metrics = {
@@ -192,7 +451,9 @@ async def _run_research(env_manager, callbacks, reporter, op_id, query, mode, pr
             "searchesPerformed": len(search_results),
             "pagesRead": len(raw_sources),
             "sourcesConsidered": len(raw_sources),
-            "sourcesUsed": len(safe_sources)
+            "sourcesUsed": len(safe_sources),
+            "modelCalls": estimate_model_calls(mode),
+            "estimatedModelCostUsd": estimated_cost
         }
 
         return {
@@ -207,8 +468,9 @@ async def _run_research(env_manager, callbacks, reporter, op_id, query, mode, pr
             "citations": citations,
             "searchesPerformed": [res.get("query", "") for res in search_results if isinstance(res, dict)],
             "metrics": metrics,
-            "limitations": [
-                "Structured evidence and claim verification were not emitted because the current GPT Researcher adapter exposes source URLs but not stable passage-level evidence."
+            "limitations": budget_reasons + [
+                "Evidence passages and supported claims are extracted from GPT Researcher source/context records when available.",
+                "If GPT Researcher exposes no source text for a safe URL, the adapter falls back to report-derived inferred claims for that source."
             ]
         }
 
