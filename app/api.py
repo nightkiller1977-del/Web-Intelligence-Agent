@@ -13,6 +13,7 @@ from app.cancellation import cancellation_manager
 from app.progress_adapter import ProgressReporter
 from app.researcher_adapter import conduct_web_research
 from app.security import is_safe_url
+from app.metrics import observe_research_result
 
 logger = logging.getLogger("web-intelligence")
 router = APIRouter()
@@ -21,6 +22,7 @@ router = APIRouter()
 _active_ops_count = 0
 _concurrency_lock = asyncio.Lock()
 RAW_CREDENTIAL_HEADERS = ("X-LLM-Key", "X-Search-Key")
+TERMINAL_STATUSES = ("completed", "partial", "failed", "cancelled")
 
 def client_safe_error() -> dict:
     return {
@@ -55,7 +57,7 @@ async def health_ready():
 
     auth_ready = bool(settings.AUTH_TOKEN)
 
-    status = "ok" if (gpt_researcher_ready and storage_ready) else "degraded"
+    status = "ok" if (gpt_researcher_ready and storage_ready and auth_ready) else "degraded"
 
     return {
         "status": status,
@@ -88,8 +90,17 @@ async def capabilities():
             "standard_research": True,
             "deep_research": True,
             "cancellations": True,
+            "source_level_citations": True,
             "citations": True,
-            "ssrf_egress_blocking": True
+            "structured_evidence": True,
+            "claim_verification": True,
+            "source_policy": True,
+            "model_budget_limits": True,
+            "model_preferences": True,
+            "ssrf_egress_blocking": True,
+            "ssrf_url_query_validation": True,
+            "ssrf_source_result_redaction": True,
+            "ssrf_prefetch_http_guard": True
         }
     }
 
@@ -98,19 +109,28 @@ async def background_research_task(req: ResearchRequestInput, reporter: Progress
     op_id = req.operationId
 
     try:
+        await storage.save_operation(op_id, {"status": "running"})
+        await reporter.report("planning", "Research task started.")
+
         # Run execution loop
         result = await conduct_web_research(
             op_id=op_id,
             query=req.query,
             mode=req.mode,
             profile=req.profile,
-            limits=req.limits.dict(),
+            limits=req.limits.model_dump(),
+            source_policy=req.sourcePolicy,
+            model_provider=req.model_provider,
+            model_name=req.model_name,
+            require_claim_verification=bool(req.requireClaimVerification),
             reporter=reporter,
             headers=headers
         )
 
         # Save output result
         await storage.save_operation(op_id, result)
+        observe_research_result(result)
+        await reporter.report(result["status"], f"Research task {result['status']}.")
 
     except asyncio.CancelledError:
         logger.warning(f"Operation {op_id} was cancelled during execution.")
@@ -124,6 +144,7 @@ async def background_research_task(req: ResearchRequestInput, reporter: Progress
             "metrics": {"startedAt": "", "durationMs": 0, "searchesPerformed": 0, "pagesRead": 0, "sourcesConsidered": 0, "sourcesUsed": 0}
         }
         await storage.save_operation(op_id, cancelled_state)
+        observe_research_result(cancelled_state)
         await reporter.report("cancelled", "Research task cancelled.")
 
     except Exception:
@@ -139,6 +160,7 @@ async def background_research_task(req: ResearchRequestInput, reporter: Progress
             "error": client_safe_error()
         }
         await storage.save_operation(op_id, failed_state)
+        observe_research_result(failed_state)
         await reporter.report("failed", "Research task failed. Check server logs for redacted diagnostics.")
 
     finally:
@@ -154,74 +176,129 @@ async def start_research(
 ):
     global _active_ops_count
 
-    # 1. Enforce and reserve Concurrency slot atomically
-    async with _concurrency_lock:
-        if _active_ops_count >= settings.MAX_CONCURRENT_OPS:
-            raise HTTPException(status_code=429, detail="Concurrency limit reached. Too many active operations.")
-        _active_ops_count += 1
+    lookup_key = idempotency_key or req.idempotencyKey
+    if not lookup_key:
+        raise HTTPException(
+            status_code=400,
+            detail="Idempotency-Key header or idempotencyKey body field is required."
+        )
 
+    claimed_lookup_key = None
+    claimed_operation_id = False
+    slot_reserved = False
     try:
-        # 2. Atomic idempotency check-and-reserve
-        lookup_key = idempotency_key or req.idempotencyKey
-        if lookup_key:
-            existing_op_id = await storage.claim_idempotency_key(lookup_key, req.operationId)
-            if existing_op_id:
-                logger.info("Idempotency hit for key %s, returning existing operation: %s", lookup_key, existing_op_id)
-                async with _concurrency_lock:
-                    _active_ops_count = max(0, _active_ops_count - 1)
-                op_state = await storage.get_operation(existing_op_id)
-                return {"operationId": existing_op_id, "status": op_state.get("status") if op_state else "unknown"}
-
-        # 3. Secure initial query validation (check secrets, SSRF URLs if query is an explicit URL)
+        # 1. Secure initial query validation (check secrets, SSRF URLs if query is an explicit URL)
         query_str = req.query.strip()
         if query_str.lower().startswith(("http://", "https://")):
             if not is_safe_url(query_str, req.profile):
                 raise HTTPException(status_code=400, detail="SSRF Validation Error: Target query address is blocked.")
 
-        # 4. Reject raw credential headers outside local loopback mode.
+        # 2. Reject raw credential headers outside local loopback mode.
         if not raw_header_credentials_allowed():
             if any(request.headers.get(header) for header in RAW_CREDENTIAL_HEADERS):
                 raise HTTPException(
                     status_code=400,
                     detail="Raw provider credentials are accepted only in local deployment mode."
                 )
+
+        if bool(req.model_provider) != bool(req.model_name):
+            raise HTTPException(
+                status_code=400,
+                detail="model_provider and model_name must be provided together."
+            )
+
+        unsupported_source_policy_keys = set((req.sourcePolicy or {}).keys()) - {"allowedDomains"}
+        if unsupported_source_policy_keys:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Unsupported sourcePolicy fields: "
+                    f"{', '.join(sorted(unsupported_source_policy_keys))}. "
+                    "Only allowedDomains is supported."
+                )
+            )
+
+        # 3. Atomic idempotency check-and-reserve before new-work concurrency limiting.
+        existing_op_id = await storage.claim_idempotency_key(lookup_key, req.operationId)
+        if existing_op_id:
+            logger.info("Idempotency hit for key %s, returning existing operation: %s", lookup_key, existing_op_id)
+            op_state = await storage.get_operation(existing_op_id)
+            return {"operationId": existing_op_id, "status": op_state.get("status") if op_state else "unknown"}
+        claimed_lookup_key = lookup_key
+
+        operation_claimed = await storage.claim_operation_id(req.operationId, lookup_key)
+        if not operation_claimed:
+            raise HTTPException(
+                status_code=409,
+                detail="operationId is already associated with a different idempotency key."
+            )
+        claimed_operation_id = True
+
+        # 4. Enforce and reserve a concurrency slot only for new operations.
+        async with _concurrency_lock:
+            if _active_ops_count >= settings.MAX_CONCURRENT_OPS:
+                raise HTTPException(status_code=429, detail="Concurrency limit reached. Too many active operations.")
+            _active_ops_count += 1
+            slot_reserved = True
     except Exception as e:
         # Rollback reserved slot if validation fails
-        async with _concurrency_lock:
-            _active_ops_count = max(0, _active_ops_count - 1)
+        if claimed_operation_id:
+            await storage.release_operation_id(req.operationId, lookup_key)
+        if claimed_lookup_key:
+            await storage.release_idempotency_key(claimed_lookup_key, req.operationId)
+        if slot_reserved:
+            async with _concurrency_lock:
+                _active_ops_count = max(0, _active_ops_count - 1)
         raise e
 
     op_id = req.operationId
+    task_started = False
 
-    # Register operation shell
-    await storage.save_operation(op_id, {
-        "operationId": op_id,
-        "idempotency_key": lookup_key,
-        "attempt_id": req.attemptId,
-        "status": "queued",
-        "query": req.query,
-        "mode": req.mode,
-        "profile": req.profile
-    })
+    try:
+        # Register operation shell
+        await storage.save_operation(op_id, {
+            "operationId": op_id,
+            "idempotency_key": lookup_key,
+            "attempt_id": req.attemptId,
+            "status": "queued",
+            "query": req.query,
+            "mode": req.mode,
+            "profile": req.profile
+        })
 
-    # Extract loopback credentials headers
-    headers = {
-        "X-LLM-Key": request.headers.get("X-LLM-Key", ""),
-        "X-Search-Key": request.headers.get("X-Search-Key", "")
-    }
+        # Extract loopback credentials headers
+        headers = {
+            "X-LLM-Key": request.headers.get("X-LLM-Key", ""),
+            "X-Search-Key": request.headers.get("X-Search-Key", "")
+        }
 
-    reporter = ProgressReporter(op_id)
-    await reporter.report("planning", "Request received. Research task queued.")
+        reporter = ProgressReporter(op_id)
+        await reporter.report("planning", "Request received. Research task queued.")
 
-    # Spawn research execution task in background
-    task = asyncio.create_task(background_research_task(req, reporter, headers))
-    cancellation_manager.register_task(op_id, task)
+        # Spawn research execution task in background
+        task = asyncio.create_task(background_research_task(req, reporter, headers))
+        cancellation_manager.register_task(op_id, task)
+        task_started = True
+    except Exception as e:
+        if not task_started:
+            if claimed_operation_id:
+                await storage.release_operation_id(req.operationId, lookup_key)
+            if claimed_lookup_key:
+                await storage.release_idempotency_key(claimed_lookup_key, req.operationId)
+            if slot_reserved:
+                async with _concurrency_lock:
+                    _active_ops_count = max(0, _active_ops_count - 1)
+        raise e
 
     return {"operationId": op_id, "status": "queued"}
 
 @router.get("/v1/research/{operation_id}/events")
 async def get_research_events(operation_id: str):
     """Streams research progress updates as Server-Sent Events."""
+    op = await storage.get_operation(operation_id)
+    if not op:
+        raise HTTPException(status_code=404, detail="Research operation not found")
+
     async def event_generator():
         last_idx = 0
         while True:
@@ -232,7 +309,7 @@ async def get_research_events(operation_id: str):
                 last_idx = len(events)
 
             op = await storage.get_operation(operation_id)
-            if op and op.get("status") in ("completed", "partial", "failed", "cancelled"):
+            if op and op.get("status") in TERMINAL_STATUSES:
                 # Yield any last residual events
                 events = await storage.get_progress_events(operation_id)
                 for ev in events[last_idx:]:
@@ -249,11 +326,26 @@ async def get_research_result(operation_id: str):
     if not op:
         raise HTTPException(status_code=404, detail="Research operation not found")
 
+    if op.get("status") not in TERMINAL_STATUSES:
+        return {
+            "operationId": operation_id,
+            "status": op.get("status", "queued"),
+            "mode": op.get("mode", "standard"),
+            "profile": op.get("profile", "general"),
+            "answer": None,
+            "sources": [],
+            "evidence": [],
+            "claims": [],
+            "citations": [],
+            "searchesPerformed": [],
+            "metrics": None
+        }
+
     return op
 
 @router.post("/v1/research/{operation_id}/cancel")
 async def cancel_research(operation_id: str):
-    success = await cancellation_manager.cancel_task(operation_id)
+    success = await cancellation_manager.cancel_task(operation_id, storage.get_operation)
     if not success:
         # Check if operation was already finalized
         op = await storage.get_operation(operation_id)
