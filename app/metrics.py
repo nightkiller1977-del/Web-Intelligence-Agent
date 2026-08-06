@@ -1,16 +1,11 @@
 # app/metrics.py
 import logging
+
 from prometheus_client import Counter, Histogram
+
 from app.config import settings
 
 logger = logging.getLogger("web-intelligence")
-
-# Prometheus Metrics
-research_cost_tokens = Counter(
-    "research_cost_tokens_total",
-    "Total tokens consumed during web intelligence operations",
-    ["agent_profile", "token_type"] # e.g. prompt_tokens, completion_tokens
-)
 
 research_duration = Histogram(
     "research_duration_ms",
@@ -26,30 +21,56 @@ sources_fetched = Histogram(
     buckets=(1, 3, 5, 10, 20, 50)
 )
 
-# Ephemeral Daily Spend Accumulator (In-Memory for simplicity, or Redis if configured)
+research_operations = Counter(
+    "research_operations_total",
+    "Research operations by final status",
+    ["agent_profile", "mode", "status"]
+)
+
+research_cost_tokens = Counter(
+    "research_cost_tokens_total",
+    "Estimated output tokens consumed during web intelligence operations",
+    ["agent_profile", "token_type"]
+)
+
 _daily_spend_usd = 0.0
 
-def track_operation_cost(agent_profile: str, input_tokens: int, output_tokens: int, provider: str = "openai"):
+def estimate_tokens(text: str) -> int:
+    if not text:
+        return 0
+    return max(1, len(text.split()) * 4 // 3)
+
+def track_operation_cost(agent_profile: str, output_tokens: int):
     global _daily_spend_usd
-    
-    # Very rough cost calculations based on average LLM pricing (e.g. $2.50 / 1M input, $10.00 / 1M output)
-    input_rate = 0.0000025
+
+    # Rough default estimate: $10 per 1M output tokens.
     output_rate = 0.000010
-    
-    cost = (input_tokens * input_rate) + (output_tokens * output_rate)
-    
-    # Increment Prometheus metrics
-    research_cost_tokens.labels(agent_profile=agent_profile, token_type="input").inc(input_tokens)
+    cost = output_tokens * output_rate
+
     research_cost_tokens.labels(agent_profile=agent_profile, token_type="output").inc(output_tokens)
-    
     _daily_spend_usd += cost
-    logger.info(f"Operation cost: ${cost:.5f} USD. Accumulated Daily Spend: ${_daily_spend_usd:.2f} USD")
-    
+
     if _daily_spend_usd > settings.DAILY_SPEND_LIMIT_USD:
         logger.warning(
-            f"DAILY SPEND LIMIT EXCEEDED! Current: ${_daily_spend_usd:.2f} USD, Limit: {settings.DAILY_SPEND_LIMIT_USD:.2f} USD. "
-            "Please check for runaway loops or adjust limits."
+            "Daily web intelligence spend estimate exceeded limit: current=$%.2f limit=$%.2f",
+            _daily_spend_usd,
+            settings.DAILY_SPEND_LIMIT_USD
         )
 
 def get_accumulated_daily_spend():
     return _daily_spend_usd
+
+def observe_research_result(result: dict):
+    profile = result.get("profile", "unknown")
+    mode = result.get("mode", "unknown")
+    status = result.get("status", "unknown")
+    metrics = result.get("metrics") or {}
+    sources = result.get("sources") or []
+
+    research_operations.labels(agent_profile=profile, mode=mode, status=status).inc()
+    research_duration.labels(agent_profile=profile, mode=mode).observe(metrics.get("durationMs", 0))
+    sources_fetched.labels(agent_profile=profile).observe(len(sources))
+
+    output_tokens = estimate_tokens(result.get("answer") or "")
+    if output_tokens:
+        track_operation_cost(profile, output_tokens)
