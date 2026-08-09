@@ -15,11 +15,11 @@ import sys
 from unittest.mock import patch, MagicMock, AsyncMock, MagicMock as MockModule
 
 # Set environment for remote mode testing BEFORE importing app
-os.environ['DEPLOYMENT_MODE'] = 'remote'
-os.environ['STORAGE_BACKEND'] = 'local'  # Use local storage to avoid Redis dependency
-os.environ['MAX_CONCURRENT_OPS'] = '3'
-os.environ['WEB_INTELLIGENCE_AUTH_TOKEN'] = 'test-token-12345'
-os.environ['MAX_MEMORY_MB'] = '512'
+os.environ.setdefault('DEPLOYMENT_MODE', 'remote')
+os.environ.setdefault('STORAGE_BACKEND', 'local')  # Use local storage to avoid Redis dependency
+os.environ.setdefault('MAX_CONCURRENT_OPS', '3')
+os.environ.setdefault('WEB_INTELLIGENCE_AUTH_TOKEN', 'test-token-12345')
+os.environ.setdefault('MAX_MEMORY_MB', '512')
 
 # Mock GPT Researcher before importing app modules
 sys.modules['gpt_researcher'] = MagicMock()
@@ -42,7 +42,7 @@ class TestHealthEndpoints:
         assert response.status_code == 200
         assert response.json() == {"status": "ok"}
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_health_ready_checks_dependencies(self):
         """GET /health/ready should probe storage and GPT Researcher availability."""
         client = TestClient(app)
@@ -83,13 +83,14 @@ class TestHealthEndpoints:
 class TestAuthentication:
     """Test Bearer token authentication in remote mode."""
 
-    def test_request_without_auth_rejected(self):
-        """POST /v1/research without Authorization header should fail."""
+    def test_request_without_auth(self):
+        """POST /v1/research without auth headers should reject."""
         client = TestClient(app)
         response = client.post(
             "/v1/research",
             json={
                 "operationId": "op-1",
+                "attemptId": "attempt-1",
                 "query": "test",
                 "mode": "standard",
                 "profile": "general",
@@ -99,10 +100,11 @@ class TestAuthentication:
                     "maximumPages": 5,
                     "maximumSources": 5
                 }
-            }
+            },
+            headers={"Idempotency-Key": "idem-1"}
         )
-        # Should either reject (401/403) or require auth in header
-        assert response.status_code in [401, 403, 422]
+        # Should reject (401/403)
+        assert response.status_code in [401, 403]
 
     def test_request_with_valid_auth(self):
         """POST /v1/research with valid Bearer token should accept request."""
@@ -188,7 +190,7 @@ class TestIdempotency:
 class TestRedisLocking:
     """Test Redis atomic locking for multi-instance safety (horizontal scaling)."""
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_concurrent_operations_with_locking(self):
         """Multiple concurrent operations should use Redis locking correctly."""
         # Skip if Redis not available
@@ -243,49 +245,54 @@ class TestRedisLocking:
 class TestConcurrencyLimiting:
     """Test that MAX_CONCURRENT_OPS limit is enforced."""
 
-    def test_concurrency_limit_enforced(self):
+    @pytest.mark.anyio
+    async def test_concurrency_limit_enforced(self):
         """Exceeding MAX_CONCURRENT_OPS should return 429 or queue request."""
-        client = TestClient(app)
-        headers = {"Authorization": f"Bearer {settings.AUTH_TOKEN}"}
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            headers = {"Authorization": f"Bearer {settings.AUTH_TOKEN}"}
+            max_ops = int(settings.MAX_CONCURRENT_OPS)
 
-        max_ops = int(settings.MAX_CONCURRENT_OPS)
+            # Mock research to simulate long-running operations
+            async def slow_research(*args, **kwargs):
+                await asyncio.sleep(5)  # Simulate slow research
+                return {"status": "completed", "answer": "test"}
 
-        # Mock research to simulate long-running operations
-        async def slow_research(*args, **kwargs):
-            await asyncio.sleep(10)  # Simulate slow research
-            return {"status": "completed", "answer": "test"}
-
-        with patch('app.api.conduct_web_research', side_effect=slow_research):
-            # Try to submit more operations than allowed
-            responses = []
-            for i in range(max_ops + 2):
-                response = client.post(
-                    "/v1/research",
-                    json={
-                        "operationId": f"op-limit-{i}",
-                        "attemptId": f"attempt-limit-{i}",
-                        "query": f"query {i}",
-                        "mode": "standard",
-                        "profile": "general",
-                        "limits": {
-                            "maximumDurationSeconds": 30,
-                            "maximumSearches": 3,
-                            "maximumPages": 5,
-                            "maximumSources": 5
+            with patch('app.api.conduct_web_research', side_effect=slow_research):
+                # Try to submit more operations than allowed concurrently
+                tasks = []
+                for i in range(max_ops + 2):
+                    tasks.append(client.post(
+                        "/v1/research",
+                        json={
+                            "operationId": f"op-limit-{i}",
+                            "attemptId": f"attempt-limit-{i}",
+                            "query": f"query {i}",
+                            "mode": "standard",
+                            "profile": "general",
+                            "limits": {
+                                "maximumDurationSeconds": 30,
+                                "maximumSearches": 3,
+                                "maximumPages": 5,
+                                "maximumSources": 5
+                            }
+                        },
+                        headers={
+                            **headers,
+                            "Idempotency-Key": f"idem-key-limit-{i}"
                         }
-                    },
-                    headers={
-                        **headers,
-                        "Idempotency-Key": f"idem-key-limit-{i}"
-                    },
-                    timeout=0.5  # Don't wait long for each request
-                )
-                responses.append(response.status_code)
+                    ))
 
-            # At least the first MAX_CONCURRENT_OPS should accept
-            accept_codes = {200, 201, 202}
-            accepted = sum(1 for r in responses[:max_ops] if r in accept_codes)
-            assert accepted > 0, "Concurrency-limited operations should accept within limit"
+                responses = await asyncio.gather(*tasks)
+                status_codes = [r.status_code for r in responses]
+
+                # At least the first MAX_CONCURRENT_OPS should accept
+                accepted = sum(1 for r in status_codes if r in [200, 201, 202])
+                assert accepted == max_ops, f"Should accept exactly {max_ops} operations, got {accepted}"
+
+                # The remaining requests should return 429
+                rejected = sum(1 for r in status_codes if r == 429)
+                assert rejected == 2, f"Should reject exactly 2 operations with 429, got {rejected}"
 
 
 class TestEventStreaming:
@@ -419,7 +426,7 @@ class TestRenderEnvironmentVariables:
 class TestRenderContainerRecycle:
     """Test recovery behavior after container recycle (stateless transition)."""
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_redis_reconnection_on_restart(self):
         """Storage should reconnect to Redis if connection is lost and restored."""
         if settings.STORAGE_BACKEND != "redis":
@@ -453,8 +460,10 @@ class TestLiveRenderDeployment:
             assert response.status_code == 200
             assert response.json()["status"] == "ok"
 
+    @pytest.mark.anyio
     async def test_live_research_workflow(self, render_url):
         """Test end-to-end research workflow on live deployment."""
+        import time
         async with httpx.AsyncClient() as client:
             # 1. Get auth token (in practice, this comes from Render env vars)
             token = os.getenv('WEB_INTELLIGENCE_AUTH_TOKEN', 'test-token')
@@ -462,7 +471,9 @@ class TestLiveRenderDeployment:
 
             # 2. Submit research query
             payload = {
-                "operationId": "test-live-1",
+                "operationId": f"test-live-{int(time.time())}",
+                "attemptId": "live-attempt-1",
+                "idempotencyKey": f"idem-live-{int(time.time())}",
                 "query": "What is the latest version of FastAPI?",
                 "mode": "standard",
                 "profile": "general",
