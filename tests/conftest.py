@@ -12,11 +12,17 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Ensure remote mode for test environment
-os.environ['DEPLOYMENT_MODE'] = 'remote'
-os.environ['STORAGE_BACKEND'] = 'local'  # Use local storage for unit tests
-os.environ['MAX_CONCURRENT_OPS'] = '3'
-os.environ['WEB_INTELLIGENCE_AUTH_TOKEN'] = 'test-token-12345'
-os.environ['MAX_MEMORY_MB'] = '512'
+os.environ.setdefault('DEPLOYMENT_MODE', 'remote')
+os.environ.setdefault('STORAGE_BACKEND', 'local')  # Use local storage for unit tests
+os.environ.setdefault('MAX_CONCURRENT_OPS', '3')
+os.environ.setdefault('WEB_INTELLIGENCE_AUTH_TOKEN', 'test-token-12345')
+os.environ.setdefault('MAX_MEMORY_MB', '512')
+
+
+@pytest.fixture
+def anyio_backend():
+    """Specify asyncio backend for anyio."""
+    return 'asyncio'
 
 
 @pytest.fixture(scope="session")
