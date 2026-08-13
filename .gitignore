@@ -5,4 +5,48 @@ __pycache__/
 .venv/
 venv/
 ENV/
+env/
+
+# Environment files (NEVER commit these)
 .env
+.env.local
+.env.*.local
+.env.production.local
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Python
+*.egg-info/
+dist/
+build/
+*.egg
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Secrets and credentials (never commit)
+*.key
+*.pem
+*.p12
+*.pfx
+secrets.yaml
+secrets.yml
+credentials.json
+aws_credentials
+.aws/
+.kube/
+
+# Build and test artifacts
+*.log
+node_modules/
+.yarn/

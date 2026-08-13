@@ -6,16 +6,21 @@ Pytest configuration for Web Intelligence Agent tests.
 
 import os
 import sys
+import secrets
 import pytest
 
 # Add parent directory to path so app module is importable
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# Generate ephemeral test token (randomized per test run for security)
+# This matches the config.py behavior for local/test mode
+test_token = os.getenv('WEB_INTELLIGENCE_AUTH_TOKEN', secrets.token_hex(32))
+
 # Ensure remote mode for test environment
 os.environ.setdefault('DEPLOYMENT_MODE', 'remote')
 os.environ.setdefault('STORAGE_BACKEND', 'local')  # Use local storage for unit tests
 os.environ.setdefault('MAX_CONCURRENT_OPS', '3')
-os.environ.setdefault('WEB_INTELLIGENCE_AUTH_TOKEN', 'test-token-12345')
+os.environ['WEB_INTELLIGENCE_AUTH_TOKEN'] = test_token  # Use generated ephemeral token
 os.environ.setdefault('MAX_MEMORY_MB', '512')
 
 

@@ -1,0 +1,19 @@
+# Security-sensitive files require review
+
+# All security and configuration files
+SECURITY.md @nightkiller1977-del
+.env.example @nightkiller1977-del
+.gitignore @nightkiller1977-del
+Dockerfile @nightkiller1977-del
+render.yaml @nightkiller1977-del
+
+# Configuration and authentication
+app/config.py @nightkiller1977-del
+app/main.py @nightkiller1977-del
+
+# Test configuration and fixtures
+tests/conftest.py @nightkiller1977-del
+tests/test_remote_mode.py @nightkiller1977-del
+
+# Documentation
+*.md @nightkiller1977-del

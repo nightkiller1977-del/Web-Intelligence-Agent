@@ -135,7 +135,7 @@ pytest tests/test_remote_mode.py --cov=app --cov-report=html
 - Storage backend: `local` (for unit tests; `redis` for integration)
 - Max concurrent ops: `3`
 - Max memory: `512 MB`
-- Auth token: `test-token-12345`
+- Auth token: Auto-generated ephemeral token (see tests/conftest.py)
 
 ---
 
