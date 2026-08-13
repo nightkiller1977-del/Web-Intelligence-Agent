@@ -252,8 +252,11 @@ def _ensure_safe_host(host: str):
     if not _egress_protection_active() or not host:
         return
     profile = _active_egress_profile()
+    # Mirror the provider bypass from _ensure_safe_url so profiled research can reach model/search APIs.
     is_safe = False if profile == _DENY_ALL_PROFILE else (
-        is_safe_url(f"https://{host}", profile) if profile != "general" else resolve_and_verify_host(str(host))
+        resolve_and_verify_host(str(host)) if _match_domain(host, PROVIDER_API_HOSTS)
+        else is_safe_url(f"https://{host}", profile) if profile != "general"
+        else resolve_and_verify_host(str(host))
     )
     if not is_safe:
         logger.error("SSRF egress guard denied connection to host %s", host)

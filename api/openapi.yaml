@@ -172,6 +172,7 @@ paths:
                 sourcePolicy:
                   type: object
                   description: Optional source policy. Only allowedDomains is supported.
+                  additionalProperties: false
                   properties:
                     allowedDomains:
                       type: array

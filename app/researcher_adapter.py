@@ -346,6 +346,7 @@ def freshness_instruction(freshness: Dict[str, str] | None) -> str:
 def input_text_from_file(path: Path) -> str:
     if settings.DEPLOYMENT_MODE != "local":
         return ""
+    path = path.resolve()
     if not path.is_file() or path.suffix.lower() not in SUPPORTED_INPUT_EXTENSIONS:
         return ""
     try:
@@ -533,6 +534,15 @@ async def conduct_web_research(
             f"maximumModelCalls={max_model_calls} is too low for {mode} research; "
             f"estimated minimum is {estimate_model_calls(mode)}."
         )
+
+    max_model_cost = limits.get("maximumModelCostUsd")
+    if max_model_cost is not None:
+        min_cost = estimate_model_cost_usd(estimate_tokens(effective_query), 200)
+        if min_cost > max_model_cost:
+            raise ValueError(
+                f"maximumModelCostUsd=${max_model_cost:.6f} is too low; "
+                f"estimated minimum cost for this query is ${min_cost:.6f}."
+            )
 
     env_manager = RequestEnvironmentManager(headers, model_provider=model_provider, model_name=model_name)
     callbacks = GPTResearcherCallbackHandler(reporter)
@@ -742,7 +752,13 @@ async def _run_research(env_manager, callbacks, reporter, op_id, query, mode, pr
             ]
 
         if input_chunks:
+            # Cap total sources before appending local inputs so the combined list stays within the budget.
+            del sources[max_sources:]
             append_input_sources(op_id, input_chunks, sources, evidence, citations)
+            # Clear claimIds from all citations before re-verifying so stale IDs from the
+            # first pass (web-only evidence) don't survive into the final response.
+            for citation in citations:
+                citation["claimIds"] = []
             claims = verify_claims_against_evidence(op_id, report_text, evidence, citations) or claims
 
         duration_ms = int((time.time() - start_time) * 1000)
