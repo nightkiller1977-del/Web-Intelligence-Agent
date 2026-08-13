@@ -9,16 +9,20 @@ and end-to-end research workflow.
 import os
 import json
 import asyncio
+import secrets
 import pytest
 import httpx
 import sys
 from unittest.mock import patch, MagicMock, AsyncMock, MagicMock as MockModule
 
+# Generate ephemeral test token (randomized per test run for security)
+test_token = os.getenv('WEB_INTELLIGENCE_AUTH_TOKEN', secrets.token_hex(32))
+
 # Set environment for remote mode testing BEFORE importing app
 os.environ.setdefault('DEPLOYMENT_MODE', 'remote')
 os.environ.setdefault('STORAGE_BACKEND', 'local')  # Use local storage to avoid Redis dependency
 os.environ.setdefault('MAX_CONCURRENT_OPS', '3')
-os.environ.setdefault('WEB_INTELLIGENCE_AUTH_TOKEN', 'test-token-12345')
+os.environ['WEB_INTELLIGENCE_AUTH_TOKEN'] = test_token  # Use generated ephemeral token
 os.environ.setdefault('MAX_MEMORY_MB', '512')
 
 # Mock GPT Researcher before importing app modules
@@ -466,7 +470,9 @@ class TestLiveRenderDeployment:
         import time
         async with httpx.AsyncClient() as client:
             # 1. Get auth token (in practice, this comes from Render env vars)
-            token = os.getenv('WEB_INTELLIGENCE_AUTH_TOKEN', 'test-token')
+            token = os.getenv('WEB_INTELLIGENCE_AUTH_TOKEN')
+            if not token:
+                raise ValueError("WEB_INTELLIGENCE_AUTH_TOKEN not configured for test")
             headers = {"Authorization": f"Bearer {token}"}
 
             # 2. Submit research query
