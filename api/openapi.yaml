@@ -155,17 +155,60 @@ paths:
                 profile:
                   type: string
                   enum: [general, technical, repair, code-review, security]
+                freshness:
+                  type: object
+                  description: Optional recency constraints applied to the research prompt.
+                  additionalProperties: false
+                  properties:
+                    since:
+                      type: string
+                      description: Prefer sources published on or after this date.
+                    until:
+                      type: string
+                      description: Exclude sources published after this date.
+                    maxAgeDays:
+                      type: string
+                      description: Prefer sources from the last N days.
                 sourcePolicy:
                   type: object
                   description: Optional source policy. Only allowedDomains is supported.
+                  additionalProperties: false
                   properties:
                     allowedDomains:
                       type: array
                       items:
                         type: string
+                inputs:
+                  type: object
+                  description: Optional local first-party inputs processed as bounded evidence. Contents are not sent to external research providers unless allowExternalUse is true.
+                  additionalProperties: false
+                  properties:
+                    allowExternalUse:
+                      type: boolean
+                      default: false
+                    documents:
+                      type: array
+                      items:
+                        type: object
+                        additionalProperties: false
+                        properties:
+                          path:
+                            type: string
+                          displayName:
+                            type: string
+                    repositories:
+                      type: array
+                      items:
+                        type: object
+                        additionalProperties: false
+                        properties:
+                          path:
+                            type: string
+                          branch:
+                            type: string
                 requireClaimVerification:
                   type: boolean
-                  description: Return source/context passage-backed claim verification records.
+                  description: Return claim records verified by a separate passage-matching pass over available evidence.
                 model_provider:
                   type: string
                   description: GPT Researcher LLM provider, for example openai. Must be provided with model_name.
@@ -276,14 +319,60 @@ paths:
                     type: array
                     items:
                       type: object
+                      properties:
+                        id:
+                          type: string
+                        url:
+                          type: string
+                        title:
+                          type: string
+                        publisher:
+                          type: string
+                        author:
+                          type: string
+                        publishedAt:
+                          type: string
+                        retrievedAt:
+                          type: integer
+                        sourceType:
+                          type: string
+                        qualityScore:
+                          type: number
                   evidence:
                     type: array
                     items:
                       type: object
+                      properties:
+                        id:
+                          type: string
+                        sourceId:
+                          type: string
+                        section:
+                          type: string
+                        passage:
+                          type: string
+                        contentHash:
+                          type: string
+                        relevanceScore:
+                          type: number
                   claims:
                     type: array
                     items:
                       type: object
+                      properties:
+                        id:
+                          type: string
+                        text:
+                          type: string
+                        evidenceIds:
+                          type: array
+                          items:
+                            type: string
+                        confidence:
+                          type: number
+                        verificationStatus:
+                          type: string
+                          enum: [supported, partially-supported, unsupported, conflicting, inferred]
                   citations:
                     type: array
                     items:

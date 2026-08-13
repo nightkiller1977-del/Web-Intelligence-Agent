@@ -120,6 +120,8 @@ async def background_research_task(req: ResearchRequestInput, reporter: Progress
             profile=req.profile,
             limits=req.limits.model_dump(),
             source_policy=req.sourcePolicy,
+            freshness=req.freshness,
+            inputs=req.inputs,
             model_provider=req.model_provider,
             model_name=req.model_name,
             require_claim_verification=bool(req.requireClaimVerification),

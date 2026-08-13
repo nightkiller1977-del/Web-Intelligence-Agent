@@ -26,11 +26,9 @@ async def lifespan(app: FastAPI):
     logger.info("Initializing storage backend lifecycle...")
     await storage.init()
 
-    # Mark any operations left in queued/running state from a prior crash as failed
-    if settings.STORAGE_BACKEND != "redis" or getattr(storage, "degraded", False):
-        await storage.mark_stale_operations()
-    else:
-        logger.info("Skipping global stale-operation scan for shared Redis storage.")
+    # Mark any operations left in queued/running state from a prior crash as failed.
+    # Always scan regardless of backend so crashed-worker orphans are recovered on restart.
+    await storage.mark_stale_operations()
 
     # Wire up cross-instance cancel pub/sub if Redis is available
     redis_client = getattr(storage, "redis", None)

@@ -269,6 +269,51 @@ def test_source_policy_allowed_domains_is_passed_to_adapter(monkeypatch):
     assert observed_source_policy == {"allowedDomains": ["example.com"]}
 
 
+def test_freshness_and_inputs_are_passed_to_adapter(monkeypatch, tmp_path):
+    observed = {}
+
+    async def fake_conduct_web_research(**kwargs):
+        observed["freshness"] = kwargs["freshness"]
+        observed["inputs"] = kwargs["inputs"]
+        return {
+            "operationId": kwargs["op_id"],
+            "status": "completed",
+            "mode": kwargs["mode"],
+            "profile": kwargs["profile"],
+            "answer": "Mock answer",
+            "sources": [],
+            "evidence": [],
+            "claims": [],
+            "citations": [],
+            "searchesPerformed": [],
+            "metrics": {
+                "startedAt": "2026-01-01T00:00:00+00:00",
+                "completedAt": "2026-01-01T00:00:01+00:00",
+                "durationMs": 1,
+                "searchesPerformed": 0,
+                "pagesRead": 0,
+                "sourcesConsidered": 0,
+                "sourcesUsed": 0,
+            },
+        }
+
+    monkeypatch.setattr(api, "conduct_web_research", fake_conduct_web_research)
+    document = tmp_path / "notes.md"
+    document.write_text("local context", encoding="utf-8")
+    payload = _payload("op-fresh-inputs")
+    payload["freshness"] = {"since": "2026-08-01"}
+    payload["inputs"] = {"documents": [{"path": str(document), "displayName": "Notes"}]}
+
+    with TestClient(app) as client:
+        response = client.post("/v1/research", json=payload, headers=_auth_headers())
+        result = _wait_for_terminal_result(client, "op-fresh-inputs")
+
+    assert response.status_code == 202
+    assert result["status"] == "completed"
+    assert observed["freshness"] == {"since": "2026-08-01"}
+    assert observed["inputs"]["documents"][0]["displayName"] == "Notes"
+
+
 def test_unknown_source_policy_fields_are_rejected():
     payload = _payload("op-source-policy-bad")
     payload["sourcePolicy"] = {"deniedDomains": ["example.com"]}
