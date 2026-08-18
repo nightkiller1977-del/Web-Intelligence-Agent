@@ -54,11 +54,6 @@ jobs:
     # intercept it, so this job runs with no proxy configured to keep the
     # security assertions deterministic and independent of the runner's
     # network environment.
-    env:
-      HTTP_PROXY: ""
-      HTTPS_PROXY: ""
-      http_proxy: ""
-      https_proxy: ""
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -74,6 +69,20 @@ jobs:
 
       - name: Install dependencies
         run: pip install -r requirements.lock -r requirements-test.txt
+
+      # A step (not a job-level `env:` map) because GitHub's schema treats
+      # env keys as case-insensitive — HTTP_PROXY/http_proxy in the same
+      # `env:` block is a duplicate-key error that invalidates the whole
+      # workflow file. $GITHUB_ENV lines aren't YAML mapping keys, so both
+      # casings can be cleared here without that restriction.
+      - name: Clear proxy env vars for deterministic egress assertions
+        run: |
+          {
+            echo "HTTP_PROXY="
+            echo "HTTPS_PROXY="
+            echo "http_proxy="
+            echo "https_proxy="
+          } >> "$GITHUB_ENV"
 
       - name: Run SSRF/egress security tests
         run: pytest tests/test_security_egress.py --cov=app -v
