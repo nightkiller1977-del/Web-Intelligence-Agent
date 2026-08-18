@@ -14,6 +14,7 @@ app/main.py @nightkiller1977-del
 # Test configuration and fixtures
 tests/conftest.py @nightkiller1977-del
 tests/test_remote_mode.py @nightkiller1977-del
+tests/test_security_egress.py @nightkiller1977-del
 
 # Documentation
 *.md @nightkiller1977-del

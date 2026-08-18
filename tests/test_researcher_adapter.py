@@ -169,7 +169,10 @@ def test_build_effective_query_applies_freshness_without_inputs():
     assert limitations == []
 
 
-def test_collect_input_context_processes_documents_without_external_use(tmp_path):
+def test_collect_input_context_processes_documents_without_external_use(monkeypatch, tmp_path):
+    import app.researcher_adapter as adapter
+    monkeypatch.setattr(adapter.settings, "DEPLOYMENT_MODE", "local")
+
     document = tmp_path / "notes.md"
     document.write_text("The local design requires independent claim verification.", encoding="utf-8")
 
@@ -185,7 +188,10 @@ def test_collect_input_context_processes_documents_without_external_use(tmp_path
     assert "not sent to external research providers" in " ".join(limitations)
 
 
-def test_collect_input_context_requires_boolean_external_use(tmp_path):
+def test_collect_input_context_requires_boolean_external_use(monkeypatch, tmp_path):
+    import app.researcher_adapter as adapter
+    monkeypatch.setattr(adapter.settings, "DEPLOYMENT_MODE", "local")
+
     document = tmp_path / "notes.md"
     document.write_text("The local design requires independent claim verification.", encoding="utf-8")
 
@@ -224,7 +230,10 @@ def test_input_text_from_file_disabled_outside_local_mode(monkeypatch, tmp_path)
     assert input_text_from_file(document) == ""
 
 
-def test_input_text_from_file_reads_only_capped_bytes(tmp_path):
+def test_input_text_from_file_reads_only_capped_bytes(monkeypatch, tmp_path):
+    import app.researcher_adapter as adapter
+    monkeypatch.setattr(adapter.settings, "DEPLOYMENT_MODE", "local")
+
     document = tmp_path / "large.md"
     document.write_text("a" * 50_000, encoding="utf-8")
 
@@ -233,7 +242,10 @@ def test_input_text_from_file_reads_only_capped_bytes(tmp_path):
     assert len(text) == 40_000
 
 
-def test_collect_input_context_caps_documents_before_repository_reads(tmp_path):
+def test_collect_input_context_caps_documents_before_repository_reads(monkeypatch, tmp_path):
+    import app.researcher_adapter as adapter
+    monkeypatch.setattr(adapter.settings, "DEPLOYMENT_MODE", "local")
+
     documents = []
     for index in range(20):
         document = tmp_path / f"doc-{index:02}.md"
@@ -252,7 +264,10 @@ def test_collect_input_context_caps_documents_before_repository_reads(tmp_path):
     assert all(chunk["label"].startswith("doc-") for chunk in chunks)
 
 
-def test_collect_repository_context_short_circuits_large_trees(tmp_path):
+def test_collect_repository_context_short_circuits_large_trees(monkeypatch, tmp_path):
+    import app.researcher_adapter as adapter
+    monkeypatch.setattr(adapter.settings, "DEPLOYMENT_MODE", "local")
+
     for index in range(20):
         (tmp_path / f"file-{index:02}.md").write_text(f"content {index}", encoding="utf-8")
 
