@@ -1,0 +1,21 @@
+# requirements-test.txt
+#
+# Test-only dependencies layered on top of requirements.lock. Never bundled
+# into the production image/deployment — install alongside requirements.lock
+# only for running the pytest suite (locally or in CI):
+#
+#   pip install -r requirements.lock -r requirements-test.txt
+#
+# fakeredis provides an in-process, async-compatible stand-in for
+# redis.asyncio so RedisStorage (app/storage.py) can be exercised without a
+# real Redis/Valkey server. The `lua` extra pulls in `lupa`, which fakeredis
+# needs to actually execute Lua scripts via EVAL (used by
+# RedisStorage.claim_operation_id's atomic claim script). Without lupa,
+# fakeredis raises "unknown command 'eval'" and the Lua-script-backed tests
+# would not exercise real behavior.
+fakeredis[lua]==2.37.1
+lupa==2.8
+
+# pytest-cov drives the `pytest --cov=app` coverage reporting used in
+# .github/workflows/sidecar-tests.yml.
+pytest-cov==7.1.0
