@@ -31,6 +31,7 @@ sys.modules['gpt_researcher.agent'] = MagicMock()
 sys.modules['gpt_researcher.actions'] = MagicMock()
 
 from fastapi.testclient import TestClient
+import app.api as api
 from app.main import app
 from app.config import settings
 from app.storage import storage
@@ -246,6 +247,33 @@ class TestRedisLocking:
             assert success_count > 0, "At least some concurrent operations should succeed"
 
 
+def _concurrency_test_payload(op_id):
+    return {
+        "operationId": op_id,
+        "attemptId": f"attempt-{op_id}",
+        "query": f"query {op_id}",
+        "mode": "standard",
+        "profile": "general",
+        "limits": {
+            "maximumDurationSeconds": 30,
+            "maximumSearches": 3,
+            "maximumPages": 5,
+            "maximumSources": 5
+        }
+    }
+
+
+async def _wait_for_op_terminal(client, headers, op_id, timeout=2):
+    async def poll():
+        while True:
+            response = await client.get(f"/v1/research/{op_id}/result", headers=headers)
+            if response.json()["status"] in api.TERMINAL_STATUSES:
+                return
+            await asyncio.sleep(0.02)
+
+    await asyncio.wait_for(poll(), timeout=timeout)
+
+
 class TestConcurrencyLimiting:
     """Test that MAX_CONCURRENT_OPS limit is enforced."""
 
@@ -257,35 +285,28 @@ class TestConcurrencyLimiting:
             headers = {"Authorization": f"Bearer {settings.AUTH_TOKEN}"}
             max_ops = int(settings.MAX_CONCURRENT_OPS)
 
-            # Mock research to simulate long-running operations
-            async def slow_research(*args, **kwargs):
-                await asyncio.sleep(5)  # Simulate slow research
+            # Event-gated stand-in for the research call: blocks deterministically
+            # until released instead of a fixed wall-clock asyncio.sleep(5), which
+            # made this test both slower than necessary and dependent on timing
+            # (a slow CI runner could let the sleep expire mid-assertion).
+            release_gate = asyncio.Event()
+
+            async def gated_research(*args, **kwargs):
+                await release_gate.wait()
                 return {"status": "completed", "answer": "test"}
 
-            with patch('app.api.conduct_web_research', side_effect=slow_research):
+            op_ids = [f"op-limit-{i}" for i in range(max_ops + 2)]
+
+            with patch('app.api.conduct_web_research', side_effect=gated_research):
                 # Try to submit more operations than allowed concurrently
-                tasks = []
-                for i in range(max_ops + 2):
-                    tasks.append(client.post(
+                tasks = [
+                    client.post(
                         "/v1/research",
-                        json={
-                            "operationId": f"op-limit-{i}",
-                            "attemptId": f"attempt-limit-{i}",
-                            "query": f"query {i}",
-                            "mode": "standard",
-                            "profile": "general",
-                            "limits": {
-                                "maximumDurationSeconds": 30,
-                                "maximumSearches": 3,
-                                "maximumPages": 5,
-                                "maximumSources": 5
-                            }
-                        },
-                        headers={
-                            **headers,
-                            "Idempotency-Key": f"idem-key-limit-{i}"
-                        }
-                    ))
+                        json=_concurrency_test_payload(op_id),
+                        headers={**headers, "Idempotency-Key": f"idem-key-{op_id}"}
+                    )
+                    for op_id in op_ids
+                ]
 
                 responses = await asyncio.gather(*tasks)
                 status_codes = [r.status_code for r in responses]
@@ -297,6 +318,79 @@ class TestConcurrencyLimiting:
                 # The remaining requests should return 429
                 rejected = sum(1 for r in status_codes if r == 429)
                 assert rejected == 2, f"Should reject exactly 2 operations with 429, got {rejected}"
+
+                # Release the gate and drain the accepted operations so their
+                # concurrency slots are actually freed before the next test runs -
+                # otherwise _active_ops_count would leak into later tests.
+                release_gate.set()
+                accepted_op_ids = [
+                    op_id for op_id, status in zip(op_ids, status_codes) if status in [200, 201, 202]
+                ]
+                await asyncio.gather(*(
+                    _wait_for_op_terminal(client, headers, op_id) for op_id in accepted_op_ids
+                ))
+
+    @pytest.mark.anyio
+    async def test_concurrency_slot_released_after_normal_completion_allows_new_op(self):
+        """After a running operation finishes normally, its concurrency slot
+        must be freed so a subsequent operation is accepted instead of being
+        rejected with 429."""
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            headers = {"Authorization": f"Bearer {settings.AUTH_TOKEN}"}
+            max_ops = int(settings.MAX_CONCURRENT_OPS)
+
+            fill_op_ids = [f"op-slot-fill-{i}" for i in range(max_ops)]
+            # Pre-register a gate for every op_id we might submit (including
+            # "op-slot-new", posted later) so gated_research never races
+            # against this test's own bookkeeping of which gates exist yet.
+            gates_by_op = {op_id: asyncio.Event() for op_id in fill_op_ids + ["op-slot-new"]}
+
+            async def gated_research(*args, **kwargs):
+                await gates_by_op[kwargs["op_id"]].wait()
+                return {"status": "completed", "answer": "test"}
+
+            with patch('app.api.conduct_web_research', side_effect=gated_research):
+                # Fill every concurrency slot.
+                fill_responses = await asyncio.gather(*(
+                    client.post(
+                        "/v1/research",
+                        json=_concurrency_test_payload(op_id),
+                        headers={**headers, "Idempotency-Key": f"idem-key-{op_id}"}
+                    )
+                    for op_id in fill_op_ids
+                ))
+                assert all(r.status_code == 202 for r in fill_responses), (
+                    "expected every slot-filling operation to be accepted"
+                )
+
+                # Confirm the pool is genuinely exhausted: one more request is rejected.
+                overflow_response = await client.post(
+                    "/v1/research",
+                    json=_concurrency_test_payload("op-slot-overflow"),
+                    headers={**headers, "Idempotency-Key": "idem-key-op-slot-overflow"}
+                )
+                assert overflow_response.status_code == 429
+
+                # Let exactly one filled operation finish normally.
+                gates_by_op[fill_op_ids[0]].set()
+                await _wait_for_op_terminal(client, headers, fill_op_ids[0])
+
+                # A new operation should now be accepted since a slot freed up.
+                new_response = await client.post(
+                    "/v1/research",
+                    json=_concurrency_test_payload("op-slot-new"),
+                    headers={**headers, "Idempotency-Key": "idem-key-op-slot-new"}
+                )
+                assert new_response.status_code == 202
+
+                # Drain every remaining gated operation so nothing leaks into later tests.
+                for gate in gates_by_op.values():
+                    gate.set()
+                remaining_op_ids = fill_op_ids[1:] + ["op-slot-new"]
+                await asyncio.gather(*(
+                    _wait_for_op_terminal(client, headers, op_id) for op_id in remaining_op_ids
+                ))
 
 
 class TestEventStreaming:

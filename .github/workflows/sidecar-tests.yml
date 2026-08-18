@@ -1,0 +1,79 @@
+name: Sidecar Tests
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+
+jobs:
+  test:
+    name: pytest (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # README.md states Python 3.11+ as the minimum supported version;
+        # 3.12 matches this project's local development interpreter.
+        python-version: ["3.11", "3.12"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: |
+            requirements.lock
+            requirements-test.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements.lock -r requirements-test.txt
+
+      - name: Run test suite (excluding SSRF/egress security tests)
+        run: pytest --cov=app --ignore=tests/test_security_egress.py -v
+
+  security-egress-test:
+    name: pytest security egress (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    # These tests assert that outbound SSRF/egress protection blocks unsafe
+    # requests at the requests/httpx/aiohttp/socket layer *before* any
+    # connection attempt leaves the process (see app/security.py's patched
+    # Session.send / Client.send / socket.connect wrappers, which raise
+    # PermissionError and never invoke the original network call in the
+    # blocked case). An ambient CI proxy could otherwise change how those
+    # clients resolve/route a request before our guard has a chance to
+    # intercept it, so this job runs with no proxy configured to keep the
+    # security assertions deterministic and independent of the runner's
+    # network environment.
+    env:
+      HTTP_PROXY: ""
+      HTTPS_PROXY: ""
+      http_proxy: ""
+      https_proxy: ""
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: |
+            requirements.lock
+            requirements-test.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements.lock -r requirements-test.txt
+
+      - name: Run SSRF/egress security tests
+        run: pytest tests/test_security_egress.py --cov=app -v
