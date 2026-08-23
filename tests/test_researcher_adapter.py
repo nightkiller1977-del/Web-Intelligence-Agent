@@ -2,8 +2,11 @@ import os
 
 import pytest
 
+from unittest.mock import AsyncMock, MagicMock
+
 from app.model_adapter import RequestEnvironmentManager
 import app.model_adapter as model_adapter
+import app.researcher_adapter as researcher_adapter
 from app.researcher_adapter import (
     build_structured_findings_from_passages,
     build_structured_findings,
@@ -11,12 +14,44 @@ from app.researcher_adapter import (
     collect_input_context,
     collect_passage_records,
     collect_source_metadata,
+    conduct_web_research,
     estimate_model_calls,
     estimate_model_cost_usd,
     input_text_from_file,
     verify_claims_against_evidence,
     trim_to_token_budget,
 )
+
+
+class FakeConfig:
+    pass
+
+
+class FakeCompletedGPTResearcher:
+    """Stands in for gpt_researcher.GPTResearcher on the happy path: research
+    completes on the first pass, no timeout/cancellation involved."""
+
+    def __init__(self, query, report_type, query_domains):
+        self.cfg = FakeConfig()
+
+    async def conduct_research(self):
+        return None
+
+    async def write_report(self):
+        return "# Fake report\n\nFake findings about the query."
+
+    def get_source_urls(self):
+        return ["https://example.com/a"]
+
+    def get_research_sources(self):
+        return []
+
+    def get_research_context(self):
+        return []
+
+    def get_search_results(self):
+        return []
+
 
 class FakeResearcher:
     def __init__(self, sources=None, context=None):
@@ -317,3 +352,43 @@ def test_model_preferences_apply_when_raw_headers_are_disallowed(monkeypatch):
     ).apply_keys():
         assert os.environ["FAST_LLM"] == "openai:gpt-4o-mini"
         assert "OPENAI_API_KEY" not in os.environ
+
+
+@pytest.mark.anyio
+async def test_conduct_web_research_completes_without_crashing_on_metrics(monkeypatch):
+    # Regression test: every prior test of this module either mocks
+    # conduct_web_research away entirely (test_api.py, conftest.py's
+    # mock_gpt_researcher fixture) or only exercises its pure helper
+    # functions in isolation, so nothing ever ran the real
+    # conduct_web_research -> _run_research orchestration path end to end.
+    # That gap let a NameError ("start_time" was defined in
+    # conduct_web_research but never passed into _run_research, which
+    # referenced it directly when computing metrics.durationMs) go
+    # completely undetected -- it fired on every single successful
+    # research completion, discarding the finished report and returning a
+    # generic failure instead. This test calls the real function so a
+    # regression here fails loudly instead of silently.
+    monkeypatch.setattr(researcher_adapter, "GPTResearcher", FakeCompletedGPTResearcher)
+    monkeypatch.setattr(researcher_adapter, "is_safe_url", lambda url, profile: True)
+
+    reporter = MagicMock()
+    reporter.report = AsyncMock()
+
+    result = await conduct_web_research(
+        op_id="test-op",
+        query="test query",
+        mode="standard",
+        profile="general",
+        limits={"maximumDurationSeconds": 30, "maximumSearches": 3, "maximumPages": 5, "maximumSources": 5},
+        source_policy=None,
+        freshness=None,
+        inputs=None,
+        model_provider=None,
+        model_name=None,
+        require_claim_verification=False,
+        reporter=reporter,
+        headers={}
+    )
+
+    assert result["status"] == "completed"
+    assert result["metrics"]["durationMs"] >= 0
