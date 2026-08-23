@@ -567,10 +567,11 @@ async def conduct_web_research(
             require_claim_verification,
             headers,
             input_chunks,
-            input_limitations
+            input_limitations,
+            start_time
         )
 
-async def _run_research(env_manager, callbacks, reporter, op_id, query, mode, profile, report_type, max_duration, max_searches, max_pages, max_sources, max_memory, query_domains, limits, require_claim_verification, headers, input_chunks, input_limitations):
+async def _run_research(env_manager, callbacks, reporter, op_id, query, mode, profile, report_type, max_duration, max_searches, max_pages, max_sources, max_memory, query_domains, limits, require_claim_verification, headers, input_chunks, input_limitations, start_time):
     with env_manager.apply_keys():
         await callbacks.on_planning("Initializing research configuration...")
 
