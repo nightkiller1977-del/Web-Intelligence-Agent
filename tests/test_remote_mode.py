@@ -563,7 +563,7 @@ class TestLiveRenderDeployment:
     async def test_live_research_workflow(self, render_url):
         """Test end-to-end research workflow on live deployment."""
         import time
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=30.0) as client:
             # 1. Get auth token (in practice, this comes from Render env vars)
             token = os.getenv('WEB_INTELLIGENCE_AUTH_TOKEN')
             if not token:
