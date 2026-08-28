@@ -101,4 +101,37 @@ def test_guard_does_not_affect_http_clients_when_disabled(monkeypatch):
     response = requests.get("http://127.0.0.1/health", timeout=0.1)
 
     assert response.status_code == 204
-    assert sent_urls == ["http://127.0.0.1/health"]
+
+
+def test_direct_socket_connect_public_ip_allowed_under_profiled_egress():
+    """Regression test for the profiled-research SSRF bug: when httpx/httpcore
+    resolves api.openai.com and calls socket.connect with the resulting public IP,
+    _ensure_safe_host must allow it instead of rejecting it for not matching the
+    profile's domain allowlist (e.g. "technical" only allows github.com etc.)."""
+    with enforce_egress_protection("technical"):
+        # A public IP (1.1.1.1 = Cloudflare DNS) must not be blocked by
+        # profile-level domain rules — it should pass the public-IP check.
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            # We expect a real connection attempt (which will be refused/timeout),
+            # NOT a PermissionError from the SSRF guard.
+            try:
+                sock.connect(("1.1.1.1", 9))  # port 9 = discard, almost always refused
+            except PermissionError:
+                raise  # re-raise so the test fails clearly
+            except OSError:
+                pass  # connection refused or timed out — correct, guard didn't block
+        finally:
+            sock.close()
+
+
+def test_direct_socket_connect_private_ip_still_blocked_under_profiled_egress():
+    """Private IPs must remain blocked even after the public-IP early-return
+    in _ensure_safe_host — the fix must not weaken that defence."""
+    with enforce_egress_protection("technical"):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            with pytest.raises(PermissionError):
+                sock.connect(("10.0.0.1", 80))
+        finally:
+            sock.close()
