@@ -86,3 +86,51 @@ jobs:
 
       - name: Run SSRF/egress security tests
         run: pytest tests/test_security_egress.py --cov=app -v
+
+  live-integration-test:
+    name: Live Render integration test
+    runs-on: ubuntu-latest
+    # Only run on push to main — secrets are not forwarded to pull_request
+    # jobs from forked repositories, and hitting production on every PR
+    # branch would be wasteful and racy.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [test, security-egress-test]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            requirements.lock
+            requirements-test.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements.lock -r requirements-test.txt
+
+      # The free-tier container spins down after inactivity. Retry for up to
+      # 90 s so the tests don't race a container that is still booting.
+      - name: Wake Render service (cold-start)
+        run: |
+          for i in $(seq 1 18); do
+            if curl -sf --max-time 5 "$RENDER_SERVICE_URL/health/live" > /dev/null; then
+              echo "Service is up after attempt $i"
+              exit 0
+            fi
+            echo "Attempt $i/18: not ready yet, retrying in 5s..."
+            sleep 5
+          done
+          echo "Service did not respond within 90s"
+          exit 1
+        env:
+          RENDER_SERVICE_URL: ${{ secrets.RENDER_SERVICE_URL }}
+
+      - name: Run live Render integration tests
+        run: pytest tests/test_remote_mode.py::TestLiveRenderDeployment -v --tb=short
+        timeout-minutes: 5
+        env:
+          RENDER_SERVICE_URL: ${{ secrets.RENDER_SERVICE_URL }}
+          WEB_INTELLIGENCE_AUTH_TOKEN: ${{ secrets.WEB_INTELLIGENCE_AUTH_TOKEN }}
