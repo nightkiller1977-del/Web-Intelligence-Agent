@@ -251,6 +251,22 @@ def _ensure_safe_url(url: str):
 def _ensure_safe_host(host: str):
     if not _egress_protection_active() or not host:
         return
+
+    # When httpx/httpcore resolves a hostname and calls socket.connect with the
+    # resulting IP, we only need to verify it's a public address — profile-level
+    # domain rules already fired at the URL layer.  Feeding a raw IP into the
+    # domain-allowlist path would always fail for profiled research because IPs
+    # never match strings like "github.com".
+    clean_host = host.split('%')[0]  # strip IPv6 zone index before parsing
+    try:
+        ipaddress.ip_address(clean_host)
+        if not is_safe_ip(clean_host):
+            logger.error("SSRF egress guard denied connection to private/reserved IP %s", host)
+            raise PermissionError(f"SSRF blocked private IP connection: {host}")
+        return
+    except ValueError:
+        pass  # not an IP address — fall through to hostname checks
+
     profile = _active_egress_profile()
     # Mirror the provider bypass from _ensure_safe_url so profiled research can reach model/search APIs.
     is_safe = False if profile == _DENY_ALL_PROFILE else (
