@@ -551,6 +551,7 @@ class TestLiveRenderDeployment:
             pytest.skip("RENDER_SERVICE_URL not set; skipping live Render tests")
         return url.rstrip('/')
 
+    @pytest.mark.anyio
     async def test_live_health_check(self, render_url):
         """Test health endpoints on live Render deployment."""
         async with httpx.AsyncClient() as client:
