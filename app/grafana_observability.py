@@ -1,17 +1,122 @@
-"""Bounded, metadata-only Loki delivery and pure ASGI request/lifecycle observation."""
+"""Bounded, metadata-only Loki delivery and pure ASGI request/lifecycle observation.
+
+Destination/credential resolution follows the fleet observability contract
+(ACES-293), one implementation per repo:
+
+* ``resolve_loki_config()`` — atomic ``LOKI_URL_REMOTE`` + ``LOKI_REMOTE_AUTH``
+  pair from the process environment; a one-sided pair disables export with a
+  single warning (values are never logged).
+* ``validate_basic_auth()`` — auth must be ``Basic <base64(user:password)>``
+  with non-empty user/password and no control characters; anything else
+  disables export before a worker or queue entry exists, never a retry loop.
+* Default policy — remote export auto-enables in production and is off in
+  dev/test unless ``OBSERVABILITY_REMOTE=1``; ``OBSERVABILITY_REMOTE=0`` opts
+  out even in production. Production means ``DEPLOYMENT_MODE=remote`` (set by
+  ``render.yaml``, mirroring ``app/config.py``) or the ``RENDER`` env var that
+  Render sets on every service. Local Python logging is independent.
+"""
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import json
+import logging
 import math
 import os
 import queue
 import threading
 import time
 import urllib.request
+from typing import NamedTuple, Optional
 from urllib.parse import urlsplit
 
 _ALLOWED = {"method", "route", "status", "duration_ms", "error_type", "reason", "storage_degraded", "redis_enabled"}
+
+_log = logging.getLogger("grafana-observability")
+_warned: set[str] = set()  # reason codes already warned about — never values
+
+
+# NamedTuple, not a dataclass: this module is also loaded by path in tests
+# (spec_from_file_location) where dataclass field resolution needs sys.modules.
+class LokiConfig(NamedTuple):
+    """Validated, atomic remote-export destination."""
+    enabled: bool
+    url: Optional[str] = None
+    auth: Optional[str] = None
+    source: Optional[str] = None  # authority the pair came from ("env")
+    reason: Optional[str] = None  # why export is disabled (never a value)
+
+
+def validate_basic_auth(value):
+    """True only for ``Basic <base64>`` decoding to non-empty ``user:pass``."""
+    if not isinstance(value, str) or not value:
+        return False
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in value):
+        return False
+    scheme, _, payload = value.partition(" ")
+    if scheme.lower() != "basic" or not payload:
+        return False
+    try:
+        decoded = base64.b64decode(payload, validate=True).decode("utf-8")
+    except (ValueError, UnicodeDecodeError, binascii.Error):
+        return False
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in decoded):
+        return False
+    user, sep, password = decoded.partition(":")
+    return bool(sep) and bool(user) and bool(password)
+
+
+def _valid_push_url(url):
+    try:
+        target = urlsplit(url)
+    except ValueError:
+        return False
+    return bool(
+        target.scheme == "https" and target.hostname
+        and not target.username and not target.password
+        and not target.query and not target.fragment
+    )
+
+
+def is_production(env=None):
+    env = os.environ if env is None else env
+    return env.get("DEPLOYMENT_MODE", "local") == "remote" or bool(env.get("RENDER"))
+
+
+def _disabled(reason, *, warn=True):
+    if warn and reason not in _warned:
+        _warned.add(reason)
+        _log.warning("loki remote export disabled: %s (values are never logged)", reason)
+    return LokiConfig(enabled=False, reason=reason)
+
+
+def resolve_loki_config(env=None):
+    """Resolve the atomic remote pair + policy. Never raises, never logs values."""
+    env = os.environ if env is None else env
+    url = (env.get("LOKI_URL_REMOTE") or "").strip()
+    auth = (env.get("LOKI_REMOTE_AUTH") or "").strip()
+
+    opt = (env.get("OBSERVABILITY_REMOTE") or "").strip()
+    if opt == "0":
+        return _disabled("opted_out", warn=False)
+    if opt != "1" and not is_production(env):
+        return _disabled("non_production_default_off", warn=False)
+
+    if not url and not auth:
+        return _disabled("unconfigured", warn=False)
+    if bool(url) != bool(auth):
+        return _disabled("partial_pair")
+    if not _valid_push_url(url):
+        return _disabled("invalid_url")
+    if not validate_basic_auth(auth):
+        return _disabled("invalid_auth")
+    return LokiConfig(enabled=True, url=url, auth=auth, source="env")
+
+
+def reset_warnings():
+    """Test hook: allow one-shot warnings to fire again."""
+    _warned.clear()
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
@@ -39,13 +144,14 @@ class LokiEmitter:
         self.stats = {"accepted": 0, "dropped": 0, "sent": 0, "failed": 0}
 
     def emit(self, event, **fields):
-        url = os.getenv("LOKI_URL_REMOTE", "").strip()
-        auth = os.getenv("LOKI_REMOTE_AUTH", "").strip()
+        # Atomic pair + policy + Basic-auth validation live in one resolver;
+        # invalid or partial config never starts the worker, so a malformed
+        # credential can never become a retry loop.
+        config = resolve_loki_config()
+        if not config.enabled:
+            return False
+        url, auth = config.url, config.auth
         try:
-            target = urlsplit(url)
-            if (target.scheme != "https" or not target.hostname or target.username or target.password
-                    or target.query or target.fragment or not auth or "\r" in auth or "\n" in auth):
-                return False
             safe = {"service": self.service, "event": event}
             for key, value in fields.items():
                 if key not in _ALLOWED:
@@ -59,6 +165,8 @@ class LokiEmitter:
                 "environment": os.getenv("ENVIRONMENT", "production"),
             }, "values": [[str(time.time_ns()), json.dumps(safe, separators=(",", ":"))]]}]}).encode()
             if len(body) > 4096:
+                with self._lock:
+                    self.stats["dropped"] += 1
                 return False
         except (TypeError, ValueError):
             return False
