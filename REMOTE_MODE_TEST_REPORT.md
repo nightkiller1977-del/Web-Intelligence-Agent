@@ -103,7 +103,7 @@ class Settings(BaseSettings):
 
 ```bash
 # Navigate to sidecar directory
-cd /Users/alarkins/Dev/Projects/Web-Intelligence-Agent
+cd ~/Dev/Projects/Web-Intelligence-Agent
 
 # Activate virtual environment
 source .venv/bin/activate
