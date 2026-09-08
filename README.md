@@ -164,3 +164,43 @@ Render deployments use the Blueprint template (`render.yaml`) and build directly
 4. Set your provider API keys (`OPENAI_API_KEY`, `TAVILY_API_KEY`) as **Environment Variables** in the Render service dashboard. These are injected directly into the container's `os.environ` at startup.
 
 > **Note on secrets flow:** In local mode the sidecar inherits API keys from the Electron control plane's `process.env`, which loads them from AI Commander's centralized SOPS-encrypted secrets store (`secrets.enc.env`). In remote mode, Render's native environment variable injection replaces that mechanism. Do not introduce a separate secrets file loader — credentials always flow through environment variables regardless of deployment mode.
+
+## 7. Observability (Grafana Loki export)
+
+`app/grafana_observability.py` implements the fleet observability contract
+(ACES-293) with one implementation per concern: `resolve_loki_config()`
+(atomic config resolution), `validate_basic_auth()` (credential validation),
+`LokiEmitter` (bounded transport) and `ObserveASGI` (request/lifecycle
+observation).
+
+**Canonical keys — atomic pair.** `LOKI_URL_REMOTE` + `LOKI_REMOTE_AUTH` must
+both be present from the process environment (one authority) and valid for
+remote export to enable. A one-sided pair disables export with a single
+warning; values are never logged. `LOKI_REMOTE_AUTH` must be
+`Basic <base64(user:password)>` with non-empty user and password — anything
+else (wrong scheme, invalid base64, control characters) disables export before
+any worker or queue entry exists, never a retry loop.
+
+**Default policy.** Remote export auto-enables in production — detected as
+`DEPLOYMENT_MODE=remote` (set by `render.yaml`, mirroring `app/config.py`) or
+the `RENDER` env var that Render sets on every service — and is off in
+dev/test unless `OBSERVABILITY_REMOTE=1`. `OBSERVABILITY_REMOTE=0` opts out
+even in production. Local Python logging is independent of this policy.
+
+**Queue/drop semantics.** One daemon worker, a finite 64-event queue, bounded
+flush deadlines and no redirects. Overflow and oversized (>4KB) payloads are
+counted in `stats["dropped"]` and lost — telemetry, not an audit ledger. There
+is no retry loop and no per-request thread.
+
+**Privacy contract.** Only allowlisted metadata fields are exported (method,
+route template or `unmatched`, status, duration, error type, reason flags).
+Research queries, prompts, provider request bodies, headers, returned content
+and raw URL paths are never exported. The export worker uses a scoped egress
+profile for the single validated `*.grafana.net` push endpoint; the research
+SSRF/profile guard is not weakened globally.
+
+**Readback validation.** After deploying with a live pair, confirm ingestion
+by querying Grafana Explore for
+`{application="ai-agents", agent="web-intelligence-agent"}` and finding a
+fresh `service_started` or `http_request` event before declaring the
+integration live.
