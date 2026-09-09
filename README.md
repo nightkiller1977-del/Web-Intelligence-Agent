@@ -1,206 +1,83 @@
-# Web Intelligence Agent (Python Sidecar)
+# Web Intelligence Agent
 
-The Web Intelligence Agent is a lightweight, production-ready Python FastAPI sidecar that wraps the open-source **GPT Researcher** engine. It exposes structured, multi-step web research capabilities to the AI Commander desktop control plane.
+Web-Intelligence-Agent is AI Commander's **structured web-research execution service**. It provides a network-reachable FastAPI boundary for creating, running, streaming, cancelling, and retrieving research jobs while isolating browser/research workloads from the desktop application's main process.
 
-This service is designed to run in two modes:
-1. **Local Mode**: Spawned and managed locally by the Electron control plane on a dynamic loopback port with ephemeral token authentication.
-2. **Remote Mode**: Deployed as an auto-scaling, Docker-based container cluster on Render.com, backed by a Valkey/Redis instance for shared operation state and progress streams.
+The service wraps research capabilities such as GPT Researcher behind AI Commander-specific security, resource, job-state, and observability controls.
 
----
+## Current status — September 9, 2026
 
-## 1. Features
-- **Iterative Research Orchestration**: Plans and executes multi-query web searches, scrapes pages, and synthesizes answers using GPT Researcher.
-- **SSRF Hardened Egress**: Validates explicit URL queries, guards outbound HTTP clients before connection, checks DNS resolution for private IPv4/IPv6 ranges, carrier-grade NAT, and cloud metadata endpoints, and redacts unsafe source URLs from final results.
-- **Isolate Request Keys**: Applies OpenAI and Tavily API credentials in request scopes only, preventing race conditions or process-wide leaks.
-- **Process Memory Guardrails**: Monitored via a background task. If memory footprint exceeds 80% of the configured limit, the sidecar stops the active research loop and attempts a bounded partial synthesis.
-- **Durable Event Streaming**: Emits live progress logs (`planning`, `searching`, `reading`, `synthesizing`, etc.) via Server-Sent Events (SSE) backed by Redis Streams in cluster mode.
-- **Task Cancellations**: Provides REST-based endpoints to abort running async loops.
-- **Prometheus Telemetry**: Exposes research operation counters, duration and fetched-source histograms, and estimated output-token spend counters.
+**State: Implemented supporting service / integrated with AI Commander and under ongoing operational hardening.**
 
-### Current Adapter Behavior
-- Responses include source URLs, source-level citations, passage-level evidence, and claim records extracted from GPT Researcher source/context records when safe source text is available.
-- Claim records are generated from synthesized report claims and verified by a separate passage-matching pass over available evidence, marking claims as `supported`, `partially-supported`, `unsupported`, or `conflicting`.
-- Source metadata is populated from GPT Researcher source/search records when available, including title, publisher, author, published date, and quality score.
-- `freshness` constraints are applied to the research prompt for recency-aware source selection.
-- In local mode, `inputs.documents` and `inputs.repositories` are processed as bounded first-party evidence. Path-based inputs are ignored outside local mode, and their contents are not sent to external research providers unless `inputs.allowExternalUse=true`.
-- `sourcePolicy.allowedDomains` is supported and passed to GPT Researcher as a domain constraint. Other `sourcePolicy` fields are rejected.
-- `model_provider` and `model_name` are supported as request-scoped GPT Researcher model preferences.
-- Model-call, output-token, and cost budgets are enforced with deterministic estimates. Token and cost overruns return a `partial` result with a limitation note.
-- If GPT Researcher exposes a safe source URL but no source text, the adapter falls back to inferred report-derived claims for that source and marks that limitation in the response.
+`main` currently includes:
 
----
+- Python/FastAPI service and API routes for research jobs.
+- Local and remote execution modes.
+- Structured job creation/status/result workflows.
+- Streaming/event-oriented progress support and job cancellation.
+- Redis-backed coordination/stream behavior where configured.
+- Request-scoped credential handling.
+- URL/network safety checks, including SSRF-oriented restrictions.
+- Memory/resource guards for expensive research tasks.
+- Metrics/health surfaces.
+- Docker and Render deployment definitions.
+- Automated tests and a remote-mode test report.
+- Metadata-only Grafana/Loki observability with sanitization and bounded remote-export behavior.
+- Live Render integration work in the AI Commander environment.
 
-## 2. Service Architecture
+The service should **not** be described as an unrestricted autonomous browser. It is a bounded research sidecar: callers submit a research task, the service applies its security/resource policies, and the caller receives structured progress/results.
 
-```mermaid
-graph TD
-    Client[AI Commander Electron Control Plane]
-    API[FastAPI Gateway /app/api.py]
-    Auth[Bearer Auth Middleware]
-    Manager[Cancellation Manager]
-    Storage[Storage Adapter: Memory / Redis]
-    Adapter[GPT Researcher Adapter]
-    Engine[GPT Researcher Engine]
-    SSRF[SSRF Validator /app/security.py]
-    LLM[Model/Provider API]
+## System role
 
-    Client -->|POST /v1/research| API
-    Client -->|GET /events| API
-    API -->|1. Authenticate| Auth
-    API -->|2. Register/Poll| Storage
-    API -->|3. Spawn Task| Adapter
-    Adapter -->|Request-Scoped Keys| Engine
-    Adapter -->|Monitor Task| Manager
-    Engine -->|Scrape Pages| SSRF
-    SSRF -->|HTTP Get| Web((Public Web))
-    Engine -->|LLM Synthesis| LLM
+```text
+AI Commander / authorized agent
+            │
+            ▼
+ Web Intelligence Agent
+   ├─ validate research request
+   ├─ enforce URL/network policy
+   ├─ manage job lifecycle
+   ├─ execute research workload
+   ├─ stream progress / support cancel
+   ├─ enforce memory/resource guards
+   └─ return structured result
+            │
+            ▼
+ authorized public web resources
 ```
 
----
+Keeping research in a dedicated service reduces the amount of browser/network complexity inside the desktop process and gives AI Commander a consistent job contract for long-running research.
 
-## 3. REST API Specification
+## Security boundaries
 
-Detailed OpenAPI documentation is available under `api/openapi.yaml`.
+Web research processes untrusted external content. Important controls include:
 
-### 3.1 Health & Verification
-- **`GET /health/live`**: Fast liveness probe checking process response (used by Render).
-- **`GET /health/ready`**: Probes storage backends (Redis) and engine dependencies.
-- **`GET /capabilities`**: Lists active features supported by the sidecar.
-- **`GET /metrics`**: Prometheus metrics for operation outcomes, duration, fetched sources, and estimated output tokens.
-- **`GET /version`**: Returns service and gpt-researcher version strings.
+- reject or constrain private/loopback/link-local/internal network destinations unless explicitly required by a trusted configuration;
+- avoid following user-controlled URLs into protected infrastructure;
+- keep provider/search credentials request-scoped or in the authorized runtime secret store;
+- do not expose secrets, prompts, private user content, or unrestricted raw URLs through remote observability;
+- bound job memory, concurrency, and cancellation behavior so one research request cannot exhaust the host/service;
+- treat retrieved web content as untrusted data, not instructions that override system/tool policy.
 
-### 3.2 Operations Workflow
-- **`POST /v1/research`**: Enqueues a new query. Returns `202 Accepted` with the `operationId`. Supports idempotency key checks via `Idempotency-Key` header.
-- **`GET /v1/research/{operationId}/events`**: Server-Sent Events (SSE) stream of task progression logs.
-- **`GET /v1/research/{operationId}/result`**: Fetches the completed synthesis report, source URLs, source-level citations, metrics, and adapter limitations.
-- **`POST /v1/research/{operationId}/cancel`**: Interrupts the active research task.
+See `SECURITY.md` for deeper security guidance.
 
----
+## Local development
 
-## 4. Configuration & Environment Variables
+Use the pinned/locked requirements in the repository and the current application entry point as the source of truth. A typical setup starts by creating a Python environment and installing the required packages from the repository's requirements files.
 
-| Variable | Default | Description |
-| :--- | :--- | :--- |
-| `DEPLOYMENT_MODE` | `local` | Service deployment mode: `local` (Electron sidecar) or `remote` (Render). |
-| `WEB_INTELLIGENCE_AUTH_TOKEN` | `""` | Bearer token verified on incoming API requests (auto-generated in local mode). |
-| `ALLOW_UNAUTHENTICATED_DOCS` | `false` | When `true` in local mode, exposes `/docs`, `/redoc`, and `/openapi.json` for plain-browser testing. Ignored in remote mode. |
-| `STORAGE_BACKEND` | `local` | Persistence mode: `local` (in-memory dicts) or `redis` (Render Valkey cache). |
-| `REDIS_URL` | `""` | Connection URL for Redis instances (e.g. `redis://red-xxx:6379`). |
-| `MAX_CONCURRENT_OPS` | `3` | Maximum number of concurrent research jobs allowed in the process. |
-| `MAX_MEMORY_MB` | `512` | Memory threshold limits (MB) prior to triggering early partial synthesis. |
-| `DAILY_SPEND_LIMIT_USD` | `50.0` | Warning threshold for estimated output-token spend. |
-| `CORS_ORIGINS` | `""` | Comma-separated list of approved CORS domain origins. |
+Run the automated tests before changing request validation, SSRF controls, job state, streaming, or cancellation behavior.
 
----
+## Deployment
 
-## 5. Local Setup & Installation
+- `Dockerfile` defines the service container.
+- `render.yaml` defines the Render deployment shape.
+- `REMOTE_MODE_TEST_REPORT.md` contains point-in-time remote-mode validation evidence.
 
-### 5.1 Prerequisites
-- Python 3.11+
-- virtualenv
+A successful historical test report or deployment blueprint does not guarantee current runtime health. Use live health, fleet status, logs, and current deployment evidence for operational decisions.
 
-### 5.2 Commands
-```bash
-# 1. Navigate to the agent directory
-cd WEB_INTELLIGENCE_AGENT_PATH
+## Relationship to AI Commander
 
-# 2. Create and activate a virtual environment
-python3 -m venv .venv
-source .venv/bin/activate
+`Ai-Command-Center-Desktop-App` uses this service when web research is better isolated as a dedicated job rather than executed directly in the local chat loop. `Aicc-Coordinator` can surface service health as part of the wider fleet view.
 
-# 3. Install pinned dependencies
-pip install -r requirements.lock
+## Documentation rule
 
-# 4. Spin up the FastAPI server locally
-uvicorn app.main:app --host 127.0.0.1 --port 8080
-
-# 5. Run the sidecar test suite
-pytest
-```
-
-### 5.3 Browser Testing
-
-The sidecar protects API routes with bearer-token authentication. If you open a protected route directly in a plain browser tab, the expected response is:
-
-```json
-{"detail":"Unauthorized: Missing authentication bearer token"}
-```
-
-For local browser testing, start the service with unauthenticated docs enabled:
-
-```bash
-WEB_INTELLIGENCE_AUTH_TOKEN=dev-token ALLOW_UNAUTHENTICATED_DOCS=true uvicorn app.main:app --host 127.0.0.1 --port 8081
-```
-
-Then open:
-
-- `http://127.0.0.1:8081/docs`
-- `http://127.0.0.1:8081/redoc`
-- `http://127.0.0.1:8081/openapi.json`
-
-Unauthenticated docs are only exposed when `DEPLOYMENT_MODE=local` and `ALLOW_UNAUTHENTICATED_DOCS=true`. Research, result, event, and cancel routes still require:
-
-```http
-Authorization: Bearer dev-token
-```
-
-Public local smoke-test URLs:
-
-- `http://127.0.0.1:8081/health/live`
-- `http://127.0.0.1:8081/capabilities`
-- `http://127.0.0.1:8081/metrics`
-
----
-
-## 6. Remote Deployment (Render.com)
-
-Render deployments use the Blueprint template (`render.yaml`) and build directly from the `Dockerfile`.
-
-1. Go to your **Render Dashboard** > **New** > **Blueprint**.
-2. Select your `Web-Intelligence-Agent` Git repository.
-3. Render will provision:
-   - The FastAPI web service linked to `Dockerfile` with liveness checks at `/health/live`.
-   - The Valkey database instance used for cluster queues.
-4. Set your provider API keys (`OPENAI_API_KEY`, `TAVILY_API_KEY`) as **Environment Variables** in the Render service dashboard. These are injected directly into the container's `os.environ` at startup.
-
-> **Note on secrets flow:** In local mode the sidecar inherits API keys from the Electron control plane's `process.env`, which loads them from AI Commander's centralized SOPS-encrypted secrets store (`secrets.enc.env`). In remote mode, Render's native environment variable injection replaces that mechanism. Do not introduce a separate secrets file loader — credentials always flow through environment variables regardless of deployment mode.
-
-## 7. Observability (Grafana Loki export)
-
-`app/grafana_observability.py` implements the fleet observability contract
-(ACES-293) with one implementation per concern: `resolve_loki_config()`
-(atomic config resolution), `validate_basic_auth()` (credential validation),
-`LokiEmitter` (bounded transport) and `ObserveASGI` (request/lifecycle
-observation).
-
-**Canonical keys — atomic pair.** `LOKI_URL_REMOTE` + `LOKI_REMOTE_AUTH` must
-both be present from the process environment (one authority) and valid for
-remote export to enable. A one-sided pair disables export with a single
-warning; values are never logged. `LOKI_REMOTE_AUTH` must be
-`Basic <base64(user:password)>` with non-empty user and password — anything
-else (wrong scheme, invalid base64, control characters) disables export before
-any worker or queue entry exists, never a retry loop.
-
-**Default policy.** Remote export auto-enables in production — detected as
-`DEPLOYMENT_MODE=remote` (set by `render.yaml`, mirroring `app/config.py`) or
-the `RENDER` env var that Render sets on every service — and is off in
-dev/test unless `OBSERVABILITY_REMOTE=1`. `OBSERVABILITY_REMOTE=0` opts out
-even in production. Local Python logging is independent of this policy.
-
-**Queue/drop semantics.** One daemon worker, a finite 64-event queue, bounded
-flush deadlines and no redirects. Overflow and oversized (>4KB) payloads are
-counted in `stats["dropped"]` and lost — telemetry, not an audit ledger. There
-is no retry loop and no per-request thread.
-
-**Privacy contract.** Only allowlisted metadata fields are exported (method,
-route template or `unmatched`, status, duration, error type, reason flags).
-Research queries, prompts, provider request bodies, headers, returned content
-and raw URL paths are never exported. The export worker uses a scoped egress
-profile for the single validated `*.grafana.net` push endpoint; the research
-SSRF/profile guard is not weakened globally.
-
-**Readback validation.** After deploying with a live pair, confirm ingestion
-by querying Grafana Explore for
-`{application="ai-agents", agent="web-intelligence-agent"}` and finding a
-fresh `service_started` or `http_request` event before declaring the
-integration live.
+This README describes the repository's current role and capabilities on `main`. Automated tests, live service health, deployment evidence, and current AI Commander integration are the sources of truth for operational status. Avoid static “production ready” claims that are not continuously verified.
