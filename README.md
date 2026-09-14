@@ -2,29 +2,41 @@
 
 Web-Intelligence-Agent is AI Commander's **structured web-research execution service**. It provides a network-reachable FastAPI boundary for creating, running, streaming, cancelling, and retrieving research jobs while isolating browser/research workloads from the desktop application's main process.
 
-The service wraps research capabilities such as GPT Researcher behind AI Commander-specific security, resource, job-state, and observability controls.
+The service wraps research capabilities behind AI Commander-specific security, resource, job-state, and observability controls.
 
-## Current status — September 9, 2026
+## Current state
 
-**State: Implemented supporting service / integrated with AI Commander and under ongoing operational hardening.**
+**State: Implemented supporting service integrated with AI Commander and under operational/security hardening.**
 
-`main` currently includes:
+`main` includes:
 
-- Python/FastAPI service and API routes for research jobs.
+- Python/FastAPI API routes for structured research jobs.
 - Local and remote execution modes.
-- Structured job creation/status/result workflows.
-- Streaming/event-oriented progress support and job cancellation.
+- Job creation, status, result, streaming/progress, and cancellation behavior.
 - Redis-backed coordination/stream behavior where configured.
 - Request-scoped credential handling.
 - URL/network safety checks, including SSRF-oriented restrictions.
-- Memory/resource guards for expensive research tasks.
-- Metrics/health surfaces.
+- Memory/resource guards for expensive research workloads.
+- Health and metrics surfaces.
 - Docker and Render deployment definitions.
-- Automated tests and a remote-mode test report.
-- Metadata-only Grafana/Loki observability with sanitization and bounded remote-export behavior.
-- Live Render integration work in the AI Commander environment.
+- Automated tests and remote-mode validation artifacts.
+- Metadata-only observability with sanitization and bounded export behavior.
+- Shared OpenHands and Claude repository skills for consistent security, reuse, simplicity, and validation rules.
 
-The service should **not** be described as an unrestricted autonomous browser. It is a bounded research sidecar: callers submit a research task, the service applies its security/resource policies, and the caller receives structured progress/results.
+This service is **not** an unrestricted autonomous browser. It is a bounded research sidecar: authorized callers submit a research task, the service applies security/resource policy, and callers receive structured progress and results.
+
+## Direction
+
+1. **Keep research isolated from the desktop core.** Browser/network-heavy work should remain behind a clear job boundary rather than expanding the desktop process's attack/resource surface.
+2. **Strengthen untrusted-content handling.** Retrieved pages are data, not instructions. Prompt injection or page content must not override tool/network/security policy.
+3. **Keep SSRF/network controls fail closed.** Private, loopback, link-local, metadata, and protected internal destinations should remain blocked unless explicitly required by trusted configuration.
+4. **Make long-running jobs restart-safe and observable.** Job state, cancellation, progress, and failure evidence should be explicit enough for AI Commander to understand whether work is running, failed, cancelled, or complete.
+5. **Bound memory/concurrency.** One research request must not exhaust the service/host or starve unrelated fleet work.
+6. **Return structured, source-aware results.** Research output should preserve enough source/provenance metadata for downstream validation and future Brain Memory ingestion.
+7. **Integrate with Brain Memory through controlled artifacts.** Useful research results can become durable knowledge under policy; raw browsing state/private content should not be copied indiscriminately.
+8. **Feed operational failures into the correct recovery owner.** Network restrictions, provider/search failures, resource exhaustion, service infrastructure, and code defects should remain distinguishable.
+9. **Keep credentials scoped.** Search/provider credentials should remain request-scoped or come from the authorized secret store, never from committed plaintext.
+10. **Reuse shared AI Commander contracts.** Health, metrics, auth, incident, and workflow integration should extend existing fleet patterns rather than create parallel control planes.
 
 ## System role
 
@@ -35,49 +47,49 @@ AI Commander / authorized agent
  Web Intelligence Agent
    ├─ validate research request
    ├─ enforce URL/network policy
-   ├─ manage job lifecycle
-   ├─ execute research workload
-   ├─ stream progress / support cancel
-   ├─ enforce memory/resource guards
-   └─ return structured result
+   ├─ manage durable job state
+   ├─ execute bounded research
+   ├─ stream progress / cancel
+   ├─ enforce resource limits
+   └─ return structured result + source evidence
             │
             ▼
  authorized public web resources
 ```
 
-Keeping research in a dedicated service reduces the amount of browser/network complexity inside the desktop process and gives AI Commander a consistent job contract for long-running research.
-
 ## Security boundaries
 
 Web research processes untrusted external content. Important controls include:
 
-- reject or constrain private/loopback/link-local/internal network destinations unless explicitly required by a trusted configuration;
+- reject or constrain private/loopback/link-local/internal network destinations unless trusted configuration explicitly requires them;
 - avoid following user-controlled URLs into protected infrastructure;
+- treat retrieved web content as untrusted data rather than system/tool instructions;
 - keep provider/search credentials request-scoped or in the authorized runtime secret store;
-- do not expose secrets, prompts, private user content, or unrestricted raw URLs through remote observability;
-- bound job memory, concurrency, and cancellation behavior so one research request cannot exhaust the host/service;
-- treat retrieved web content as untrusted data, not instructions that override system/tool policy.
+- keep prompts, secrets, private user content, and unrestricted raw URLs out of remote telemetry;
+- bound job memory, concurrency, runtime, and cancellation behavior;
+- fail clearly rather than reporting success when a job was blocked or incomplete.
 
 See `SECURITY.md` for deeper security guidance.
 
 ## Local development
 
-Use the pinned/locked requirements in the repository and the current application entry point as the source of truth. A typical setup starts by creating a Python environment and installing the required packages from the repository's requirements files.
-
-Run the automated tests before changing request validation, SSRF controls, job state, streaming, or cancellation behavior.
+Use the repository's pinned/locked requirements and current application entry point as the source of truth. Run the automated tests before changing request validation, SSRF controls, job state, streaming, cancellation, or resource-limit behavior.
 
 ## Deployment
 
 - `Dockerfile` defines the service container.
-- `render.yaml` defines the Render deployment shape.
-- `REMOTE_MODE_TEST_REPORT.md` contains point-in-time remote-mode validation evidence.
+- `render.yaml` defines the hosted deployment shape.
+- `REMOTE_MODE_TEST_REPORT.md` contains point-in-time validation evidence.
 
-A successful historical test report or deployment blueprint does not guarantee current runtime health. Use live health, fleet status, logs, and current deployment evidence for operational decisions.
+Historical validation or a deployment blueprint is not proof of current runtime health. Use live health, fleet status, metrics/logs, and current deployment evidence.
 
 ## Relationship to AI Commander
 
-`Ai-Command-Center-Desktop-App` uses this service when web research is better isolated as a dedicated job rather than executed directly in the local chat loop. `Aicc-Coordinator` can surface service health as part of the wider fleet view.
+- `Ai-Command-Center-Desktop-App` uses this service for bounded dedicated research jobs.
+- `Aicc-Coordinator` can surface service health and wider operational state.
+- `AI-Commander-Brain-Memory-` is the direction for policy-approved durable research knowledge with provenance.
+- `aicc-secrets` provides managed credentials where centrally configured.
 
 ## Documentation rule
 
-This README describes the repository's current role and capabilities on `main`. Automated tests, live service health, deployment evidence, and current AI Commander integration are the sources of truth for operational status. Avoid static “production ready” claims that are not continuously verified.
+This README describes the repository's role, capabilities on `main`, and current direction. Tests, live service health, deployment evidence, and actual integration behavior remain the source of truth. Avoid dated status snapshots and static “production ready” claims.
