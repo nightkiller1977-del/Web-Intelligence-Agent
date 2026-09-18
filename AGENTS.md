@@ -40,9 +40,9 @@ OpenHands skills live under `.agents/skills/`. Claude Code skills live under `.c
 
 ## Pull request review policy
 
-- **GitHub Copilot Code Review is the only AI pull-request reviewer to request or enable for this repository.**
-- When an AI review is needed, request **Copilot** through GitHub's normal reviewer mechanism.
+- **Use GitHub Copilot Code Review and the AI Commander Code Review Agent for AI-assisted pull-request review.**
+- When an external AI review is needed, request **GitHub Copilot** through GitHub's normal reviewer mechanism.
+- Also inspect the **AI Commander Code Review Agent** result when it is available; treat its findings as hypotheses to verify against the current head, source, tests, and deterministic evidence.
 - Do **not** request, invoke, enable, or depend on Codex/OpenAI/ChatGPT pull-request review, including `@codex review`.
-- Do **not** trigger the AI Commander Code Review Agent or another AI reviewer for PR review unless the repository owner explicitly changes this policy.
-- Historical review comments from other reviewers may remain as evidence, but new review rounds must use Copilot only.
-- Copilot review does not replace deterministic merge evidence: required CI, tests, lint, security checks, and repository-specific validation still must pass.
+- Historical Codex or other reviewer comments may remain as evidence, but do not trigger new Codex review rounds.
+- Copilot and AI Commander review do not replace deterministic merge evidence: required CI, tests, lint, security checks, and repository-specific validation still must pass.
