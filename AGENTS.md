@@ -37,3 +37,12 @@ Jira is the source of truth for AI Commander implementation work. Before code-ch
 
 ## Skills
 OpenHands skills live under `.agents/skills/`. Claude Code skills live under `.claude/skills/`. Skills supplement these rules and do not override them.
+
+## Pull request review policy
+
+- **Use GitHub Copilot Code Review and the AI Commander Code Review Agent for AI-assisted pull-request review.**
+- When an external AI review is needed, request **GitHub Copilot** through GitHub's normal reviewer mechanism.
+- Also inspect the **AI Commander Code Review Agent** result when it is available; treat its findings as hypotheses to verify against the current head, source, tests, and deterministic evidence.
+- Do **not** request, invoke, enable, or depend on Codex/OpenAI/ChatGPT pull-request review, including `@codex review`.
+- Historical Codex or other reviewer comments may remain as evidence, but do not trigger new Codex review rounds.
+- Copilot and AI Commander review do not replace deterministic merge evidence: required CI, tests, lint, security checks, and repository-specific validation still must pass.
