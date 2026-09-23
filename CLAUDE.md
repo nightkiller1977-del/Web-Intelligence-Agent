@@ -10,6 +10,7 @@
 - Ask before irreversible/shared actions unless explicitly authorized in the current task: merge, force-push/history rewrite, production deploy/config change, secret-store write, real external submission/message/purchase, destructive account/data change, or permission/budget change.
 - Branch commits, tests, and opening a PR do not require extra confirmation.
 - Never bypass tests, hooks, approval checks, or security controls merely to appear complete.
+- Start delegated fix sessions (review-finding fixes, CI fixes, merging the base branch in) on Sonnet. Use Opus only for initial design/implementation or when the user asks for it.
 
 ## Ecosystem and tool boundary
 
