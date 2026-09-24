@@ -134,3 +134,90 @@ jobs:
         env:
           RENDER_SERVICE_URL: ${{ secrets.RENDER_SERVICE_URL }}
           WEB_INTELLIGENCE_AUTH_TOKEN: ${{ secrets.WEB_INTELLIGENCE_AUTH_TOKEN }}
+
+  # ACES-453: deploy the built image to Azure Container Apps after CI passes
+  # on main. Deliberately does NOT depend on live-integration-test — that job
+  # targets the Render deployment (a separate, pre-Azure-migration surface;
+  # see the 2026-09-24 Azure migration notes) and coupling this repo's Azure
+  # deploy to a Render smoke test's health is the wrong dependency direction
+  # regardless of whether Render is still live. OIDC federated auth (no
+  # stored client secret) via a service principal scoped to rg-aicc-fleet
+  # only — see AZURE_CLIENT_ID/TENANT_ID/SUBSCRIPTION_ID repo secrets.
+  deploy:
+    name: Deploy to Azure Container Apps
+    runs-on: ubuntu-latest
+    needs: [test, security-egress-test]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      id-token: write
+      contents: read
+    concurrency:
+      group: deploy-web-intelligence-agent
+      cancel-in-progress: false
+    env:
+      RESOURCE_GROUP: rg-aicc-fleet
+      APP_NAME: web-intelligence-agent
+      ACR_NAME: aiccfleetacr
+      IMAGE_NAME: web-intelligence-agent
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Install Azure Container Apps CLI extension
+        run: az extension add --name containerapp --upgrade -y
+
+      - name: Build image (az acr build)
+        run: |
+          set -euo pipefail
+          SHORT_SHA="${GITHUB_SHA:0:7}"
+          echo "IMAGE_TAG=sha-${SHORT_SHA}" >> "$GITHUB_ENV"
+          echo "REVISION_SUFFIX=gh${SHORT_SHA}" >> "$GITHUB_ENV"
+          az acr build \
+            --registry "$ACR_NAME" \
+            --image "${IMAGE_NAME}:sha-${SHORT_SHA}" \
+            --file ./Dockerfile \
+            .
+
+      - name: Update Container App revision
+        run: |
+          set -euo pipefail
+          az containerapp update \
+            --name "$APP_NAME" \
+            --resource-group "$RESOURCE_GROUP" \
+            --image "${ACR_NAME}.azurecr.io/${IMAGE_NAME}:${IMAGE_TAG}" \
+            --revision-suffix "$REVISION_SUFFIX"
+
+      - name: Wait for new revision to report healthy
+        run: |
+          set -euo pipefail
+          REVISION_NAME="${APP_NAME}--${REVISION_SUFFIX}"
+          echo "Waiting on revision: $REVISION_NAME"
+          for i in $(seq 1 30); do
+            RUNNING_STATE=$(az containerapp revision show \
+              --name "$APP_NAME" --resource-group "$RESOURCE_GROUP" \
+              --revision "$REVISION_NAME" \
+              --query "properties.runningState" -o tsv 2>/dev/null || echo "Pending")
+            HEALTH_STATE=$(az containerapp revision show \
+              --name "$APP_NAME" --resource-group "$RESOURCE_GROUP" \
+              --revision "$REVISION_NAME" \
+              --query "properties.healthState" -o tsv 2>/dev/null || echo "Pending")
+            echo "Attempt $i/30: running=$RUNNING_STATE health=$HEALTH_STATE"
+            if [ "$RUNNING_STATE" = "Running" ] && [ "$HEALTH_STATE" = "Healthy" ]; then
+              echo "Revision is healthy."
+              exit 0
+            fi
+            if [ "$RUNNING_STATE" = "Failed" ] || [ "$HEALTH_STATE" = "Unhealthy" ]; then
+              echo "Revision reported unhealthy/failed. Recent logs:"
+              az containerapp logs show --name "$APP_NAME" --resource-group "$RESOURCE_GROUP" --revision "$REVISION_NAME" --tail 100 || true
+              exit 1
+            fi
+            sleep 10
+          done
+          echo "Timed out waiting for revision to report healthy."
+          exit 1
