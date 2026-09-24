@@ -180,6 +180,7 @@ jobs:
           echo "REVISION_SUFFIX=gh${SHORT_SHA}" >> "$GITHUB_ENV"
           az acr build \
             --registry "$ACR_NAME" \
+            --resource-group "$RESOURCE_GROUP" \
             --image "${IMAGE_NAME}:sha-${SHORT_SHA}" \
             --file ./Dockerfile \
             .
