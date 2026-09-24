@@ -12,8 +12,13 @@ Destination/credential resolution follows the fleet observability contract
 * Default policy — remote export auto-enables in production and is off in
   dev/test unless ``OBSERVABILITY_REMOTE=1``; ``OBSERVABILITY_REMOTE=0`` opts
   out even in production. Production means ``DEPLOYMENT_MODE=remote`` (set by
-  ``render.yaml``, mirroring ``app/config.py``) or the ``RENDER`` env var that
-  Render sets on every service. Local Python logging is independent.
+  ``render.yaml``, mirroring ``app/config.py``) or a present, truthy ``RENDER``
+  env var. Post-Render-migration (ACES-461) neither signal is set on the live
+  deployment (``DEPLOYMENT_MODE`` is repurposed there for an unrelated storage
+  backend), so an *absent* ``RENDER`` also now defaults to production — the
+  safer failure mode for an ops-visibility feature, mirroring the Go services'
+  "unset environment defaults to production" convention. Local Python logging
+  is independent.
 """
 from __future__ import annotations
 
@@ -80,8 +85,16 @@ def _valid_push_url(url):
 
 
 def is_production(env=None):
+    """``DEPLOYMENT_MODE=remote`` or a present ``RENDER`` still count as an
+    explicit signal. A completely absent ``RENDER`` (the Azure reality; see
+    module docstring) now also defaults to production rather than dev/test.
+    """
     env = os.environ if env is None else env
-    return env.get("DEPLOYMENT_MODE", "local") == "remote" or bool(env.get("RENDER"))
+    if env.get("DEPLOYMENT_MODE", "local") == "remote":
+        return True
+    if "RENDER" in env:
+        return bool(env.get("RENDER"))
+    return True
 
 
 def _disabled(reason, *, warn=True):

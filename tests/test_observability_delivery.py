@@ -73,12 +73,42 @@ class TransportTests(unittest.TestCase):
             self.assertFalse(emitter.emit("x" * 5000))
         self.assertEqual(emitter.stats["dropped"], 1)
 
+class IsProductionTests(unittest.TestCase):
+    """ACES-461: an absent RENDER now also defaults to production."""
+
+    def test_missing_signals_default_to_production(self):
+        self.assertTrue(module.is_production({}))
+
+    def test_deployment_mode_local_with_no_render_defaults_to_production(self):
+        # The actual Azure deployment: DEPLOYMENT_MODE is repurposed for an
+        # unrelated storage backend and set to "local"; RENDER is unset.
+        self.assertTrue(module.is_production({"DEPLOYMENT_MODE": "local"}))
+
+    def test_deployment_mode_remote_is_still_explicit_production(self):
+        self.assertTrue(module.is_production({"DEPLOYMENT_MODE": "remote"}))
+
+    def test_render_present_and_truthy_is_still_production(self):
+        self.assertTrue(module.is_production({"RENDER": "true"}))
+
+    def test_render_present_but_falsy_is_still_non_production(self):
+        self.assertFalse(module.is_production({"RENDER": ""}))
+
+
 class PolicyTests(unittest.TestCase):
     URL = "https://logs.example.grafana.net/loki/api/v1/push"
     AUTH = "Basic dGVzdDp0ZXN0"
 
-    def test_dev_test_default_off_even_with_valid_pair(self):
+    def test_missing_signal_defaults_to_production(self):
+        # ACES-461: post-Render-migration, no signal at all (the Azure
+        # reality) must still auto-enable a valid pair, not silently disable it.
         env = {"LOKI_URL_REMOTE": self.URL, "LOKI_REMOTE_AUTH": self.AUTH}
+        with patch.dict(os.environ, env, clear=True):
+            config = module.resolve_loki_config()
+        self.assertTrue(config.enabled)
+        self.assertEqual((config.url, config.auth, config.source), (self.URL, self.AUTH, "env"))
+
+    def test_render_present_but_falsy_stays_non_production_default_off(self):
+        env = {"LOKI_URL_REMOTE": self.URL, "LOKI_REMOTE_AUTH": self.AUTH, "RENDER": ""}
         with patch.dict(os.environ, env, clear=True):
             config = module.resolve_loki_config()
             self.assertFalse(config.enabled)
