@@ -209,11 +209,15 @@ jobs:
               --revision "$REVISION_NAME" \
               --query "properties.healthState" -o tsv 2>/dev/null || echo "Pending")
             echo "Attempt $i/30: running=$RUNNING_STATE health=$HEALTH_STATE"
-            if [ "$RUNNING_STATE" = "Running" ] && [ "$HEALTH_STATE" = "Healthy" ]; then
-              echo "Revision is healthy."
-              exit 0
-            fi
-            if [ "$RUNNING_STATE" = "Failed" ] || [ "$HEALTH_STATE" = "Unhealthy" ]; then
+            case "$RUNNING_STATE" in
+              Running|RunningAtMaxScale|RunningAtMinScale)
+                if [ "$HEALTH_STATE" = "Healthy" ]; then
+                  echo "Revision is healthy."
+                  exit 0
+                fi
+                ;;
+            esac
+            if [ "$RUNNING_STATE" = "Failed" ] || [ "$RUNNING_STATE" = "Degraded" ] || [ "$HEALTH_STATE" = "Unhealthy" ]; then
               echo "Revision reported unhealthy/failed. Recent logs:"
               az containerapp logs show --name "$APP_NAME" --resource-group "$RESOURCE_GROUP" --revision "$REVISION_NAME" --tail 100 || true
               exit 1
