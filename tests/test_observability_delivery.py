@@ -74,15 +74,17 @@ class TransportTests(unittest.TestCase):
         self.assertEqual(emitter.stats["dropped"], 1)
 
 class IsProductionTests(unittest.TestCase):
-    """ACES-461: an absent RENDER now also defaults to production."""
+    """ACES-461: CONTAINER_APP_NAME (Azure's auto-injected signal) is now
+    also explicit production; nothing recognized still stays non-production,
+    including an ordinary local run where DEPLOYMENT_MODE defaults to "local"."""
 
-    def test_missing_signals_default_to_production(self):
-        self.assertTrue(module.is_production({}))
+    def test_missing_all_signals_stays_non_production(self):
+        self.assertFalse(module.is_production({}))
 
-    def test_deployment_mode_local_with_no_render_defaults_to_production(self):
-        # The actual Azure deployment: DEPLOYMENT_MODE is repurposed for an
-        # unrelated storage backend and set to "local"; RENDER is unset.
-        self.assertTrue(module.is_production({"DEPLOYMENT_MODE": "local"}))
+    def test_deployment_mode_local_with_no_render_stays_non_production(self):
+        # The ordinary local/dev default (app/config.py) — must NOT become
+        # production just because RENDER happens to be unset too.
+        self.assertFalse(module.is_production({"DEPLOYMENT_MODE": "local"}))
 
     def test_deployment_mode_remote_is_still_explicit_production(self):
         self.assertTrue(module.is_production({"DEPLOYMENT_MODE": "remote"}))
@@ -93,19 +95,26 @@ class IsProductionTests(unittest.TestCase):
     def test_render_present_but_falsy_is_still_non_production(self):
         self.assertFalse(module.is_production({"RENDER": ""}))
 
+    def test_container_app_name_present_is_production(self):
+        # The real Azure signal (auto-injected on every revision): present
+        # even though DEPLOYMENT_MODE stays "local" (repurposed storage
+        # setting) and RENDER is unset.
+        self.assertTrue(module.is_production({"DEPLOYMENT_MODE": "local", "CONTAINER_APP_NAME": "web-intelligence-agent"}))
+
 
 class PolicyTests(unittest.TestCase):
     URL = "https://logs.example.grafana.net/loki/api/v1/push"
     AUTH = "Basic dGVzdDp0ZXN0"
 
-    def test_missing_signal_defaults_to_production(self):
-        # ACES-461: post-Render-migration, no signal at all (the Azure
-        # reality) must still auto-enable a valid pair, not silently disable it.
+    def test_missing_all_signals_stays_non_production_default_off(self):
         env = {"LOKI_URL_REMOTE": self.URL, "LOKI_REMOTE_AUTH": self.AUTH}
         with patch.dict(os.environ, env, clear=True):
             config = module.resolve_loki_config()
-        self.assertTrue(config.enabled)
-        self.assertEqual((config.url, config.auth, config.source), (self.URL, self.AUTH, "env"))
+            self.assertFalse(config.enabled)
+            self.assertEqual(config.reason, "non_production_default_off")
+            emitter = module.LokiEmitter("test-agent")
+            self.assertFalse(emitter.emit("test"))
+            self.assertIsNone(emitter._worker)
 
     def test_render_present_but_falsy_stays_non_production_default_off(self):
         env = {"LOKI_URL_REMOTE": self.URL, "LOKI_REMOTE_AUTH": self.AUTH, "RENDER": ""}
@@ -116,6 +125,15 @@ class PolicyTests(unittest.TestCase):
             emitter = module.LokiEmitter("test-agent")
             self.assertFalse(emitter.emit("test"))
             self.assertIsNone(emitter._worker)
+
+    def test_container_app_name_auto_on(self):
+        # ACES-461: the real Azure Container Apps signal must auto-enable a
+        # valid pair without requiring a manual OBSERVABILITY_REMOTE=1.
+        env = {"LOKI_URL_REMOTE": self.URL, "LOKI_REMOTE_AUTH": self.AUTH, "CONTAINER_APP_NAME": "web-intelligence-agent"}
+        with patch.dict(os.environ, env, clear=True):
+            config = module.resolve_loki_config()
+        self.assertTrue(config.enabled)
+        self.assertEqual((config.url, config.auth, config.source), (self.URL, self.AUTH, "env"))
 
     def test_production_render_deployment_mode_auto_on(self):
         with patch.dict(os.environ, {"LOKI_URL_REMOTE": self.URL, "LOKI_REMOTE_AUTH": self.AUTH, "DEPLOYMENT_MODE": "remote"}, clear=True):

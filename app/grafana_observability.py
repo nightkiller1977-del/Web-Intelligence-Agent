@@ -12,13 +12,17 @@ Destination/credential resolution follows the fleet observability contract
 * Default policy — remote export auto-enables in production and is off in
   dev/test unless ``OBSERVABILITY_REMOTE=1``; ``OBSERVABILITY_REMOTE=0`` opts
   out even in production. Production means ``DEPLOYMENT_MODE=remote`` (set by
-  ``render.yaml``, mirroring ``app/config.py``) or a present, truthy ``RENDER``
-  env var. Post-Render-migration (ACES-461) neither signal is set on the live
-  deployment (``DEPLOYMENT_MODE`` is repurposed there for an unrelated storage
-  backend), so an *absent* ``RENDER`` also now defaults to production — the
-  safer failure mode for an ops-visibility feature, mirroring the Go services'
-  "unset environment defaults to production" convention. Local Python logging
-  is independent.
+  ``render.yaml``, mirroring ``app/config.py``), a present, truthy ``RENDER``
+  env var, or ``CONTAINER_APP_NAME`` — which Azure Container Apps injects into
+  every revision automatically (see
+  https://learn.microsoft.com/azure/container-apps/environment-variables#built-in-environment-variables),
+  giving a real positive signal on the live post-Render-migration deployment
+  (ACES-461) without requiring a permanent ``OBSERVABILITY_REMOTE=1`` opt-in.
+  Neither Render-era signal alone is set there (``DEPLOYMENT_MODE`` is
+  repurposed for an unrelated storage backend). An environment with none of
+  these three signals — including an ordinary local/dev run, where
+  ``DEPLOYMENT_MODE`` also defaults to ``"local"`` — still defaults to
+  non-production. Local Python logging is independent.
 """
 from __future__ import annotations
 
@@ -85,16 +89,17 @@ def _valid_push_url(url):
 
 
 def is_production(env=None):
-    """``DEPLOYMENT_MODE=remote`` or a present ``RENDER`` still count as an
-    explicit signal. A completely absent ``RENDER`` (the Azure reality; see
-    module docstring) now also defaults to production rather than dev/test.
+    """``DEPLOYMENT_MODE=remote``, a truthy ``RENDER``, or ``CONTAINER_APP_NAME``
+    (auto-set by Azure Container Apps on every revision) are explicit signals.
+    Nothing recognized — including an ordinary local run, where
+    ``DEPLOYMENT_MODE`` also defaults to ``"local"`` — stays non-production.
     """
     env = os.environ if env is None else env
-    if env.get("DEPLOYMENT_MODE", "local") == "remote":
-        return True
-    if "RENDER" in env:
-        return bool(env.get("RENDER"))
-    return True
+    return (
+        env.get("DEPLOYMENT_MODE", "local") == "remote"
+        or bool(env.get("RENDER"))
+        or bool(env.get("CONTAINER_APP_NAME"))
+    )
 
 
 def _disabled(reason, *, warn=True):
