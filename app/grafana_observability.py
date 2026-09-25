@@ -12,8 +12,17 @@ Destination/credential resolution follows the fleet observability contract
 * Default policy — remote export auto-enables in production and is off in
   dev/test unless ``OBSERVABILITY_REMOTE=1``; ``OBSERVABILITY_REMOTE=0`` opts
   out even in production. Production means ``DEPLOYMENT_MODE=remote`` (set by
-  ``render.yaml``, mirroring ``app/config.py``) or the ``RENDER`` env var that
-  Render sets on every service. Local Python logging is independent.
+  ``render.yaml``, mirroring ``app/config.py``), a present, truthy ``RENDER``
+  env var, or ``CONTAINER_APP_NAME`` — which Azure Container Apps injects into
+  every revision automatically (see
+  https://learn.microsoft.com/azure/container-apps/environment-variables#built-in-environment-variables),
+  giving a real positive signal on the live post-Render-migration deployment
+  (ACES-461) without requiring a permanent ``OBSERVABILITY_REMOTE=1`` opt-in.
+  Neither Render-era signal alone is set there (``DEPLOYMENT_MODE`` is
+  repurposed for an unrelated storage backend). An environment with none of
+  these three signals — including an ordinary local/dev run, where
+  ``DEPLOYMENT_MODE`` also defaults to ``"local"`` — still defaults to
+  non-production. Local Python logging is independent.
 """
 from __future__ import annotations
 
@@ -80,8 +89,17 @@ def _valid_push_url(url):
 
 
 def is_production(env=None):
+    """``DEPLOYMENT_MODE=remote``, a truthy ``RENDER``, or ``CONTAINER_APP_NAME``
+    (auto-set by Azure Container Apps on every revision) are explicit signals.
+    Nothing recognized — including an ordinary local run, where
+    ``DEPLOYMENT_MODE`` also defaults to ``"local"`` — stays non-production.
+    """
     env = os.environ if env is None else env
-    return env.get("DEPLOYMENT_MODE", "local") == "remote" or bool(env.get("RENDER"))
+    return (
+        env.get("DEPLOYMENT_MODE", "local") == "remote"
+        or bool(env.get("RENDER"))
+        or bool(env.get("CONTAINER_APP_NAME"))
+    )
 
 
 def _disabled(reason, *, warn=True):
