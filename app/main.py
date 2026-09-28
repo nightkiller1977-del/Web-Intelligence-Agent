@@ -10,6 +10,7 @@ from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from app.config import auth_is_configured, settings, unauthenticated_docs_allowed
 from app.storage import storage
 from app.cancellation import cancellation_manager
+from app.researcher_adapter import flush_pending_ingest_tasks
 from app.api import router
 from app.grafana_observability import ObserveASGI, emitter, emit as emit_observability
 
@@ -35,6 +36,10 @@ async def lifespan(app: FastAPI):
         redis_enabled=bool(redis_client),
     )
     yield
+    # Best-effort Brain outcome ingests are tracked tasks. Await them before
+    # the loop tears down, otherwise a graceful shutdown can close the loop
+    # mid-flight and lose the outcome despite scheduling it.
+    await flush_pending_ingest_tasks()
     await cancellation_manager.shutdown()
     logger.info("Shutting down storage backend connections...")
 

@@ -129,3 +129,41 @@ def test_recall_ignores_malformed_results_payload(monkeypatch):
     monkeypatch.setattr(client, "_request", lambda *_args: {"results": None})
 
     assert client.recall_context("question") == ""
+
+
+def test_ingest_rejects_negative_or_non_accepting_receipt(monkeypatch):
+    from app.brain_memory import BrainMemoryClient
+
+    for receipt in (
+        {"accepted": False},
+        {"acceptedChunks": 0, "duplicates": 0, "rejected": 1},
+        {"acceptedChunks": 0, "duplicates": 0, "quarantined": 1},
+        {"acceptedChunks": 0, "duplicates": 0},
+        {},
+        "not-an-object",
+    ):
+        client = BrainMemoryClient("https://brain.example", "web-agent-1", "test-secret")
+        monkeypatch.setattr(client, "_request", lambda *_args, _r=receipt: _r)
+        assert client.ingest_verified_outcome(
+            operation_id="op-1",
+            status="completed",
+            mode="standard",
+            source_count=1,
+            verified_claim_count=1,
+            source_types=["web"],
+        ) is False, receipt
+
+
+def test_ingest_accepts_chunk_receipt_with_accepted_chunks(monkeypatch):
+    from app.brain_memory import BrainMemoryClient
+
+    client = BrainMemoryClient("https://brain.example", "web-agent-1", "test-secret")
+    monkeypatch.setattr(client, "_request", lambda *_args: {"acceptedChunks": 2, "duplicates": 0, "rejected": 0, "quarantined": 0})
+    assert client.ingest_verified_outcome(
+        operation_id="op-1",
+        status="completed",
+        mode="standard",
+        source_count=1,
+        verified_claim_count=1,
+        source_types=["web"],
+    ) is True

@@ -502,9 +502,15 @@ def _schedule_outcome_ingest(client, result: Dict[str, Any], op_id: str, mode: s
     tracked in ``_pending_ingest_tasks`` so tests and shutdown can await an
     explicit completion signal.
     """
+    # Count only claims carrying independently extracted source evidence.
+    # The report-only fallback in build_structured_findings() manufactures
+    # evidence from the generated report itself and labels those claims
+    # "partially-supported", so counting that status would ingest a fabricated
+    # verification success. "supported" against a real passage (or any status
+    # backed by an evidence id) is the independently evidenced shape.
     verified_claim_count = sum(
         1 for claim in result.get("claims", [])
-        if claim.get("verificationStatus") in ("supported", "partially-supported")
+        if claim.get("verificationStatus") == "supported" and claim.get("evidenceIds")
     )
     sources = result.get("sources", [])
     task = asyncio.create_task(asyncio.to_thread(
