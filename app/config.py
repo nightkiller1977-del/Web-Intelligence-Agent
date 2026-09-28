@@ -1,6 +1,7 @@
 # app/config.py
 import os
 import secrets
+import logging
 from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings
 from pydantic_settings import SettingsConfigDict
@@ -39,6 +40,8 @@ class Settings(BaseSettings):
 
 settings = Settings()
 
+_logger = logging.getLogger("web-intelligence")
+
 # Secure fallback token generation if not provided in local mode
 if settings.DEPLOYMENT_MODE == "local" and not settings.AUTH_TOKEN:
     settings.AUTH_TOKEN = secrets.token_hex(32)
@@ -51,3 +54,24 @@ def raw_header_credentials_allowed() -> bool:
 
 def unauthenticated_docs_allowed() -> bool:
     return settings.DEPLOYMENT_MODE == "local" and settings.ALLOW_UNAUTHENTICATED_DOCS
+
+
+def brain_memory_client():
+    """Return the optional Brain client only for a complete, explicit config."""
+    if os.getenv("BRAIN_MEMORY_ENABLED", "").lower() not in ("1", "true", "yes"):
+        return None
+    values = {
+        "BRAIN_MEMORY_URL": os.getenv("BRAIN_MEMORY_URL", "").strip(),
+        "BRAIN_MEMORY_KEY_ID": os.getenv("BRAIN_MEMORY_KEY_ID", "").strip(),
+        "BRAIN_MEMORY_SECRET": os.getenv("BRAIN_MEMORY_SECRET", "").strip(),
+    }
+    missing = [name for name, value in values.items() if not value]
+    if missing:
+        _logger.warning("Brain Memory disabled because its credential group is incomplete: %s", ", ".join(missing))
+        return None
+    try:
+        from app.brain_memory import BrainMemoryClient
+        return BrainMemoryClient(values["BRAIN_MEMORY_URL"], values["BRAIN_MEMORY_KEY_ID"], values["BRAIN_MEMORY_SECRET"])
+    except ValueError:
+        _logger.warning("Brain Memory disabled because its URL is invalid", exc_info=True)
+        return None

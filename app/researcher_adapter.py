@@ -12,7 +12,7 @@ from gpt_researcher import GPTResearcher
 from app.progress_adapter import ProgressReporter, GPTResearcherCallbackHandler
 from app.model_adapter import RequestEnvironmentManager
 from app.security import enforce_egress_protection, is_safe_url
-from app.config import settings
+from app.config import brain_memory_client, settings
 
 logger = logging.getLogger("web-intelligence")
 import psutil
@@ -520,6 +520,11 @@ async def conduct_web_research(
         query_domains = source_policy["allowedDomains"]
     input_chunks, allow_external_inputs = collect_input_context(inputs)
     effective_query, input_limitations = build_effective_query(query, freshness, input_chunks, allow_external_inputs)
+    memory_client = brain_memory_client()
+    if memory_client and os.getenv("BRAIN_MEMORY_CONTEXT_ENABLED", "").lower() in ("1", "true", "yes"):
+        historical_context = await asyncio.to_thread(memory_client.recall_context, query)
+        if historical_context:
+            effective_query = f"{effective_query}\n\n{historical_context}"
 
     # Determine gpt-researcher report types based on mode
     report_type = "research_report"
@@ -548,7 +553,7 @@ async def conduct_web_research(
     callbacks = GPTResearcherCallbackHandler(reporter)
 
     with enforce_egress_protection(profile, maximum_searches=max_searches):
-        return await _run_research(
+        result = await _run_research(
             env_manager,
             callbacks,
             reporter,
@@ -570,6 +575,21 @@ async def conduct_web_research(
             input_limitations,
             start_time
         )
+    if memory_client and result.get("status") in ("completed", "partial"):
+        verified_claim_count = sum(
+            1 for claim in result.get("claims", [])
+            if claim.get("verificationStatus") in ("supported", "partially-supported")
+        )
+        await asyncio.to_thread(
+            memory_client.ingest_verified_outcome,
+            operation_id=op_id,
+            status=result["status"],
+            mode=mode,
+            source_count=len(result.get("sources", [])),
+            verified_claim_count=verified_claim_count,
+            source_types=[source.get("sourceType", "") for source in result.get("sources", [])],
+        )
+    return result
 
 async def _run_research(env_manager, callbacks, reporter, op_id, query, mode, profile, report_type, max_duration, max_searches, max_pages, max_sources, max_memory, query_domains, limits, require_claim_verification, headers, input_chunks, input_limitations, start_time):
     with env_manager.apply_keys():
