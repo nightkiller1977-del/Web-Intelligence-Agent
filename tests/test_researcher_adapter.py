@@ -568,3 +568,41 @@ async def test_recall_disabled_for_explicit_source_allowlist(monkeypatch):
 
     assert result["status"] == "completed"
     assert recalled["called"] is False
+
+
+@pytest.mark.anyio
+async def test_recall_disabled_for_explicit_empty_source_allowlist(monkeypatch):
+    """An explicit empty allowlist is restrictive, not an unrestricted default."""
+    recalled = {"called": False}
+
+    class BrainMemorySpy:
+        def recall_context(self, query):
+            recalled["called"] = True
+            return "UNTRUSTED HISTORICAL EVIDENCE — should not appear"
+
+    spy = BrainMemorySpy()
+    monkeypatch.setattr(researcher_adapter.settings, "BRAIN_MEMORY_CONTEXT_ENABLED", True)
+    monkeypatch.setattr(researcher_adapter, "GPTResearcher", FakeCompletedGPTResearcher)
+    monkeypatch.setattr(researcher_adapter, "brain_memory_client", lambda: spy)
+    monkeypatch.setattr(researcher_adapter, "is_safe_url", lambda url, profile: True)
+    reporter = MagicMock()
+    reporter.report = AsyncMock()
+
+    result = await conduct_web_research(
+        op_id="test-op",
+        query="test query",
+        mode="standard",
+        profile="general",
+        limits={"maximumDurationSeconds": 30, "maximumSearches": 3, "maximumPages": 5, "maximumSources": 5},
+        source_policy={"allowedDomains": []},
+        freshness=None,
+        inputs=None,
+        model_provider=None,
+        model_name=None,
+        require_claim_verification=False,
+        reporter=reporter,
+        headers={},
+    )
+
+    assert result["status"] == "completed"
+    assert recalled["called"] is False

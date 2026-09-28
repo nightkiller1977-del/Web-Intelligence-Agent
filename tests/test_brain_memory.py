@@ -1,6 +1,7 @@
 import hashlib
 import hmac
 import json
+from urllib.request import ProxyHandler
 
 
 def test_search_signs_exact_body_and_bounds_untrusted_context(monkeypatch):
@@ -120,6 +121,41 @@ def test_request_rejects_private_or_rebound_brain_endpoint(monkeypatch):
         assert "approved egress" in str(exc)
     else:
         raise AssertionError("unsafe Brain endpoint must be rejected before a request is sent")
+
+
+def test_request_disables_ambient_proxies(monkeypatch):
+    """Signed Brain credentials must only be sent to the configured endpoint."""
+    from app.brain_memory import BrainMemoryClient
+
+    client = BrainMemoryClient("https://brain.example", "web-agent-1", "test-secret")
+    handlers = []
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, _limit):
+            return b'{"accepted": true}'
+
+    class Opener:
+        def open(self, _request, timeout):
+            assert timeout == 5
+            return Response()
+
+    def fake_build_opener(*configured_handlers):
+        handlers.extend(configured_handlers)
+        return Opener()
+
+    monkeypatch.setattr("app.brain_memory.is_safe_egress_url", lambda _url: True)
+    monkeypatch.setattr("app.brain_memory.build_opener", fake_build_opener)
+
+    assert client._request("/v1/memories/search", "{}", "brain-memory-http-search-v1") == {"accepted": True}
+    proxy_handlers = [handler for handler in handlers if isinstance(handler, ProxyHandler)]
+    assert len(proxy_handlers) == 1
+    assert proxy_handlers[0].proxies == {}
 
 
 def test_recall_ignores_malformed_results_payload(monkeypatch):
