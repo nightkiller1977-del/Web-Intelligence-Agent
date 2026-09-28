@@ -168,6 +168,26 @@ def test_ingest_accepts_chunk_receipt_with_accepted_chunks(monkeypatch):
         source_types=["web"],
     ) is True
 
+def test_ingest_rejects_malformed_receipt_counters_without_raising(monkeypatch):
+    from app.brain_memory import BrainMemoryClient
+
+    for receipt in (
+        {"acceptedChunks": "unknown"},
+        {"rejected": "not-a-number"},
+        {"quarantined": ["x"], "acceptedChunks": 2},
+    ):
+        client = BrainMemoryClient("https://brain.example", "web-agent-1", "test-secret")
+        monkeypatch.setattr(client, "_request", lambda *_args, _r=receipt: _r)
+        assert client.ingest_verified_outcome(
+            operation_id="op-1",
+            status="completed",
+            mode="standard",
+            source_count=1,
+            verified_claim_count=1,
+            source_types=["web"],
+        ) is False, receipt
+
+
 def test_recall_context_is_bounded_in_utf8_bytes(monkeypatch):
     from app.brain_memory import BrainMemoryClient
 

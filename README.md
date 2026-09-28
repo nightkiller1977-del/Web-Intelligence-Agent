@@ -98,7 +98,7 @@ STORAGE_BACKEND=local
 
 Do not commit your `.env` file.
 
-Optional Brain Memory integration is off by default. To enable verified research-outcome ingestion, set the complete `BRAIN_MEMORY_URL`, `BRAIN_MEMORY_KEY_ID`, and `BRAIN_MEMORY_SECRET` credential group together with `BRAIN_MEMORY_ENABLED=true`. Historical recall additionally requires `BRAIN_MEMORY_CONTEXT_ENABLED=true`; recalled text is bounded, provenance-labelled, and explicitly treated as untrusted background rather than instructions or current-state authority.
+Optional Brain Memory integration is off by default. To enable verified research-outcome ingestion, set the complete `BRAIN_MEMORY_URL`, `BRAIN_MEMORY_KEY_ID`, and `BRAIN_MEMORY_SECRET` credential group together with `BRAIN_MEMORY_ENABLED=true`. Historical recall additionally requires `BRAIN_MEMORY_CONTEXT_ENABLED=true`; recalled text is bounded, provenance-labelled, and explicitly treated as untrusted background rather than instructions or current-state authority. Recall is skipped whenever the effective source allowlist is narrower than the profile permits (an explicit `sourcePolicy.allowedDomains`, or a profile with its own allowlist), because the Brain contract has no per-domain provenance filter to enforce that restriction on recalled evidence. Outcome ingestion is scheduled only after the research result is durably stored.
 
 ### 3. Start the API
 

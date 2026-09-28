@@ -11,7 +11,7 @@ from gpt_researcher import GPTResearcher
 
 from app.progress_adapter import ProgressReporter, GPTResearcherCallbackHandler
 from app.model_adapter import RequestEnvironmentManager
-from app.security import enforce_egress_protection, is_safe_url
+from app.security import PROFILE_DOMAINS, enforce_egress_protection, is_safe_url
 from app.config import brain_memory_client, settings
 
 logger = logging.getLogger("web-intelligence")
@@ -532,6 +532,22 @@ async def flush_pending_ingest_tasks(timeout: float = 6.0) -> int:
     return len(pending)
 
 
+def schedule_outcome_ingest(result: Dict[str, Any], op_id: str, mode: str) -> bool:
+    """Schedule the optional Brain outcome ingest once the result is durable.
+
+    Called by the caller after a successful ``storage.save_operation`` so a
+    completed/partial research run is never recorded in Brain unless it was
+    persisted. Returns True only when a task was scheduled.
+    """
+    if result.get("status") not in ("completed", "partial"):
+        return False
+    client = brain_memory_client()
+    if not client:
+        return False
+    _schedule_outcome_ingest(client, result, op_id, mode)
+    return True
+
+
 async def conduct_web_research(
     op_id: str,
     query: str,
@@ -561,9 +577,15 @@ async def conduct_web_research(
     input_chunks, allow_external_inputs = collect_input_context(inputs)
     effective_query, input_limitations = build_effective_query(query, freshness, input_chunks, allow_external_inputs)
     memory_client = brain_memory_client()
-    # Recalled evidence has no per-domain provenance filter in the current
-    # Brain contract, so a caller's explicit source allowlist disables recall.
-    if memory_client and settings.BRAIN_MEMORY_CONTEXT_ENABLED and not query_domains:
+    # Recalled evidence has no per-domain provenance filter in the current Brain
+    # contract, so recall is disabled whenever the effective source allowlist is
+    # narrower than "anything the profile permits". That covers both an explicit
+    # sourcePolicy.allowedDomains and any profile that carries its own allowlist
+    # (app/security.py PROFILE_DOMAINS): historical text from a domain the live
+    # search would reject must not reach the report.
+    profile_rules = PROFILE_DOMAINS.get(profile) or {}
+    profile_restricts_domains = bool(profile_rules.get("allowed"))
+    if memory_client and settings.BRAIN_MEMORY_CONTEXT_ENABLED and not query_domains and not profile_restricts_domains:
         remaining = max(0.0, max_duration - (time.time() - start_time))
         try:
             historical_context = await asyncio.wait_for(
@@ -628,11 +650,10 @@ async def conduct_web_research(
             input_limitations,
             start_time
         )
-    if memory_client and result.get("status") in ("completed", "partial"):
-        # Result persistence is owned by background_research_task immediately
-        # after this function returns; the optional ingest is detached so it
-        # cannot delay or fail the already-durable research result.
-        _schedule_outcome_ingest(memory_client, result, op_id, mode)
+    # Outcome ingestion is intentionally NOT scheduled here. The caller
+    # (app/api.py background_research_task) persists the result durably first
+    # and only then calls schedule_outcome_ingest(), so Brain can never record a
+    # completed/partial outcome for a result that was never durably stored.
     return result
 
 async def _run_research(env_manager, callbacks, reporter, op_id, query, display_query, mode, profile, report_type, max_duration, max_searches, max_pages, max_sources, max_memory, query_domains, limits, require_claim_verification, headers, input_chunks, input_limitations, start_time):

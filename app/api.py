@@ -11,7 +11,7 @@ from app.storage import storage
 from app.schemas import ResearchRequestInput, ResearchResultResponse, CapabilitiesInfo
 from app.cancellation import cancellation_manager
 from app.progress_adapter import ProgressReporter
-from app.researcher_adapter import conduct_web_research
+from app.researcher_adapter import conduct_web_research, schedule_outcome_ingest
 from app.security import is_safe_url
 from app.metrics import observe_research_result
 
@@ -132,6 +132,10 @@ async def background_research_task(req: ResearchRequestInput, reporter: Progress
         # Save output result
         await storage.save_operation(op_id, result)
         observe_research_result(result)
+        # Only after the result is durable may the optional Brain outcome ingest
+        # be scheduled; otherwise Brain could record a completed/partial outcome
+        # for a result that was never stored.
+        schedule_outcome_ingest(result, op_id, req.mode)
         await reporter.report(result["status"], f"Research task {result['status']}.")
 
     except asyncio.CancelledError:
