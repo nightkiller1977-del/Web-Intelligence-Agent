@@ -1,11 +1,43 @@
 # app/storage.py
 import json
 import logging
+import os
+import socket
 import time
+from collections import OrderedDict
 from typing import Dict, Any, List, Optional
 from app.config import settings
 
 logger = logging.getLogger("web-intelligence")
+
+# Bound the in-memory operation cache so a long-lived local process cannot grow
+# without limit. Web results stay queryable; input/reconciliation metadata is
+# dropped first so the evicted bytes are the large ones.
+OPERATION_CACHE_LIMIT = 500
+OPERATION_METADATA_PREFIX = "__meta:"
+
+
+class StorageUnavailable(RuntimeError):
+    """Raised at startup when a required durable backend cannot be reached.
+
+    Selected via REDIS_REQUIRED so a remote deployment fails closed instead of
+    silently serving from process-local memory, which would lose operations on
+    the next restart or route a request to an instance with no state.
+    """
+
+
+def _new_instance_id() -> str:
+    return f"{socket.gethostname()}:{os.getpid()}:{int(time.time() * 1000)}"
+
+
+class _InstanceIdentity:
+    """Stable per-process identity used to scope liveness/lease claims."""
+
+    def __init__(self):
+        self.instance_id = _new_instance_id()
+
+    def lease_id(self, lease_id: Optional[str] = None) -> str:
+        return f"{self.instance_id}:{lease_id or 'default'}"
 
 class BaseStorage:
     async def init(self):
@@ -50,18 +82,55 @@ class BaseStorage:
     async def mark_stale_operations(self):
         raise NotImplementedError()
 
+    async def acquire_concurrency_slot(self) -> bool:
+        """Reserve a service-wide concurrent-operation slot."""
+        raise NotImplementedError()
+
+    async def release_concurrency_slot(self) -> None:
+        """Release a previously reserved concurrent-operation slot."""
+        raise NotImplementedError()
+
+    async def begin_operation(self, op_id: str) -> bool:
+        """Record that this instance is now running op_id. False if another
+        live instance already owns it."""
+        raise NotImplementedError()
+
+    async def touch_operation(self, op_id: str) -> None:
+        """Heartbeat this instance's ownership of op_id."""
+        raise NotImplementedError()
+
+    async def release_operation_lease(self, op_id: str) -> None:
+        """Drop this instance's ownership lease for a finished operation."""
+        raise NotImplementedError()
+
 class InMemoryStorage(BaseStorage):
     def __init__(self):
-        self.operations: Dict[str, Dict[str, Any]] = {}
+        # OrderedDict keyed by canonical op_id (metadata entries live under a
+        # namespaced key so they cannot collide with a caller-supplied op_id).
+        self.operations: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
         self.events: Dict[str, List[Dict[str, Any]]] = {}
         self.idempotency_keys: Dict[str, str] = {}
         self.operation_claims: Dict[str, str] = {}
+        self.instance = _InstanceIdentity()
+        self._concurrency_active = 0
+
+    def _evict_if_needed(self):
+        while len(self.operations) > OPERATION_CACHE_LIMIT:
+            evicted_key, _ = self.operations.popitem(last=False)
+            self.events.pop(evicted_key, None)
+            self.operation_claims.pop(evicted_key, None)
+            for key, existing_op_id in list(self.idempotency_keys.items()):
+                if existing_op_id == evicted_key:
+                    self.idempotency_keys.pop(key, None)
+            logger.info("Evicted operation %s from the in-memory cache (limit %d)", evicted_key, OPERATION_CACHE_LIMIT)
 
     async def save_operation(self, op_id: str, data: Dict[str, Any]):
         existing = self.operations.get(op_id)
         new_data = dict(existing) if existing else {}
         new_data.update(data)
         self.operations[op_id] = new_data
+        self.operations.move_to_end(op_id)
+        self._evict_if_needed()
 
     async def get_operation(self, op_id: str) -> Optional[Dict[str, Any]]:
         return self.operations.get(op_id)
@@ -121,20 +190,54 @@ class InMemoryStorage(BaseStorage):
         return self.events.get(op_id, [])
 
     async def mark_stale_operations(self):
+        # Single-process backend: every queued/running operation belongs to this
+        # process, so anything still live at startup was abandoned by a restart.
         for op_id, op in list(self.operations.items()):
+            if op_id.startswith(OPERATION_METADATA_PREFIX):
+                continue
             if op.get("status") in ("queued", "running"):
                 op["status"] = "failed"
                 op["error"] = {"code": "STALE_OPERATION", "message": "Operation was abandoned after a service restart.", "retryable": True}
                 logger.warning("Marked stale operation %s as failed", op_id)
+
+    async def acquire_concurrency_slot(self) -> bool:
+        # In-memory backend is single-process, so this counter is the whole
+        # service. It enforces the same MAX_CONCURRENT_OPS ceiling the shared
+        # Redis counter does, just without cross-instance visibility.
+        if self._concurrency_active >= settings.MAX_CONCURRENT_OPS:
+            return False
+        self._concurrency_active += 1
+        return True
+
+    async def release_concurrency_slot(self) -> None:
+        self._concurrency_active = max(0, self._concurrency_active - 1)
+
+    async def begin_operation(self, op_id: str) -> bool:
+        self.operations[f"{OPERATION_METADATA_PREFIX}{op_id}"] = {
+            "owner": self.instance.instance_id
+        }
+        self._evict_if_needed()
+        return True
+
+    async def touch_operation(self, op_id: str) -> None:
+        return None
+
+    async def release_operation_lease(self, op_id: str) -> None:
+        self.operations.pop(f"{OPERATION_METADATA_PREFIX}{op_id}", None)
 
 class RedisStorage(BaseStorage):
     def __init__(self):
         self.redis = None
         self.fallback = InMemoryStorage()
         self.degraded = False
+        self.instance = _InstanceIdentity()
 
     async def init(self):
         if not settings.REDIS_URL:
+            if settings.REDIS_REQUIRED:
+                raise StorageUnavailable(
+                    "STORAGE_BACKEND=redis with REDIS_REQUIRED=true but REDIS_URL is not configured."
+                )
             logger.warning("REDIS_URL is not configured; falling back to in-memory storage.")
             self.degraded = True
             return
@@ -144,7 +247,9 @@ class RedisStorage(BaseStorage):
             self.redis = aioredis.from_url(settings.REDIS_URL, decode_responses=True)
             await self.redis.ping()
             logger.info("Connected to Redis storage backend")
-        except Exception:
+        except Exception as exc:
+            if settings.REDIS_REQUIRED:
+                raise StorageUnavailable(f"Redis is required but unreachable: {exc}") from exc
             logger.exception("Unable to initialize Redis; falling back to in-memory storage.")
             self.degraded = True
 
@@ -174,6 +279,7 @@ class RedisStorage(BaseStorage):
         await self.redis.hdel("research:operations", op_id)
         await self.redis.delete(f"research:events:{op_id}")
         await self.redis.delete(f"research:operation_claims:{op_id}")
+        await self.redis.delete(f"research:owners:{op_id}")
 
     async def claim_idempotency_key(self, key: str, op_id: str) -> Optional[str]:
         if self.degraded:
@@ -252,13 +358,71 @@ class RedisStorage(BaseStorage):
     async def mark_stale_operations(self):
         if self.degraded:
             return await self.fallback.mark_stale_operations()
+        # Multi-instance backend: only fail operations that no live instance
+        # still owns. A rolling deploy or a second replica must not overwrite the
+        # state of work actively running elsewhere.
         ops = await self.list_operations()
         for op_id, op in ops.items():
-            if op.get("status") in ("queued", "running"):
-                op["status"] = "failed"
-                op["error"] = {"code": "STALE_OPERATION", "message": "Operation was abandoned after a service restart.", "retryable": True}
-                await self.redis.hset("research:operations", op_id, json.dumps(op))
-                logger.warning("Marked stale operation %s as failed", op_id)
+            if op.get("status") not in ("queued", "running"):
+                continue
+            owner_key = f"research:owners:{op_id}"
+            live_owner = await self.redis.get(owner_key)
+            if live_owner:
+                logger.info("Leaving operation %s running; live owner lease %s", op_id, live_owner)
+                continue
+            op["status"] = "failed"
+            op["error"] = {"code": "STALE_OPERATION", "message": "Operation was abandoned after a service restart.", "retryable": True}
+            await self.redis.hset("research:operations", op_id, json.dumps(op))
+            logger.warning("Marked stale operation %s as failed", op_id)
+
+    async def acquire_concurrency_slot(self) -> bool:
+        if self.degraded:
+            return await self.fallback.acquire_concurrency_slot()
+        # Service-wide counter shared by every instance; the fixed key carries a
+        # safety TTL in case a process dies without releasing its slot.
+        value = await self.redis.incr("research:concurrency:active")
+        await self.redis.expire("research:concurrency:active", settings.CONCURRENCY_LEASE_TTL_SECONDS)
+        if value > settings.MAX_CONCURRENT_OPS:
+            await self.redis.decr("research:concurrency:active")
+            return False
+        return True
+
+    async def release_concurrency_slot(self) -> None:
+        if self.degraded:
+            return await self.fallback.release_concurrency_slot()
+        remaining = await self.redis.decr("research:concurrency:active")
+        if remaining < 0:
+            # Guard against over-release (for example a double finally).
+            await self.redis.set("research:concurrency:active", 0)
+
+    async def begin_operation(self, op_id: str) -> bool:
+        if self.degraded:
+            return await self.fallback.begin_operation(op_id)
+        owner_key = f"research:owners:{op_id}"
+        # NX is authoritative: if a lease already exists, another instance owns
+        # this operation and we must not run it concurrently.
+        acquired = await self.redis.set(
+            owner_key, self.instance.instance_id, nx=True, ex=settings.CONCURRENCY_LEASE_TTL_SECONDS
+        )
+        return bool(acquired)
+
+    async def touch_operation(self, op_id: str) -> None:
+        if self.degraded:
+            return await self.fallback.touch_operation(op_id)
+        owner_key = f"research:owners:{op_id}"
+        current = await self.redis.get(owner_key)
+        if current == self.instance.instance_id:
+            await self.redis.expire(owner_key, settings.CONCURRENCY_LEASE_TTL_SECONDS)
+
+    async def release_operation_lease(self, op_id: str) -> None:
+        if self.degraded:
+            return await self.fallback.release_operation_lease(op_id)
+        owner_key = f"research:owners:{op_id}"
+        # Only the owner may release the lease, so a late finisher cannot clear
+        # a lease a newer owner has since taken.
+        current = await self.redis.get(owner_key)
+        if current == self.instance.instance_id:
+            await self.redis.delete(owner_key)
 
     async def push_progress_event(self, op_id: str, event: Dict[str, Any]):
         if self.degraded:

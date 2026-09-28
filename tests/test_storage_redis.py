@@ -23,7 +23,7 @@ import pytest
 import redis.asyncio as redis_asyncio_module
 
 from app.config import settings
-from app.storage import RedisStorage
+from app.storage import RedisStorage, StorageUnavailable
 
 
 @pytest.fixture
@@ -141,3 +141,56 @@ async def test_redis_storage_degrades_to_inmemory_when_ping_fails(monkeypatch):
     result = await storage.get_operation("op-fallback")
     assert result == {"status": "queued"}
     assert storage.fallback.operations.get("op-fallback") == {"status": "queued"}
+
+
+@pytest.mark.anyio
+async def test_redis_storage_fails_closed_when_required_and_unreachable(monkeypatch):
+    monkeypatch.setattr(settings, "REDIS_REQUIRED", True)
+    monkeypatch.setattr(settings, "REDIS_URL", "")
+
+    storage = RedisStorage()
+    with pytest.raises(StorageUnavailable):
+        await storage.init()
+
+    assert storage.degraded is False
+
+
+@pytest.mark.anyio
+async def test_mark_stale_operations_respects_live_owner_lease(redis_storage, monkeypatch):
+    # An operation owned by another live instance must not be marked stale.
+    await redis_storage.save_operation("op-owned", {"status": "running"})
+    await redis_storage.redis.set("research:owners:op-owned", "other-instance:1:1", ex=60)
+
+    # An operation with no owner lease is genuinely abandoned.
+    await redis_storage.save_operation("op-abandoned", {"status": "running"})
+
+    await redis_storage.mark_stale_operations()
+
+    assert (await redis_storage.get_operation("op-owned"))["status"] == "running"
+    assert (await redis_storage.get_operation("op-abandoned"))["status"] == "failed"
+
+
+@pytest.mark.anyio
+async def test_redis_concurrency_slot_is_service_wide(redis_storage, monkeypatch):
+    monkeypatch.setattr(settings, "MAX_CONCURRENT_OPS", 2)
+
+    assert await redis_storage.acquire_concurrency_slot() is True
+    assert await redis_storage.acquire_concurrency_slot() is True
+    assert await redis_storage.acquire_concurrency_slot() is False
+
+    await redis_storage.release_concurrency_slot()
+    assert await redis_storage.acquire_concurrency_slot() is True
+
+
+@pytest.mark.anyio
+async def test_redis_begin_operation_lease_is_exclusive(redis_storage):
+    assert await redis_storage.begin_operation("op-exclusive") is True
+
+    # A second acquisition attempt (as a peer instance would make) must fail
+    # while the first lease is live.
+    peer = RedisStorage()
+    peer.redis = redis_storage.redis
+    assert await peer.begin_operation("op-exclusive") is False
+
+    await redis_storage.release_operation_lease("op-exclusive")
+    assert await peer.begin_operation("op-exclusive") is True

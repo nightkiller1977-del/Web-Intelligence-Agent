@@ -7,6 +7,22 @@ import app.security as security
 from app.security import enforce_egress_protection
 
 
+def test_search_budget_exhaustion_is_observable_and_distinguishable():
+    with enforce_egress_protection(maximum_searches=1):
+        security._consume_search_budget("https://api.tavily.com/search")
+        assert security.search_budget_exhausted() is False
+
+        with pytest.raises(security.SearchBudgetExhausted):
+            security._consume_search_budget("https://api.tavily.com/search")
+
+        # The flag lives on the shared budget object so the research loop can
+        # detect the stop even when a client wrapper masks the exception type.
+        assert security.search_budget_exhausted() is True
+
+    # Scoped to the run: the next operation starts with a fresh budget.
+    assert security.search_budget_exhausted() is False
+
+
 def test_requests_private_url_blocked_when_egress_guard_enabled():
     with enforce_egress_protection():
         with pytest.raises(requests.exceptions.ConnectionError):

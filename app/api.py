@@ -13,14 +13,11 @@ from app.cancellation import cancellation_manager
 from app.progress_adapter import ProgressReporter
 from app.researcher_adapter import conduct_web_research, schedule_outcome_ingest
 from app.security import is_safe_url
-from app.metrics import observe_research_result
+from app.metrics import observe_research_result, spend_limit_exceeded
 
 logger = logging.getLogger("web-intelligence")
 router = APIRouter()
 
-# Global counter to enforce process concurrency limits
-_active_ops_count = 0
-_concurrency_lock = asyncio.Lock()
 RAW_CREDENTIAL_HEADERS = ("X-LLM-Key", "X-Search-Key")
 TERMINAL_STATUSES = ("completed", "partial", "failed", "cancelled")
 
@@ -105,10 +102,16 @@ async def capabilities():
     }
 
 async def background_research_task(req: ResearchRequestInput, reporter: ProgressReporter, headers: dict):
-    global _active_ops_count
     op_id = req.operationId
 
     try:
+        # Claim exclusive ownership of this operation. On a multi-instance
+        # backend this fails if another live instance is already running it, so
+        # a duplicate cannot execute the same operation concurrently.
+        if not await storage.begin_operation(op_id):
+            logger.warning("Operation %s is already owned by another live instance; not re-running.", op_id)
+            return
+
         await storage.save_operation(op_id, {"status": "running"})
         await reporter.report("planning", "Research task started.")
 
@@ -163,6 +166,9 @@ async def background_research_task(req: ResearchRequestInput, reporter: Progress
             "answer": "Research execution failed.",
             "sources": [], "evidence": [], "claims": [], "citations": [], "searchesPerformed": [],
             "metrics": {"startedAt": "", "durationMs": 0, "searchesPerformed": 0, "pagesRead": 0, "sourcesConsidered": 0, "sourcesUsed": 0},
+            # Input-context limitations are computed before research runs, so a
+            # failure after that point must still report them to the caller.
+            "limitations": req.limitations_context(),
             "error": client_safe_error()
         }
         await storage.save_operation(op_id, failed_state)
@@ -171,8 +177,8 @@ async def background_research_task(req: ResearchRequestInput, reporter: Progress
 
     finally:
         cancellation_manager.unregister_task(op_id)
-        async with _concurrency_lock:
-            _active_ops_count = max(0, _active_ops_count - 1)
+        await storage.release_operation_lease(op_id)
+        await storage.release_concurrency_slot()
 
 @router.post("/v1/research", status_code=status.HTTP_202_ACCEPTED)
 async def start_research(
@@ -180,7 +186,9 @@ async def start_research(
     request: Request,
     idempotency_key: str = Header(None, alias="Idempotency-Key")
 ):
-    global _active_ops_count
+    claimed_lookup_key = None
+    claimed_operation_id = False
+    slot_reserved = False
 
     lookup_key = idempotency_key or req.idempotencyKey
     if not lookup_key:
@@ -232,6 +240,15 @@ async def start_research(
             return {"operationId": existing_op_id, "status": op_state.get("status") if op_state else "unknown"}
         claimed_lookup_key = lookup_key
 
+        # 3b. Enforce the configured daily spend ceiling for new work. Placed
+        # after the idempotency-hit return so a retry of already-accepted work
+        # still resolves to its existing operation.
+        if spend_limit_exceeded():
+            raise HTTPException(
+                status_code=429,
+                detail="Daily spend limit reached. New research operations are paused until the limit resets."
+            )
+
         operation_claimed = await storage.claim_operation_id(req.operationId, lookup_key)
         if not operation_claimed:
             raise HTTPException(
@@ -240,12 +257,12 @@ async def start_research(
             )
         claimed_operation_id = True
 
-        # 4. Enforce and reserve a concurrency slot only for new operations.
-        async with _concurrency_lock:
-            if _active_ops_count >= settings.MAX_CONCURRENT_OPS:
-                raise HTTPException(status_code=429, detail="Concurrency limit reached. Too many active operations.")
-            _active_ops_count += 1
-            slot_reserved = True
+        # 4. Enforce a service-wide concurrency slot only for new operations.
+        # The reservation lives in storage so the limit is shared across
+        # instances/workers rather than being per-process.
+        if not await storage.acquire_concurrency_slot():
+            raise HTTPException(status_code=429, detail="Concurrency limit reached. Too many active operations.")
+        slot_reserved = True
     except Exception as e:
         # Rollback reserved slot if validation fails
         if claimed_operation_id:
@@ -253,8 +270,7 @@ async def start_research(
         if claimed_lookup_key:
             await storage.release_idempotency_key(claimed_lookup_key, req.operationId)
         if slot_reserved:
-            async with _concurrency_lock:
-                _active_ops_count = max(0, _active_ops_count - 1)
+            await storage.release_concurrency_slot()
         raise e
 
     op_id = req.operationId
@@ -292,8 +308,7 @@ async def start_research(
             if claimed_lookup_key:
                 await storage.release_idempotency_key(claimed_lookup_key, req.operationId)
             if slot_reserved:
-                async with _concurrency_lock:
-                    _active_ops_count = max(0, _active_ops_count - 1)
+                await storage.release_concurrency_slot()
         raise e
 
     return {"operationId": op_id, "status": "queued"}
@@ -347,6 +362,12 @@ async def get_research_result(operation_id: str):
             "metrics": None
         }
 
+    # A failed or cancelled operation's side effects are not guaranteed to have
+    # settled; callers must reconcile rather than assume a clean stop.
+    op["requiresReconciliation"] = op.get("status") in ("failed", "cancelled")
+    op["degraded"] = bool(op.get("degraded") or getattr(storage, "degraded", False))
+    if op["degraded"] and not op.get("degradedReasons"):
+        op["degradedReasons"] = ["Durable storage is degraded; results may not survive a restart."]
     return op
 
 @router.post("/v1/research/{operation_id}/cancel")

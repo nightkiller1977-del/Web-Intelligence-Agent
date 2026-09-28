@@ -8,7 +8,7 @@ from fastapi.responses import JSONResponse, Response
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
 from app.config import auth_is_configured, settings, unauthenticated_docs_allowed
-from app.storage import storage
+from app.storage import storage, StorageUnavailable
 from app.cancellation import cancellation_manager
 from app.researcher_adapter import flush_pending_ingest_tasks
 from app.api import router
@@ -25,7 +25,15 @@ DOCS_PATHS = {"/docs", "/redoc", "/openapi.json", "/docs/oauth2-redirect"}
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Initializing storage backend lifecycle...")
-    await storage.init()
+    try:
+        await storage.init()
+    except StorageUnavailable as exc:
+        # Fail closed: a deployment that requires Redis must not silently serve
+        # from process-local memory. Refusing to start surfaces the misconfig
+        # instead of losing operations on the next restart.
+        emit_observability("startup_failed", reason="storage_unavailable")
+        logger.error("Refusing to start: %s", exc)
+        raise
     await storage.mark_stale_operations()
     redis_client = getattr(storage, "redis", None)
     if redis_client and not getattr(storage, "degraded", False):

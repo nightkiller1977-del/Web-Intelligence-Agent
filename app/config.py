@@ -33,6 +33,19 @@ class Settings(BaseSettings):
     MAX_MEMORY_MB: int = int(os.getenv("MAX_MEMORY_MB", 512))
     DAILY_SPEND_LIMIT_USD: float = float(os.getenv("DAILY_SPEND_LIMIT_USD", 50.0))
 
+    # Durability
+    # When redis storage is selected but the backend is unreachable, refuse to
+    # start (fail closed) instead of silently falling back to process-local
+    # memory. Set false only for explicitly disposable deployments.
+    REDIS_REQUIRED: bool = os.getenv("REDIS_REQUIRED", "").lower() in ("1", "true", "yes")
+    # Lease TTL for concurrency slots and operation liveness (seconds).
+    CONCURRENCY_LEASE_TTL_SECONDS: int = int(os.getenv("CONCURRENCY_LEASE_TTL_SECONDS", 3600))
+
+    # Local input ingestion
+    # Explicit filesystem roots that local document/repository inputs may be
+    # read from (os.pathsep-separated). Empty disables local file inputs.
+    LOCAL_INPUT_ROOTS: str = os.getenv("LOCAL_INPUT_ROOTS", "")
+
     # CORS policies
     # Disabled by default in remote mode unless explicitly authorized
     CORS_ORIGINS: str = os.getenv("CORS_ORIGINS", "")

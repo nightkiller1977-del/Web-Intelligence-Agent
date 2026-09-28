@@ -1,5 +1,6 @@
 # app/metrics.py
 import logging
+import time
 
 from prometheus_client import Counter, Histogram
 
@@ -34,6 +35,16 @@ research_cost_tokens = Counter(
 )
 
 _daily_spend_usd = 0.0
+_spend_window_started = time.time()
+
+
+def _reset_spend_window_if_needed():
+    global _daily_spend_usd, _spend_window_started
+    now = time.time()
+    if now - _spend_window_started >= 86400:
+        _daily_spend_usd = 0.0
+        _spend_window_started = now
+
 
 def estimate_tokens(text: str) -> int:
     if not text:
@@ -42,6 +53,8 @@ def estimate_tokens(text: str) -> int:
 
 def track_operation_cost(agent_profile: str, output_tokens: int):
     global _daily_spend_usd
+
+    _reset_spend_window_if_needed()
 
     # Rough default estimate: $10 per 1M output tokens.
     output_rate = 0.000010
@@ -57,7 +70,18 @@ def track_operation_cost(agent_profile: str, output_tokens: int):
             settings.DAILY_SPEND_LIMIT_USD
         )
 
+def spend_limit_exceeded() -> bool:
+    """True when the process-local estimated daily spend is over the limit.
+
+    Used as a fail-closed gate on accepting new research work. The estimate is
+    per-process and resets on restart, so it complements rather than replaces
+    provider-side budget controls.
+    """
+    _reset_spend_window_if_needed()
+    return _daily_spend_usd >= settings.DAILY_SPEND_LIMIT_USD
+
 def get_accumulated_daily_spend():
+    _reset_spend_window_if_needed()
     return _daily_spend_usd
 
 def observe_research_result(result: dict):

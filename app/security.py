@@ -61,6 +61,22 @@ SEARCH_PROVIDER_HOSTS = {
     "api.search.brave.com"
 }
 
+# Model and search provider endpoints the service itself must reach. Kept as a
+# union so callers (e.g. result redaction) can recognize provider URLs without
+# importing both sets.
+PROVIDER_HOSTS = PROVIDER_API_HOSTS | SEARCH_PROVIDER_HOSTS
+
+
+class SearchBudgetExhausted(PermissionError):
+    """Raised when a research run exhausts its outbound search-provider budget.
+
+    Subclasses PermissionError so the SSRF egress guards that already catch
+    PermissionError keep working, but is distinguishable so the research loop
+    can degrade to a bounded "partial" result instead of surfacing a search
+    budget stop as an unhandled execution failure.
+    """
+
+
 def _match_domain(host: str, candidates) -> bool:
     return any(host == cand or host.endswith(f".{cand}") for cand in candidates)
 
@@ -215,6 +231,18 @@ def _is_provider_api_url(url: str) -> bool:
     hostname = _hostname_from_url(str(url))
     return bool(hostname and _match_domain(hostname, PROVIDER_API_HOSTS))
 
+
+def is_provider_host(url: str) -> bool:
+    """True when url targets a model/search provider endpoint the service owns."""
+    hostname = _hostname_from_url(str(url))
+    return bool(hostname and _match_domain(hostname, PROVIDER_HOSTS))
+
+
+def search_budget_exhausted() -> bool:
+    """True when the active research run has exhausted its search-provider budget."""
+    budget = _active_search_budget()
+    return bool(budget and budget.get("exhausted"))
+
 def _is_search_provider_url(url: str) -> bool:
     hostname = _hostname_from_url(str(url))
     return bool(hostname and _match_domain(hostname, SEARCH_PROVIDER_HOSTS))
@@ -230,8 +258,13 @@ def _consume_search_budget(url: str):
     with _protection_lock:
         remaining = int(budget.get("remaining", 0))
         if remaining <= 0:
+            # Record exhaustion on the shared budget object before raising. The
+            # HTTP client wrappers translate PermissionError into their own
+            # connection errors, so the research loop detects a budget stop by
+            # observing this flag rather than by catching the exception type.
+            budget["exhausted"] = True
             logger.error("Search provider budget exhausted before request to %s", url)
-            raise PermissionError(f"Search budget exhausted before outbound request: {url}")
+            raise SearchBudgetExhausted(f"Search budget exhausted before outbound request: {url}")
         budget["remaining"] = remaining - 1
 
 def _ensure_safe_url(url: str):

@@ -88,9 +88,26 @@ class ResearchRequestInput(BaseModel):
             raise ValueError("inputs.allowExternalUse must be a boolean")
         return value
 
+    def limitations_context(self) -> List[str]:
+        """Input-context limitations known before research runs.
+
+        Deterministic and side-effect free so a failed run can still report the
+        same input-context limitations a successful run would.
+        """
+        inputs = self.inputs or {}
+        if not (inputs.get("documents") or inputs.get("repositories")):
+            return []
+        limitations = ["Local document/repository inputs were processed as bounded first-party evidence."]
+        if inputs.get("allowExternalUse") is True:
+            limitations.append("Local inputs were explicitly allowed for external research prompt context.")
+        else:
+            limitations.append("Local inputs were not sent to external research providers because inputs.allowExternalUse was not true.")
+        return limitations
+
 class ResearchSource(BaseModel):
     id: str
     url: str
+    uri: Optional[str] = Field(None, description="Underlying locator when it is not an HTTP(S) URL (for example a local file input)")
     title: str
     publisher: Optional[str] = None
     author: Optional[str] = None
