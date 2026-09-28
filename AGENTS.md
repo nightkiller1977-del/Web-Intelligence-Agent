@@ -40,12 +40,12 @@ OpenHands skills live under `.agents/skills/`. Claude Code skills live under `.c
 
 ## Pull request review policy
 
-- **Use GitHub Copilot Code Review and the AI Commander Code Review Agent for AI-assisted pull-request review.**
-- When an external AI review is needed, request **GitHub Copilot** through GitHub's normal reviewer mechanism.
-- Also inspect the **AI Commander Code Review Agent** result when it is available; treat its findings as hypotheses to verify against the current head, source, tests, and deterministic evidence.
-- Do **not** request, invoke, enable, or depend on Codex/OpenAI/ChatGPT pull-request review, including `@codex review`.
-- Historical Codex or other reviewer comments may remain as evidence, but do not trigger new Codex review rounds.
-- Copilot and AI Commander review do not replace deterministic merge evidence: required CI, tests, lint, security checks, and repository-specific validation still must pass.
+- **Use the AI Commander Code Review Agent for AI-assisted pull-request review**; treat its findings as hypotheses to verify against the current head, source, tests, and deterministic evidence. This is the automated reviewer actually wired in today.
+- OpenHands is the intended long-term replacement for Codex-CLI-based review and is GitHub-blind by design (reviews a scoped local checkout/diff; never gets direct GitHub/secret access — an already-authorized agent or service would post its findings). Today it only has a working review-invocation path as an internal, pre-PR review gate inside `Ai-Command-Center-Desktop-App`'s own self-healing pipeline (ACES-500) — there is no mechanism yet for OpenHands to review an already-opened GitHub PR in this repo. Do not claim to have run an OpenHands PR review until that mechanism exists here; rely on the AI Commander Code Review Agent instead, and do not fall back to requesting GitHub Copilot Code Review.
+- Do **not** request GitHub Copilot Code Review, and do **not** request, invoke, enable, or depend on Codex/OpenAI/ChatGPT pull-request review, including `@codex review`.
+- GitHub Copilot Code Review and the "Codex" GitHub connector (`chatgpt-codex-connector`) are installed integrations that auto-review PRs on open/push independent of this policy — no doc or code change here disables them. Turning them off is a GitHub/OpenAI account-settings action (repo/org Copilot code-review settings; `https://chatgpt.com/codex/cloud/settings/general`; and the app installation under `github.com/settings/installations`), owned by whoever administers those accounts.
+- Historical Copilot, Codex, or other reviewer comments may remain as evidence, but do not trigger new Copilot or Codex review rounds.
+- AI Commander Code Review Agent findings do not replace deterministic merge evidence: required CI, tests, lint, security checks, and repository-specific validation still must pass.
 
 ## AI Commander ecosystem map and shared infrastructure
 
