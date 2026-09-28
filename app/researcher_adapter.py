@@ -560,6 +560,9 @@ async def conduct_web_research(
 
     env_manager = RequestEnvironmentManager(headers, model_provider=model_provider, model_name=model_name)
     callbacks = GPTResearcherCallbackHandler(reporter)
+    execution_duration = max(0.0, max_duration - (time.time() - start_time))
+    if execution_duration <= 0:
+        raise TimeoutError("maximumDurationSeconds exhausted before research execution")
 
     with enforce_egress_protection(profile, maximum_searches=max_searches):
         result = await _run_research(
@@ -572,7 +575,7 @@ async def conduct_web_research(
             mode,
             profile,
             report_type,
-            max_duration,
+            execution_duration,
             max_searches,
             max_pages,
             max_sources,
