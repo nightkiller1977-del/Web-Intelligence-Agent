@@ -36,6 +36,10 @@ async def lifespan(app: FastAPI):
         redis_enabled=bool(redis_client),
     )
     yield
+    # Quiesce in-flight research first: a research task that finished after the
+    # ingest snapshot below would schedule an untracked ingest into a closing
+    # loop. Cancel/await active tasks, then drain the ingests they produced.
+    await cancellation_manager.quiesce_tasks()
     # Best-effort Brain outcome ingests are tracked tasks. Await them before
     # the loop tears down, otherwise a graceful shutdown can close the loop
     # mid-flight and lose the outcome despite scheduling it.

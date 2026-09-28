@@ -112,3 +112,39 @@ async def test_cancel_task_with_no_redis_and_no_local_task_returns_false():
 
     result = await manager.cancel_task("op-nowhere", operation_lookup=None)
     assert result is False
+
+
+@pytest.mark.anyio
+async def test_quiesce_tasks_cancels_and_awaits_active_tasks():
+    """Shutdown quiescing must cancel and await in-flight research tasks so a
+    late finisher cannot schedule work into a closing event loop."""
+    manager = CancellationManager()
+
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def long_running():
+        started.set()
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    task = asyncio.create_task(long_running())
+    manager.register_task("op-active", task)
+    await started.wait()
+
+    quiesced = await manager.quiesce_tasks()
+
+    assert quiesced == 1
+    assert task.done()
+    assert cancelled.is_set()
+    assert manager.active_tasks["op-active"] is task
+
+
+@pytest.mark.anyio
+async def test_quiesce_tasks_returns_zero_when_idle():
+    manager = CancellationManager()
+    assert await manager.quiesce_tasks() == 0
+

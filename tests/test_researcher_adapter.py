@@ -441,13 +441,130 @@ async def test_conduct_web_research_uses_optional_untrusted_context_and_nonfatal
 
     assert result["status"] == "completed"
     assert "UNTRUSTED HISTORICAL EVIDENCE" in ContextAwareResearcher.last_query
-    # Outcome ingestion is detached so it cannot delay durable result
-    # persistence; await the explicit completion signal before asserting.
+    # The adapter no longer schedules ingestion itself; the caller does so only
+    # after the result is durable. Nothing should be pending on this path.
+    assert await researcher_adapter.flush_pending_ingest_tasks() == 0
+    assert spy.ingested == []
+
+
+@pytest.mark.anyio
+async def test_schedule_outcome_ingest_runs_only_after_durable_save(monkeypatch):
+    """The caller-owned ingest helper must count independently evidenced claims
+    and stay detached from the research result."""
+    class BrainMemorySpy:
+        def __init__(self):
+            self.ingested = []
+
+        def ingest_verified_outcome(self, **kwargs):
+            self.ingested.append(kwargs)
+            return False  # A delivery outage must not change the completed result.
+
+    spy = BrainMemorySpy()
+    monkeypatch.setattr(researcher_adapter, "brain_memory_client", lambda: spy)
+
+    result = {
+        "status": "completed",
+        "sources": [{"sourceType": "web"}],
+        "claims": [
+            {"verificationStatus": "supported", "evidenceIds": ["ev-1"]},
+            {"verificationStatus": "supported", "evidenceIds": []},
+            {"verificationStatus": "partially-supported", "evidenceIds": ["ev-2"]},
+        ],
+    }
+
+    assert researcher_adapter.schedule_outcome_ingest(result, "test-op", "standard") is True
     assert await researcher_adapter.flush_pending_ingest_tasks() == 1
-    # The fake exposes source URLs but no extractable passages, so every claim
-    # comes from the report-only fallback. Those are model-derived, not
-    # independently evidenced, and must not be ingested as verified.
     assert spy.ingested == [{
         "operation_id": "test-op", "status": "completed", "mode": "standard",
-        "source_count": 1, "verified_claim_count": 0, "source_types": ["web"],
+        "source_count": 1, "verified_claim_count": 1, "source_types": ["web"],
     }]
+
+
+@pytest.mark.anyio
+async def test_schedule_outcome_ingest_skips_non_durable_or_disabled(monkeypatch):
+    monkeypatch.setattr(researcher_adapter, "brain_memory_client", lambda: None)
+    assert researcher_adapter.schedule_outcome_ingest({"status": "completed"}, "op", "standard") is False
+    assert researcher_adapter.schedule_outcome_ingest({"status": "failed"}, "op", "standard") is False
+    assert researcher_adapter.schedule_outcome_ingest({"status": "cancelled"}, "op", "standard") is False
+
+
+@pytest.mark.anyio
+async def test_recall_disabled_for_profile_specific_domain_allowlist(monkeypatch):
+    """A profile with its own domain allowlist must not receive repository-wide
+    historical recall, because those domains are rejected from live search."""
+    recalled = {"called": False}
+
+    class BrainMemorySpy:
+        def recall_context(self, query):
+            recalled["called"] = True
+            return "UNTRUSTED HISTORICAL EVIDENCE — should not appear"
+
+        def ingest_verified_outcome(self, **kwargs):
+            return False
+
+    spy = BrainMemorySpy()
+    monkeypatch.setattr(researcher_adapter.settings, "BRAIN_MEMORY_CONTEXT_ENABLED", True)
+    monkeypatch.setattr(researcher_adapter, "GPTResearcher", FakeCompletedGPTResearcher)
+    monkeypatch.setattr(researcher_adapter, "brain_memory_client", lambda: spy)
+    monkeypatch.setattr(researcher_adapter, "is_safe_url", lambda url, profile: True)
+    reporter = MagicMock()
+    reporter.report = AsyncMock()
+
+    result = await conduct_web_research(
+        op_id="test-op",
+        query="test query",
+        mode="standard",
+        profile="security",
+        limits={"maximumDurationSeconds": 30, "maximumSearches": 3, "maximumPages": 5, "maximumSources": 5},
+        source_policy=None,
+        freshness=None,
+        inputs=None,
+        model_provider=None,
+        model_name=None,
+        require_claim_verification=False,
+        reporter=reporter,
+        headers={},
+    )
+
+    assert result["status"] == "completed"
+    assert recalled["called"] is False
+
+
+@pytest.mark.anyio
+async def test_recall_disabled_for_explicit_source_allowlist(monkeypatch):
+    recalled = {"called": False}
+
+    class BrainMemorySpy:
+        def recall_context(self, query):
+            recalled["called"] = True
+            return "UNTRUSTED HISTORICAL EVIDENCE — should not appear"
+
+        def ingest_verified_outcome(self, **kwargs):
+            return False
+
+    spy = BrainMemorySpy()
+    monkeypatch.setattr(researcher_adapter.settings, "BRAIN_MEMORY_CONTEXT_ENABLED", True)
+    monkeypatch.setattr(researcher_adapter, "GPTResearcher", FakeCompletedGPTResearcher)
+    monkeypatch.setattr(researcher_adapter, "brain_memory_client", lambda: spy)
+    monkeypatch.setattr(researcher_adapter, "is_safe_url", lambda url, profile: True)
+    reporter = MagicMock()
+    reporter.report = AsyncMock()
+
+    result = await conduct_web_research(
+        op_id="test-op",
+        query="test query",
+        mode="standard",
+        profile="general",
+        limits={"maximumDurationSeconds": 30, "maximumSearches": 3, "maximumPages": 5, "maximumSources": 5},
+        source_policy={"allowedDomains": ["example.com"]},
+        freshness=None,
+        inputs=None,
+        model_provider=None,
+        model_name=None,
+        require_claim_verification=False,
+        reporter=reporter,
+        headers={},
+    )
+
+    assert result["status"] == "completed"
+    assert recalled["called"] is False

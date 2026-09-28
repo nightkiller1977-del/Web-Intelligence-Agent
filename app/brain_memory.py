@@ -176,10 +176,17 @@ class BrainMemoryClient:
         if not isinstance(receipt, dict):
             logger.warning("Brain Memory outcome ingest returned a non-object receipt; treating as rejected")
             return False
-        rejected = int(receipt.get("rejected", 0) or 0)
-        quarantined = int(receipt.get("quarantined", 0) or 0)
-        accepted = int(receipt.get("acceptedChunks", 0) or 0)
-        duplicates = int(receipt.get("duplicates", 0) or 0)
+        try:
+            rejected = int(receipt.get("rejected", 0) or 0)
+            quarantined = int(receipt.get("quarantined", 0) or 0)
+            accepted = int(receipt.get("acceptedChunks", 0) or 0)
+            duplicates = int(receipt.get("duplicates", 0) or 0)
+        except (TypeError, ValueError):
+            # A malformed counter is just another non-accepting receipt. Parsing
+            # it inside the guarded path keeps the fail-open contract instead of
+            # letting the error escape into the detached task's unobserved result.
+            logger.warning("Brain Memory outcome ingest returned malformed receipt counters; treating as rejected")
+            return False
         explicit = receipt.get("accepted")
         # Brain's ingestion receipt is the chunk-count shape. A negative
         # signal there means the evidence was discarded even though HTTP said

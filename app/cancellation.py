@@ -85,6 +85,27 @@ class CancellationManager:
         logger.warning("No active task found to cancel for operation: %s", op_id)
         return False
 
+    async def quiesce_tasks(self, timeout: float = 5.0) -> int:
+        """Cancel and await in-flight research tasks before shutdown proceeds.
+
+        Shutdown must not let a still-running research task finish after the
+        pending-ingest snapshot was taken, or its outcome ingest would be
+        scheduled into a closing event loop. Cancelling and awaiting the active
+        tasks first makes that snapshot complete.
+        """
+        pending = [task for task in self.active_tasks.values() if not task.done()]
+        if not pending:
+            return 0
+        for task in pending:
+            task.cancel()
+        done, _still_pending = await asyncio.wait(pending, timeout=timeout)
+        for task in done:
+            # Retrieve the outcome so a cancelled/failed task is not reported as
+            # an unhandled exception while the loop is tearing down.
+            if not task.cancelled():
+                task.exception()
+        return len(pending)
+
     async def shutdown(self):
         if self._listener_task:
             self._listener_task.cancel()
