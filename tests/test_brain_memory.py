@@ -36,6 +36,29 @@ def test_search_signs_exact_body_and_bounds_untrusted_context(monkeypatch):
     assert "Historical evidence one" in context
 
 
+def test_recall_retains_stable_artifact_provenance(monkeypatch):
+    from app.brain_memory import BrainMemoryClient
+
+    client = BrainMemoryClient("https://brain.example", "web-agent-1", "test-secret")
+    monkeypatch.setattr(client, "_request", lambda *_args: {
+        "results": [
+            {
+                "text": "Historical evidence one",
+                "provenance": {"sourceType": "web", "artifactId": "artifact-abc"},
+            },
+            {
+                "text": "Historical evidence two",
+                "provenance": {"sourceType": "web", "sourceId": "source-xyz"},
+            },
+        ]
+    })
+
+    context = client.recall_context("new research question")
+
+    assert "artifact:artifact-abc" in context
+    assert "artifact:source-xyz" in context
+
+
 def test_ingest_uses_route_specific_signature_and_deidentified_outcome(monkeypatch):
     from app.brain_memory import BrainMemoryClient
 
