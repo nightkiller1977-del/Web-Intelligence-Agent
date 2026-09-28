@@ -107,7 +107,12 @@ class BrainMemoryClient:
                 continue
             provenance = result.get("provenance") if isinstance(result.get("provenance"), dict) else {}
             source_type = str(provenance.get("sourceType") or "unknown")[:64]
-            prefix = f"- [historical source: {source_type}] "
+            # Retain any stable identifier the artifact carries so a recalled
+            # passage that influenced the report can be traced back to its
+            # Brain artifact instead of only a coarse sourceType.
+            artifact_id = provenance.get("artifactId") or provenance.get("sourceId")
+            reference = f" artifact:{str(artifact_id)[:128]}" if artifact_id else ""
+            prefix = f"- [historical source: {source_type}{reference}] "
             text = text[:max(0, remaining - len(prefix) - 1)]
             if not text:
                 break
