@@ -572,7 +572,11 @@ async def conduct_web_research(
     max_sources = limits.get("maximumSources", 10)
     max_memory = limits.get("maximumMemoryMb") or settings.MAX_MEMORY_MB
     query_domains = None
-    if isinstance(source_policy, dict) and isinstance(source_policy.get("allowedDomains"), list):
+    has_explicit_domain_allowlist = (
+        isinstance(source_policy, dict)
+        and isinstance(source_policy.get("allowedDomains"), list)
+    )
+    if has_explicit_domain_allowlist:
         query_domains = source_policy["allowedDomains"]
     input_chunks, allow_external_inputs = collect_input_context(inputs)
     effective_query, input_limitations = build_effective_query(query, freshness, input_chunks, allow_external_inputs)
@@ -585,7 +589,12 @@ async def conduct_web_research(
     # search would reject must not reach the report.
     profile_rules = PROFILE_DOMAINS.get(profile) or {}
     profile_restricts_domains = bool(profile_rules.get("allowed"))
-    if memory_client and settings.BRAIN_MEMORY_CONTEXT_ENABLED and not query_domains and not profile_restricts_domains:
+    if (
+        memory_client
+        and settings.BRAIN_MEMORY_CONTEXT_ENABLED
+        and not has_explicit_domain_allowlist
+        and not profile_restricts_domains
+    ):
         remaining = max(0.0, max_duration - (time.time() - start_time))
         try:
             historical_context = await asyncio.wait_for(

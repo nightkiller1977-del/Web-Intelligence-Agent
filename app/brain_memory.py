@@ -10,7 +10,7 @@ import uuid
 from datetime import datetime, timezone
 from urllib.error import HTTPError
 from urllib.parse import urlsplit
-from urllib.request import HTTPRedirectHandler, Request, build_opener
+from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
 from app.security import enforce_egress_protection, is_safe_egress_url
 
@@ -84,7 +84,10 @@ class BrainMemoryClient:
         # as the hostname, closing the DNS-rebinding gap between preflight and
         # urllib's own resolver/connection step.
         with enforce_egress_protection("general"):
-            with build_opener(_NoRedirect()).open(request, timeout=5) as response:
+            # Credential-bearing requests must not inherit HTTP(S)_PROXY from
+            # the process environment: that would expose the signed request to
+            # an ambient proxy outside the explicitly validated endpoint.
+            with build_opener(ProxyHandler({}), _NoRedirect()).open(request, timeout=5) as response:
                 payload = response.read(_MAX_RESPONSE_BYTES + 1)
         if len(payload) > _MAX_RESPONSE_BYTES:
             raise ValueError("Brain Memory response exceeded limit")
