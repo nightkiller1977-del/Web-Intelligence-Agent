@@ -492,6 +492,40 @@ def append_input_sources(op_id: str, input_chunks: list[dict], sources: list[dic
             citation["evidenceIds"].append(evidence_id)
         citations.append(citation)
 
+_pending_ingest_tasks: set = set()
+
+
+def _schedule_outcome_ingest(client, result: Dict[str, Any], op_id: str, mode: str) -> None:
+    """Persist an optional Brain outcome best-effort, off the critical path.
+
+    The task is kept referenced so it is not garbage-collected mid-flight and
+    tracked in ``_pending_ingest_tasks`` so tests and shutdown can await an
+    explicit completion signal.
+    """
+    verified_claim_count = sum(
+        1 for claim in result.get("claims", [])
+        if claim.get("verificationStatus") in ("supported", "partially-supported")
+    )
+    sources = result.get("sources", [])
+    task = asyncio.create_task(asyncio.to_thread(
+        client.ingest_verified_outcome,
+        operation_id=op_id, status=result["status"], mode=mode,
+        source_count=len(sources), verified_claim_count=verified_claim_count,
+        source_types=[source.get("sourceType", "") for source in sources],
+    ))
+    _pending_ingest_tasks.add(task)
+    task.add_done_callback(_pending_ingest_tasks.discard)
+
+
+async def flush_pending_ingest_tasks(timeout: float = 6.0) -> int:
+    """Await best-effort ingestion tasks. Tests and shutdown call this."""
+    pending = [task for task in _pending_ingest_tasks if not task.done()]
+    if not pending:
+        return 0
+    await asyncio.wait(pending, timeout=timeout)
+    return len(pending)
+
+
 async def conduct_web_research(
     op_id: str,
     query: str,
@@ -589,18 +623,10 @@ async def conduct_web_research(
             start_time
         )
     if memory_client and result.get("status") in ("completed", "partial"):
-        verified_claim_count = sum(
-            1 for claim in result.get("claims", [])
-            if claim.get("verificationStatus") in ("supported", "partially-supported")
-        )
         # Result persistence is owned by background_research_task immediately
-        # after this function returns; do not let optional ingestion delay it.
-        asyncio.create_task(asyncio.to_thread(
-            memory_client.ingest_verified_outcome,
-            operation_id=op_id, status=result["status"], mode=mode,
-            source_count=len(result.get("sources", [])), verified_claim_count=verified_claim_count,
-            source_types=[source.get("sourceType", "") for source in result.get("sources", [])],
-        ))
+        # after this function returns; the optional ingest is detached so it
+        # cannot delay or fail the already-durable research result.
+        _schedule_outcome_ingest(memory_client, result, op_id, mode)
     return result
 
 async def _run_research(env_manager, callbacks, reporter, op_id, query, display_query, mode, profile, report_type, max_duration, max_searches, max_pages, max_sources, max_memory, query_domains, limits, require_claim_verification, headers, input_chunks, input_limitations, start_time):
