@@ -83,3 +83,17 @@ def test_signature_is_bound_to_exact_body():
         "request-1", "2026-01-01T00:00:00.000Z", hashlib.sha256(body.encode()).hexdigest(),
     ])
     assert signature == hmac.new(b"test-secret", canonical.encode(), hashlib.sha256).hexdigest()
+
+
+def test_request_rejects_private_or_rebound_brain_endpoint(monkeypatch):
+    from app.brain_memory import BrainMemoryClient
+
+    client = BrainMemoryClient("https://brain.example", "web-agent-1", "test-secret")
+    monkeypatch.setattr("app.brain_memory.is_safe_egress_url", lambda url: False)
+
+    try:
+        client._request("/v1/memories/search", "{}", "brain-memory-http-search-v1")
+    except ValueError as exc:
+        assert "approved egress" in str(exc)
+    else:
+        raise AssertionError("unsafe Brain endpoint must be rejected before a request is sent")

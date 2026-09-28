@@ -416,7 +416,7 @@ async def test_conduct_web_research_uses_optional_untrusted_context_and_nonfatal
             return False  # A delivery outage must not change the completed result.
 
     spy = BrainMemorySpy()
-    monkeypatch.setenv("BRAIN_MEMORY_CONTEXT_ENABLED", "true")
+    monkeypatch.setattr(researcher_adapter.settings, "BRAIN_MEMORY_CONTEXT_ENABLED", True)
     monkeypatch.setattr(researcher_adapter, "GPTResearcher", ContextAwareResearcher)
     monkeypatch.setattr(researcher_adapter, "brain_memory_client", lambda: spy)
     monkeypatch.setattr(researcher_adapter, "is_safe_url", lambda url, profile: True)
