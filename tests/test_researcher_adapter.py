@@ -441,6 +441,10 @@ async def test_conduct_web_research_uses_optional_untrusted_context_and_nonfatal
 
     assert result["status"] == "completed"
     assert "UNTRUSTED HISTORICAL EVIDENCE" in ContextAwareResearcher.last_query
+    for _ in range(50):
+        if spy.ingested:
+            break
+        await asyncio.sleep(0.01)
     assert spy.ingested == [{
         "operation_id": "test-op", "status": "completed", "mode": "standard",
         "source_count": 1, "verified_claim_count": 1, "source_types": ["web"],
