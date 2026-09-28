@@ -98,6 +98,8 @@ STORAGE_BACKEND=local
 
 Do not commit your `.env` file.
 
+Optional Brain Memory integration is off by default. To enable verified research-outcome ingestion, set the complete `BRAIN_MEMORY_URL`, `BRAIN_MEMORY_KEY_ID`, and `BRAIN_MEMORY_SECRET` credential group together with `BRAIN_MEMORY_ENABLED=true`. Historical recall additionally requires `BRAIN_MEMORY_CONTEXT_ENABLED=true`; recalled text is bounded, provenance-labelled, and explicitly treated as untrusted background rather than instructions or current-state authority.
+
 ### 3. Start the API
 
 ```bash
@@ -243,6 +245,8 @@ Local mode defaults to local storage and is intended for development or a truste
 ### Remote mode
 
 Remote deployments should set an explicit `WEB_INTELLIGENCE_AUTH_TOKEN` and normally use Redis-backed storage. If authentication is not configured in remote mode, protected requests fail closed.
+
+Brain Memory credentials must be provisioned as a dedicated least-privilege group through `aicc-secrets`; do not reuse another agent's credential or add partial values. A Brain outage, invalid configuration, or rejected ingest does not rerun research or alter the completed research result.
 
 The included `render.yaml` configures a Docker-based service plus Redis and illustrates the remote deployment shape.
 
