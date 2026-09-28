@@ -97,3 +97,12 @@ def test_request_rejects_private_or_rebound_brain_endpoint(monkeypatch):
         assert "approved egress" in str(exc)
     else:
         raise AssertionError("unsafe Brain endpoint must be rejected before a request is sent")
+
+
+def test_recall_ignores_malformed_results_payload(monkeypatch):
+    from app.brain_memory import BrainMemoryClient
+
+    client = BrainMemoryClient("https://brain.example", "web-agent-1", "test-secret")
+    monkeypatch.setattr(client, "_request", lambda *_args: {"results": None})
+
+    assert client.recall_context("question") == ""

@@ -521,8 +521,17 @@ async def conduct_web_research(
     input_chunks, allow_external_inputs = collect_input_context(inputs)
     effective_query, input_limitations = build_effective_query(query, freshness, input_chunks, allow_external_inputs)
     memory_client = brain_memory_client()
-    if memory_client and settings.BRAIN_MEMORY_CONTEXT_ENABLED:
-        historical_context = await asyncio.to_thread(memory_client.recall_context, query)
+    # Recalled evidence has no per-domain provenance filter in the current
+    # Brain contract, so a caller's explicit source allowlist disables recall.
+    if memory_client and settings.BRAIN_MEMORY_CONTEXT_ENABLED and not query_domains:
+        remaining = max(0.0, max_duration - (time.time() - start_time))
+        try:
+            historical_context = await asyncio.wait_for(
+                asyncio.to_thread(memory_client.recall_context, query),
+                timeout=min(3.0, remaining),
+            )
+        except (asyncio.TimeoutError, ValueError):
+            historical_context = ""
         if historical_context:
             effective_query = f"{effective_query}\n\n{historical_context}"
 
@@ -559,6 +568,7 @@ async def conduct_web_research(
             reporter,
             op_id,
             effective_query,
+            query,
             mode,
             profile,
             report_type,
@@ -580,18 +590,17 @@ async def conduct_web_research(
             1 for claim in result.get("claims", [])
             if claim.get("verificationStatus") in ("supported", "partially-supported")
         )
-        await asyncio.to_thread(
+        # Result persistence is owned by background_research_task immediately
+        # after this function returns; do not let optional ingestion delay it.
+        asyncio.create_task(asyncio.to_thread(
             memory_client.ingest_verified_outcome,
-            operation_id=op_id,
-            status=result["status"],
-            mode=mode,
-            source_count=len(result.get("sources", [])),
-            verified_claim_count=verified_claim_count,
+            operation_id=op_id, status=result["status"], mode=mode,
+            source_count=len(result.get("sources", [])), verified_claim_count=verified_claim_count,
             source_types=[source.get("sourceType", "") for source in result.get("sources", [])],
-        )
+        ))
     return result
 
-async def _run_research(env_manager, callbacks, reporter, op_id, query, mode, profile, report_type, max_duration, max_searches, max_pages, max_sources, max_memory, query_domains, limits, require_claim_verification, headers, input_chunks, input_limitations, start_time):
+async def _run_research(env_manager, callbacks, reporter, op_id, query, display_query, mode, profile, report_type, max_duration, max_searches, max_pages, max_sources, max_memory, query_domains, limits, require_claim_verification, headers, input_chunks, input_limitations, start_time):
     with env_manager.apply_keys():
         await callbacks.on_planning("Initializing research configuration...")
 
@@ -651,7 +660,7 @@ async def _run_research(env_manager, callbacks, reporter, op_id, query, mode, pr
             await callbacks.on_planning(f"Starting research loop (budget: {max_duration}s)...")
 
             async def run_loop():
-                await callbacks.on_search(query, 1, max(1, max_searches))
+                await callbacks.on_search(display_query, 1, max(1, max_searches))
                 await researcher.conduct_research()
                 raw_urls = researcher.get_source_urls() or []
                 await callbacks.on_read(
