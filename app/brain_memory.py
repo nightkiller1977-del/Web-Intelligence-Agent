@@ -152,8 +152,34 @@ class BrainMemoryClient:
             "sourceText": json.dumps(outcome, separators=(",", ":")),
         }
         try:
-            self._request(_INGEST_PATH, json.dumps(envelope, separators=(",", ":")), _INGEST_DOMAIN)
-            return True
+            receipt = self._request(_INGEST_PATH, json.dumps(envelope, separators=(",", ":")), _INGEST_DOMAIN)
         except Exception:
             logger.warning("Brain Memory outcome ingest unavailable; research result remains authoritative", exc_info=True)
             return False
+        # A 2xx is not acceptance: Brain Memory answers with an ingestion
+        # receipt that can report rejected/quarantined chunks. Reporting
+        # success on a negative receipt would record evidence Brain discarded,
+        # so require an explicit positive acknowledgement and fail loudly
+        # otherwise.
+        if not isinstance(receipt, dict):
+            logger.warning("Brain Memory outcome ingest returned a non-object receipt; treating as rejected")
+            return False
+        rejected = int(receipt.get("rejected", 0) or 0)
+        quarantined = int(receipt.get("quarantined", 0) or 0)
+        accepted = int(receipt.get("acceptedChunks", 0) or 0)
+        duplicates = int(receipt.get("duplicates", 0) or 0)
+        explicit = receipt.get("accepted")
+        # Brain's ingestion receipt is the chunk-count shape. A negative
+        # signal there means the evidence was discarded even though HTTP said
+        # 200. Older/other shapes only expose a boolean.
+        chunk_receipt = any(key in receipt for key in ("acceptedChunks", "duplicates", "rejected", "quarantined"))
+        if explicit is False or rejected or quarantined or (chunk_receipt and accepted + duplicates == 0):
+            logger.warning(
+                "Brain Memory outcome ingest was not accepted by Brain (acceptedChunks=%s duplicates=%s rejected=%s quarantined=%s accepted=%s)",
+                accepted, duplicates, rejected, quarantined, explicit,
+            )
+            return False
+        if chunk_receipt or explicit is True:
+            return True
+        logger.warning("Brain Memory outcome ingest returned no positive acceptance signal; treating as rejected")
+        return False

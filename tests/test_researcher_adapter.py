@@ -444,7 +444,10 @@ async def test_conduct_web_research_uses_optional_untrusted_context_and_nonfatal
     # Outcome ingestion is detached so it cannot delay durable result
     # persistence; await the explicit completion signal before asserting.
     assert await researcher_adapter.flush_pending_ingest_tasks() == 1
+    # The fake exposes source URLs but no extractable passages, so every claim
+    # comes from the report-only fallback. Those are model-derived, not
+    # independently evidenced, and must not be ingested as verified.
     assert spy.ingested == [{
         "operation_id": "test-op", "status": "completed", "mode": "standard",
-        "source_count": 1, "verified_claim_count": 1, "source_types": ["web"],
+        "source_count": 1, "verified_claim_count": 0, "source_types": ["web"],
     }]
