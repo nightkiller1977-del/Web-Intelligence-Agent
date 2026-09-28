@@ -167,3 +167,11 @@ def test_ingest_accepts_chunk_receipt_with_accepted_chunks(monkeypatch):
         verified_claim_count=1,
         source_types=["web"],
     ) is True
+
+def test_recall_context_is_bounded_in_utf8_bytes(monkeypatch):
+    from app.brain_memory import BrainMemoryClient
+
+    client = BrainMemoryClient("https://brain.example", "web-agent-1", "test-secret")
+    monkeypatch.setattr(client, "_request", lambda *_args: {"results": [{"text": "😀" * 8000}]})
+
+    assert len(client.recall_context("question").encode("utf-8")) <= 6000
