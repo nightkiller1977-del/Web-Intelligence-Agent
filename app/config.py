@@ -38,6 +38,14 @@ class Settings(BaseSettings):
     CORS_ORIGINS: str = os.getenv("CORS_ORIGINS", "")
     ALLOW_UNAUTHENTICATED_DOCS: bool = os.getenv("ALLOW_UNAUTHENTICATED_DOCS", "").lower() in ("1", "true", "yes")
 
+    # Optional Brain Memory integration. The complete credential group is required
+    # before either recall or outcome ingestion can run.
+    BRAIN_MEMORY_ENABLED: bool = False
+    BRAIN_MEMORY_CONTEXT_ENABLED: bool = False
+    BRAIN_MEMORY_URL: str = ""
+    BRAIN_MEMORY_KEY_ID: str = ""
+    BRAIN_MEMORY_SECRET: str = ""
+
 settings = Settings()
 
 _logger = logging.getLogger("web-intelligence")
@@ -58,12 +66,12 @@ def unauthenticated_docs_allowed() -> bool:
 
 def brain_memory_client():
     """Return the optional Brain client only for a complete, explicit config."""
-    if os.getenv("BRAIN_MEMORY_ENABLED", "").lower() not in ("1", "true", "yes"):
+    if not settings.BRAIN_MEMORY_ENABLED:
         return None
     values = {
-        "BRAIN_MEMORY_URL": os.getenv("BRAIN_MEMORY_URL", "").strip(),
-        "BRAIN_MEMORY_KEY_ID": os.getenv("BRAIN_MEMORY_KEY_ID", "").strip(),
-        "BRAIN_MEMORY_SECRET": os.getenv("BRAIN_MEMORY_SECRET", "").strip(),
+        "BRAIN_MEMORY_URL": settings.BRAIN_MEMORY_URL.strip(),
+        "BRAIN_MEMORY_KEY_ID": settings.BRAIN_MEMORY_KEY_ID.strip(),
+        "BRAIN_MEMORY_SECRET": settings.BRAIN_MEMORY_SECRET.strip(),
     }
     missing = [name for name, value in values.items() if not value]
     if missing:

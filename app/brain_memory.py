@@ -12,6 +12,8 @@ from urllib.error import HTTPError
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
+from app.security import is_safe_egress_url
+
 
 logger = logging.getLogger("web-intelligence")
 _SEARCH_PATH = "/v1/memories/search"
@@ -52,6 +54,10 @@ class BrainMemoryClient:
         return hmac.new(self.secret.encode("utf-8"), canonical.encode("utf-8"), hashlib.sha256).hexdigest()
 
     def _request(self, path: str, body: str, domain: str) -> dict:
+        # Resolve and validate immediately before this credential-bearing request
+        # so private, link-local, and DNS-rebound destinations cannot receive it.
+        if not is_safe_egress_url(f"{self.url}{path}"):
+            raise ValueError("Brain Memory endpoint is not an approved egress destination")
         request_id = str(uuid.uuid4())
         issued_at = datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
         headers = {

@@ -521,7 +521,7 @@ async def conduct_web_research(
     input_chunks, allow_external_inputs = collect_input_context(inputs)
     effective_query, input_limitations = build_effective_query(query, freshness, input_chunks, allow_external_inputs)
     memory_client = brain_memory_client()
-    if memory_client and os.getenv("BRAIN_MEMORY_CONTEXT_ENABLED", "").lower() in ("1", "true", "yes"):
+    if memory_client and settings.BRAIN_MEMORY_CONTEXT_ENABLED:
         historical_context = await asyncio.to_thread(memory_client.recall_context, query)
         if historical_context:
             effective_query = f"{effective_query}\n\n{historical_context}"
