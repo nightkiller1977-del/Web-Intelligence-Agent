@@ -99,11 +99,16 @@ jobs:
   # booting. Deleting it rather than leaving it skipped because a permanently
   # red check trains people to ignore main's status.
   #
-  # Live health validation still happens, in the deploy job's "Wait for new
-  # revision to report healthy" step, which checks the running Azure revision.
-  # tests/test_remote_mode.py::TestLiveRenderDeployment is left in place and
-  # self-skips when RENDER_SERVICE_URL is unset, so no test is silently
-  # dropped — it simply has no configured target to run against.
+  # Coverage that is RETIRED with this job, not merely relocated: the live
+  # Render job supplied RENDER_SERVICE_URL and a bearer token to
+  # tests/test_remote_mode.py::TestLiveRenderDeployment, which asserted the
+  # public ingress, bearer authentication, /v1/research, and /capabilities on
+  # a running deployment. The replacement below covers live public health on
+  # the Azure surface only; the authenticated research-workflow assertions
+  # have no configured target or credential and are retired pending an Azure
+  # test credential (follow-up ticket, not restored here). The test class is
+  # left in place and self-skips when RENDER_SERVICE_URL is unset, so it can
+  # be pointed at a future target without restoring this job.
 
   # ACES-453: deploy the built image to Azure Container Apps after CI passes
   # on main. OIDC federated auth (no stored client secret) via a service
@@ -191,4 +196,32 @@ jobs:
             sleep 10
           done
           echo "Timed out waiting for revision to report healthy."
+          exit 1
+
+      # The revision-health wait above only reads Azure control-plane state; it
+      # never exercises the deployed app's public ingress. This step hits the
+      # running revision's public FQDN so a container that Azure reports healthy
+      # but that cannot actually serve /health/live still fails the deploy
+      # (replacement for the retired Render job's public-ingress coverage).
+      - name: Smoke-test public ingress on the new revision
+        run: |
+          set -euo pipefail
+          FQDN=$(az containerapp show \
+            --name "$APP_NAME" --resource-group "$RESOURCE_GROUP" \
+            --query "properties.configuration.ingress.fqdn" -o tsv)
+          if [ -z "$FQDN" ] || [ "$FQDN" = "None" ]; then
+            echo "Container App has no public ingress FQDN; cannot smoke-test."
+            exit 1
+          fi
+          echo "Smoke-testing https://$FQDN/health/live"
+          for i in $(seq 1 12); do
+            if curl -sf --max-time 5 "https://$FQDN/health/live"; then
+              echo
+              echo "Public ingress is serving /health/live."
+              exit 0
+            fi
+            echo "Attempt $i/12: not ready yet, retrying in 5s..."
+            sleep 5
+          done
+          echo "Public ingress did not serve /health/live."
           exit 1
