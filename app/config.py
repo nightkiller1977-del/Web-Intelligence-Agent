@@ -2,9 +2,15 @@
 import os
 import secrets
 import logging
-from pydantic import AliasChoices, Field
+from pydantic import AliasChoices, Field, model_validator
 from pydantic_settings import BaseSettings
 from pydantic_settings import SettingsConfigDict
+
+# Minimum ownership-lease TTL. The heartbeat renews once per second, so a lease
+# must comfortably exceed that cadence to survive normal scheduling/network
+# jitter without being treated as lost.
+MIN_CONCURRENCY_LEASE_TTL_SECONDS = 30
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="allow")
@@ -32,6 +38,71 @@ class Settings(BaseSettings):
     MAX_CONCURRENT_OPS: int = int(os.getenv("MAX_CONCURRENT_OPS", 3))
     MAX_MEMORY_MB: int = int(os.getenv("MAX_MEMORY_MB", 512))
     DAILY_SPEND_LIMIT_USD: float = float(os.getenv("DAILY_SPEND_LIMIT_USD", 50.0))
+    # Conservative per-operation budget reserved at admission, before the real
+    # cost is known. Reservation makes the daily ceiling atomic across
+    # replicas; it is released and reconciled to the observed cost on
+    # completion, or released outright on cancel/failure.
+    DEFAULT_OPERATION_COST_RESERVE_USD: float = float(
+        os.getenv("DEFAULT_OPERATION_COST_RESERVE_USD", 0.25)
+    )
+
+    # Durability
+    # When redis storage is selected but the backend is unreachable, refuse to
+    # start (fail closed) instead of silently falling back to process-local
+    # memory. Set false only for explicitly disposable deployments.
+    REDIS_REQUIRED: bool = os.getenv("REDIS_REQUIRED", "").lower() in ("1", "true", "yes")
+    # Lease TTL for concurrency slots and operation liveness (seconds).
+    CONCURRENCY_LEASE_TTL_SECONDS: int = int(os.getenv("CONCURRENCY_LEASE_TTL_SECONDS", 3600))
+    # How often a running service re-runs the stale-operation reconciliation
+    # scan. Must be shorter than CONCURRENCY_LEASE_TTL_SECONDS so an operation
+    # orphaned by a crash is eventually failed rather than stuck forever.
+    STALE_RECONCILE_INTERVAL_SECONDS: int = int(os.getenv("STALE_RECONCILE_INTERVAL_SECONDS", 60))
+
+    @model_validator(mode="after")
+    def _validate_operational_limits(self):
+        # These settings gate leases and reconciliation loops; non-positive
+        # values would make Redis SET ... EX fail or create a tight scan loop.
+        if self.CONCURRENCY_LEASE_TTL_SECONDS < MIN_CONCURRENCY_LEASE_TTL_SECONDS:
+            # The ownership heartbeat runs on a fixed one-second cadence, so a
+            # lease shorter than this margin expires between heartbeats and
+            # aborts healthy operations as lease-lost.
+            raise ValueError(
+                f"CONCURRENCY_LEASE_TTL_SECONDS must be at least {MIN_CONCURRENCY_LEASE_TTL_SECONDS} seconds."
+            )
+        if self.STALE_RECONCILE_INTERVAL_SECONDS <= 0:
+            raise ValueError("STALE_RECONCILE_INTERVAL_SECONDS must be a positive integer.")
+        if self.DAILY_SPEND_LIMIT_USD <= 0:
+            raise ValueError("DAILY_SPEND_LIMIT_USD must be positive.")
+        if self.DEFAULT_OPERATION_COST_RESERVE_USD <= 0:
+            # A zero reserve would make every admission reservation a no-op, so
+            # concurrent operations would bypass the daily ceiling entirely.
+            raise ValueError("DEFAULT_OPERATION_COST_RESERVE_USD must be positive.")
+        if self.STALE_RECONCILE_INTERVAL_SECONDS >= self.CONCURRENCY_LEASE_TTL_SECONDS:
+            # The scan must run within the lease window, otherwise an operation
+            # orphaned by a crash stays queued/running for longer than its lease
+            # implies and blocks a concurrency slot until the next pass.
+            raise ValueError(
+                "STALE_RECONCILE_INTERVAL_SECONDS must be shorter than CONCURRENCY_LEASE_TTL_SECONDS."
+            )
+        if (
+            self.DEFAULT_OPERATION_COST_RESERVE_USD > self.DAILY_SPEND_LIMIT_USD
+            and "DEFAULT_OPERATION_COST_RESERVE_USD" not in self.model_fields_set
+        ):
+            # The documented default reserve exceeds the configured ceiling, so
+            # every operator-facing request without a smaller explicit
+            # maximumModelCostUsd would be rejected. Fail clearly at startup
+            # (only when the reserve was left at its default) instead of
+            # appearing healthy while refusing all normal work.
+            raise ValueError(
+                "DEFAULT_OPERATION_COST_RESERVE_USD exceeds DAILY_SPEND_LIMIT_USD; "
+                "increase the daily limit or lower the per-operation reserve."
+            )
+        return self
+
+    # Local input ingestion
+    # Explicit filesystem roots that local document/repository inputs may be
+    # read from (os.pathsep-separated). Empty disables local file inputs.
+    LOCAL_INPUT_ROOTS: str = os.getenv("LOCAL_INPUT_ROOTS", "")
 
     # CORS policies
     # Disabled by default in remote mode unless explicitly authorized

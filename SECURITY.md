@@ -57,7 +57,14 @@ If you discover a security vulnerability in Web Intelligence Agent, please email
 ### Storage Security
 - Local storage (SQLite) is used only in development/testing.
 - Production deployments use Redis with proper network isolation.
+- Redis-backed deployments set `REDIS_REQUIRED=true` so the service fails closed at startup rather than silently degrading to process-local memory.
+- Concurrency slots and operation ownership use Redis leases with a heartbeat, so the limit holds service-wide and a live operation is not misreported as abandoned.
 - All storage operations are audited and logged.
+
+### Local Input Security
+- Local document/repository inputs are read only from filesystem roots listed in `LOCAL_INPUT_ROOTS`; with the setting empty, local file inputs are disabled.
+- Paths are resolved before the root check so symlink/`..` traversal cannot escape an allowed root.
+- Local input locators are returned on the source `uri` field; `url` stays empty so a `file://` locator is never presented as an HTTP source.
 
 ---
 

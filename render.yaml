@@ -20,8 +20,12 @@ services:
           type: redis
           name: web-intelligence-cache
           property: connectionString
+      - key: REDIS_REQUIRED
+        value: "true"
       - key: MAX_CONCURRENT_OPS
         value: "3"
+      - key: CONCURRENCY_LEASE_TTL_SECONDS
+        value: "3600"
       - key: WEB_INTELLIGENCE_AUTH_TOKEN
         generateValue: true
         sync: false

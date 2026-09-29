@@ -173,7 +173,25 @@ class TestIdempotency:
             }
         }
 
-        with patch('app.api.conduct_web_research', new_callable=AsyncMock):
+        async def fake_conduct_web_research(**kwargs):
+            return {
+                "operationId": kwargs["op_id"],
+                "status": "completed",
+                "mode": kwargs["mode"],
+                "profile": kwargs["profile"],
+                "answer": "Mock answer",
+                "sources": [], "evidence": [], "claims": [], "citations": [],
+                "searchesPerformed": [],
+                "metrics": {
+                    "startedAt": "2026-01-01T00:00:00+00:00",
+                    "completedAt": "2026-01-01T00:00:01+00:00",
+                    "durationMs": 1,
+                    "searchesPerformed": 0, "pagesRead": 0,
+                    "sourcesConsidered": 0, "sourcesUsed": 0,
+                },
+            }
+
+        with patch('app.api.conduct_web_research', side_effect=fake_conduct_web_research):
             # First request
             response1 = client.post("/v1/research", json=payload, headers=headers)
 
@@ -321,7 +339,7 @@ class TestConcurrencyLimiting:
 
                 # Release the gate and drain the accepted operations so their
                 # concurrency slots are actually freed before the next test runs -
-                # otherwise _active_ops_count would leak into later tests.
+                # otherwise the shared storage counter would leak into later tests.
                 release_gate.set()
                 accepted_op_ids = [
                     op_id for op_id, status in zip(op_ids, status_codes) if status in [200, 201, 202]

@@ -11,16 +11,13 @@ from app.storage import storage
 from app.schemas import ResearchRequestInput, ResearchResultResponse, CapabilitiesInfo
 from app.cancellation import cancellation_manager
 from app.progress_adapter import ProgressReporter
-from app.researcher_adapter import conduct_web_research, schedule_outcome_ingest
+from app.researcher_adapter import conduct_web_research, _LeaseLostError, schedule_outcome_ingest
 from app.security import is_safe_url
-from app.metrics import observe_research_result
+from app.metrics import observed_result_cost, observe_research_result, record_operation_spend
 
 logger = logging.getLogger("web-intelligence")
 router = APIRouter()
 
-# Global counter to enforce process concurrency limits
-_active_ops_count = 0
-_concurrency_lock = asyncio.Lock()
 RAW_CREDENTIAL_HEADERS = ("X-LLM-Key", "X-Search-Key")
 TERMINAL_STATUSES = ("completed", "partial", "failed", "cancelled")
 
@@ -104,11 +101,46 @@ async def capabilities():
         }
     }
 
-async def background_research_task(req: ResearchRequestInput, reporter: ProgressReporter, headers: dict):
-    global _active_ops_count
+async def _rollback_admission(
+    operation_id: str,
+    lookup_key: str,
+    claimed_lookup_key: bool,
+    claimed_operation_id: bool,
+    slot_reserved: bool,
+    operation_owned: bool,
+    spend_reserved: float,
+) -> None:
+    """Release admission state after a failed request.
+
+    Each release is isolated so one transient backend error cannot skip the
+    others and pin a concurrency slot, owner lease, idempotency claim, or budget
+    hold for the full lease/window TTL.
+    """
+    async def _run(label: str, coro_factory):
+        try:
+            await coro_factory()
+        except Exception:
+            logger.warning("Failed to %s for operation %s during rollback.", label, operation_id, exc_info=True)
+
+    if operation_owned:
+        await _run("release owner lease", lambda: storage.release_operation_lease(operation_id))
+    if claimed_operation_id:
+        await _run("release operation claim", lambda: storage.release_operation_id(operation_id, lookup_key))
+    if claimed_lookup_key:
+        await _run("release idempotency key", lambda: storage.release_idempotency_key(lookup_key, operation_id))
+    if slot_reserved:
+        await _run("release concurrency slot", lambda: storage.release_concurrency_slot(operation_id))
+    if spend_reserved:
+        await _run("release spend hold", lambda: storage.release_daily_spend(spend_reserved, operation_id))
+
+
+async def background_research_task(req: ResearchRequestInput, reporter: ProgressReporter, headers: dict, spend_reserved: float = 0.0):
     op_id = req.operationId
+    spend_reconciled = False
 
     try:
+        # Ownership was claimed at admission time (before any queued state was
+        # published), so this task is the sole owner and may proceed.
         await storage.save_operation(op_id, {"status": "running"})
         await reporter.report("planning", "Research task started.")
 
@@ -132,6 +164,25 @@ async def background_research_task(req: ResearchRequestInput, reporter: Progress
         # Save output result
         await storage.save_operation(op_id, result)
         observe_research_result(result)
+        # Reconcile the admission reservation to the observed cost in one
+        # atomic step, so another replica cannot reserve the temporarily freed
+        # capacity in between. Isolated from the result path: a transient
+        # accounting failure must not overwrite the completed result with a
+        # failure, and the operation is left fail-closed (spend_reconciled stays
+        # True) so the finally block does not release the hold and undercharge.
+        actual = observed_result_cost(result)
+        if spend_reserved:
+            try:
+                await storage.reconcile_daily_spend(spend_reserved, actual, settings.DAILY_SPEND_LIMIT_USD, op_id)
+                spend_reconciled = True
+            except Exception:
+                spend_reconciled = True
+                logger.warning("Failed to reconcile spend for operation %s; retaining the reservation.", op_id, exc_info=True)
+        else:
+            try:
+                await record_operation_spend(storage, result)
+            except Exception:
+                logger.warning("Failed to record observed spend for operation %s.", op_id, exc_info=True)
         # Only after the result is durable may the optional Brain outcome ingest
         # be scheduled; otherwise Brain could record a completed/partial outcome
         # for a result that was never stored.
@@ -153,6 +204,10 @@ async def background_research_task(req: ResearchRequestInput, reporter: Progress
         observe_research_result(cancelled_state)
         await reporter.report("cancelled", "Research task cancelled.")
 
+    except _LeaseLostError:
+        # Ownership was lost mid-run: skip persistence so this worker cannot
+        # overwrite the terminal state reconciliation (or the new owner) wrote.
+        logger.warning("Operation %s lost its ownership lease; not persisting a failed state.", op_id)
     except Exception:
         logger.exception("Execution failed for operation %s", op_id)
         failed_state = {
@@ -163,6 +218,9 @@ async def background_research_task(req: ResearchRequestInput, reporter: Progress
             "answer": "Research execution failed.",
             "sources": [], "evidence": [], "claims": [], "citations": [], "searchesPerformed": [],
             "metrics": {"startedAt": "", "durationMs": 0, "searchesPerformed": 0, "pagesRead": 0, "sourcesConsidered": 0, "sourcesUsed": 0},
+            # Input-context limitations are computed before research runs, so a
+            # failure after that point must still report them to the caller.
+            "limitations": req.limitations_context(),
             "error": client_safe_error()
         }
         await storage.save_operation(op_id, failed_state)
@@ -170,9 +228,27 @@ async def background_research_task(req: ResearchRequestInput, reporter: Progress
         await reporter.report("failed", "Research task failed. Check server logs for redacted diagnostics.")
 
     finally:
-        cancellation_manager.unregister_task(op_id)
-        async with _concurrency_lock:
-            _active_ops_count = max(0, _active_ops_count - 1)
+        # Cleanup steps are independent: a failure in one (for example a
+        # transient Redis error releasing the spend hold) must not skip the
+        # others, or the owner lease and concurrency slot would stay pinned for
+        # the full lease TTL and the task would leak in the local registry.
+        if spend_reserved and not spend_reconciled:
+            try:
+                await storage.release_daily_spend(spend_reserved, op_id)
+            except Exception:
+                logger.warning("Failed to release spend hold for operation %s.", op_id, exc_info=True)
+        try:
+            cancellation_manager.unregister_task(op_id)
+        except Exception:
+            logger.warning("Failed to unregister task for operation %s.", op_id, exc_info=True)
+        try:
+            await storage.release_operation_lease(op_id)
+        except Exception:
+            logger.warning("Failed to release owner lease for operation %s.", op_id, exc_info=True)
+        try:
+            await storage.release_concurrency_slot(op_id)
+        except Exception:
+            logger.warning("Failed to release concurrency slot for operation %s.", op_id, exc_info=True)
 
 @router.post("/v1/research", status_code=status.HTTP_202_ACCEPTED)
 async def start_research(
@@ -180,7 +256,11 @@ async def start_research(
     request: Request,
     idempotency_key: str = Header(None, alias="Idempotency-Key")
 ):
-    global _active_ops_count
+    claimed_lookup_key = None
+    claimed_operation_id = False
+    slot_reserved = False
+    operation_owned = False
+    spend_reserved = 0.0
 
     lookup_key = idempotency_key or req.idempotencyKey
     if not lookup_key:
@@ -192,6 +272,7 @@ async def start_research(
     claimed_lookup_key = None
     claimed_operation_id = False
     slot_reserved = False
+    operation_owned = False
     try:
         # 1. Secure initial query validation (check secrets, SSRF URLs if query is an explicit URL)
         query_str = req.query.strip()
@@ -232,6 +313,24 @@ async def start_research(
             return {"operationId": existing_op_id, "status": op_state.get("status") if op_state else "unknown"}
         claimed_lookup_key = lookup_key
 
+        # 3b. Atomically reserve budget for this new operation. The check-and-
+        # reserve happens in one step so concurrent replicas cannot all pass a
+        # non-atomic read-then-admit and collectively exceed the ceiling. The
+        # reservation is reconciled to the observed cost on completion, or
+        # released on cancel/failure. Placed after the idempotency-hit return
+        # so a retry of already-accepted work still resolves to its operation.
+        reserve_amount = (
+            req.limits.maximumModelCostUsd
+            if req.limits and req.limits.maximumModelCostUsd is not None
+            else settings.DEFAULT_OPERATION_COST_RESERVE_USD
+        )
+        if not await storage.reserve_daily_spend(reserve_amount, settings.DAILY_SPEND_LIMIT_USD, req.operationId):
+            raise HTTPException(
+                status_code=429,
+                detail="Daily spend limit reached. New research operations are paused until the limit resets."
+            )
+        spend_reserved = reserve_amount
+
         operation_claimed = await storage.claim_operation_id(req.operationId, lookup_key)
         if not operation_claimed:
             raise HTTPException(
@@ -240,21 +339,29 @@ async def start_research(
             )
         claimed_operation_id = True
 
-        # 4. Enforce and reserve a concurrency slot only for new operations.
-        async with _concurrency_lock:
-            if _active_ops_count >= settings.MAX_CONCURRENT_OPS:
-                raise HTTPException(status_code=429, detail="Concurrency limit reached. Too many active operations.")
-            _active_ops_count += 1
-            slot_reserved = True
+        # 4. Enforce a service-wide concurrency slot only for new operations.
+        # The reservation lives in storage so the limit is shared across
+        # instances/workers rather than being per-process.
+        if not await storage.acquire_concurrency_slot(req.operationId):
+            raise HTTPException(status_code=429, detail="Concurrency limit reached. Too many active operations.")
+        slot_reserved = True
+
+        # 5. Claim exclusive ownership *before* any queued state is published.
+        # Publishing queued state first would let a concurrent startup
+        # reconciliation observe an ownerless queued operation and fail it out
+        # from under the worker that is about to run it.
+        if not await storage.begin_operation(req.operationId):
+            raise HTTPException(
+                status_code=409,
+                detail="operationId is already being processed by another live instance."
+            )
+        operation_owned = True
     except Exception as e:
         # Rollback reserved slot if validation fails
-        if claimed_operation_id:
-            await storage.release_operation_id(req.operationId, lookup_key)
-        if claimed_lookup_key:
-            await storage.release_idempotency_key(claimed_lookup_key, req.operationId)
-        if slot_reserved:
-            async with _concurrency_lock:
-                _active_ops_count = max(0, _active_ops_count - 1)
+        await _rollback_admission(
+            req.operationId, lookup_key, claimed_lookup_key,
+            claimed_operation_id, slot_reserved, operation_owned, spend_reserved,
+        )
         raise e
 
     op_id = req.operationId
@@ -282,18 +389,15 @@ async def start_research(
         await reporter.report("planning", "Request received. Research task queued.")
 
         # Spawn research execution task in background
-        task = asyncio.create_task(background_research_task(req, reporter, headers))
+        task = asyncio.create_task(background_research_task(req, reporter, headers, spend_reserved))
         cancellation_manager.register_task(op_id, task)
         task_started = True
     except Exception as e:
         if not task_started:
-            if claimed_operation_id:
-                await storage.release_operation_id(req.operationId, lookup_key)
-            if claimed_lookup_key:
-                await storage.release_idempotency_key(claimed_lookup_key, req.operationId)
-            if slot_reserved:
-                async with _concurrency_lock:
-                    _active_ops_count = max(0, _active_ops_count - 1)
+            await _rollback_admission(
+                req.operationId, lookup_key, claimed_lookup_key,
+                claimed_operation_id, slot_reserved, operation_owned, spend_reserved,
+            )
         raise e
 
     return {"operationId": op_id, "status": "queued"}
@@ -347,6 +451,12 @@ async def get_research_result(operation_id: str):
             "metrics": None
         }
 
+    # A failed or cancelled operation's side effects are not guaranteed to have
+    # settled; callers must reconcile rather than assume a clean stop.
+    op["requiresReconciliation"] = op.get("status") in ("failed", "cancelled")
+    op["degraded"] = bool(op.get("degraded") or getattr(storage, "degraded", False))
+    if op["degraded"] and not op.get("degradedReasons"):
+        op["degradedReasons"] = ["Durable storage is degraded; results may not survive a restart."]
     return op
 
 @router.post("/v1/research/{operation_id}/cancel")

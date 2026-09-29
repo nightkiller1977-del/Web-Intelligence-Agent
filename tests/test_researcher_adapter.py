@@ -65,7 +65,7 @@ class FakeResearcher:
         return self._context
 
 
-def test_build_structured_findings_links_claims_evidence_and_citations():
+def test_build_structured_findings_does_not_fabricate_evidence_without_passages():
     sources = [
         {
             "id": "src-op-1-0",
@@ -79,15 +79,15 @@ def test_build_structured_findings_links_claims_evidence_and_citations():
 
     evidence, claims, citations = build_structured_findings("op-1", report, sources)
 
-    assert evidence
+    # Without passage text a report sentence cannot be attributed to a source,
+    # so no evidence is invented and claims stay explicitly unverified.
+    assert evidence == []
     assert claims
+    assert all(claim["evidenceIds"] == [] for claim in claims)
+    assert all(claim["verificationStatus"] == "inferred" for claim in claims)
     assert citations
-    assert claims[0]["evidenceIds"] == [evidence[0]["id"]]
-    assert claims[0]["verificationStatus"] == "partially-supported"
-    assert evidence[0]["id"] in citations[0]["evidenceIds"]
-    assert claims[0]["id"] in citations[0]["claimIds"]
-    assert len(citations[0]["evidenceIds"]) == len(evidence)
-    assert len(citations[0]["claimIds"]) == len(claims)
+    assert all(citation["evidenceIds"] == [] for citation in citations)
+    assert all(citation["claimIds"] == [] for citation in citations)
 
 
 def test_collect_passage_records_reads_research_sources_and_context():
@@ -207,14 +207,14 @@ def test_build_effective_query_applies_freshness_without_inputs():
 def test_collect_input_context_processes_documents_without_external_use(monkeypatch, tmp_path):
     import app.researcher_adapter as adapter
     monkeypatch.setattr(adapter.settings, "DEPLOYMENT_MODE", "local")
+    monkeypatch.setattr(adapter.settings, "LOCAL_INPUT_ROOTS", str(tmp_path))
 
     document = tmp_path / "notes.md"
     document.write_text("The local design requires independent claim verification.", encoding="utf-8")
 
-    chunks, allow_external = collect_input_context({
-        "documents": [{"path": str(document), "displayName": "Notes"}]
-    })
-    query, limitations = build_effective_query("Summarize", None, chunks, allow_external)
+    raw_inputs = {"documents": [{"path": str(document), "displayName": "Notes"}]}
+    chunks, allow_external = collect_input_context(raw_inputs)
+    query, limitations = build_effective_query("Summarize", None, chunks, allow_external, raw_inputs)
 
     assert chunks[0]["label"] == "Notes"
     assert "independent claim verification" in chunks[0]["text"]
@@ -226,6 +226,7 @@ def test_collect_input_context_processes_documents_without_external_use(monkeypa
 def test_collect_input_context_requires_boolean_external_use(monkeypatch, tmp_path):
     import app.researcher_adapter as adapter
     monkeypatch.setattr(adapter.settings, "DEPLOYMENT_MODE", "local")
+    monkeypatch.setattr(adapter.settings, "LOCAL_INPUT_ROOTS", str(tmp_path))
 
     document = tmp_path / "notes.md"
     document.write_text("The local design requires independent claim verification.", encoding="utf-8")
@@ -268,6 +269,7 @@ def test_input_text_from_file_disabled_outside_local_mode(monkeypatch, tmp_path)
 def test_input_text_from_file_reads_only_capped_bytes(monkeypatch, tmp_path):
     import app.researcher_adapter as adapter
     monkeypatch.setattr(adapter.settings, "DEPLOYMENT_MODE", "local")
+    monkeypatch.setattr(adapter.settings, "LOCAL_INPUT_ROOTS", str(tmp_path))
 
     document = tmp_path / "large.md"
     document.write_text("a" * 50_000, encoding="utf-8")
@@ -280,6 +282,7 @@ def test_input_text_from_file_reads_only_capped_bytes(monkeypatch, tmp_path):
 def test_collect_input_context_caps_documents_before_repository_reads(monkeypatch, tmp_path):
     import app.researcher_adapter as adapter
     monkeypatch.setattr(adapter.settings, "DEPLOYMENT_MODE", "local")
+    monkeypatch.setattr(adapter.settings, "LOCAL_INPUT_ROOTS", str(tmp_path))
 
     documents = []
     for index in range(20):
@@ -302,6 +305,7 @@ def test_collect_input_context_caps_documents_before_repository_reads(monkeypatc
 def test_collect_repository_context_short_circuits_large_trees(monkeypatch, tmp_path):
     import app.researcher_adapter as adapter
     monkeypatch.setattr(adapter.settings, "DEPLOYMENT_MODE", "local")
+    monkeypatch.setattr(adapter.settings, "LOCAL_INPUT_ROOTS", str(tmp_path))
 
     for index in range(20):
         (tmp_path / f"file-{index:02}.md").write_text(f"content {index}", encoding="utf-8")
@@ -606,3 +610,307 @@ async def test_recall_disabled_for_explicit_empty_source_allowlist(monkeypatch):
 
     assert result["status"] == "completed"
     assert recalled["called"] is False
+
+
+def test_build_effective_query_keeps_limitations_without_reading_files(monkeypatch, tmp_path):
+    import app.researcher_adapter as adapter
+    monkeypatch.setattr(adapter.settings, "DEPLOYMENT_MODE", "local")
+    monkeypatch.setattr(adapter.settings, "LOCAL_INPUT_ROOTS", str(tmp_path))
+
+    document = tmp_path / "notes.md"
+    document.write_text("Local design notes about verification.", encoding="utf-8")
+
+    # The pure-query path must not touch the filesystem, so a missing file still
+    # yields the same input limitations the read path would report.
+    query, limitations = build_effective_query(
+        "Summarize", None, [], False, {"documents": [{"path": str(document)}]}
+    )
+
+    assert "Local inputs were not sent to external research providers" in " ".join(limitations)
+
+
+def test_input_text_from_file_refuses_paths_outside_allowed_roots(monkeypatch, tmp_path):
+    import app.researcher_adapter as adapter
+    monkeypatch.setattr(adapter.settings, "DEPLOYMENT_MODE", "local")
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+    monkeypatch.setattr(adapter.settings, "LOCAL_INPUT_ROOTS", str(allowed))
+
+    outside = tmp_path / "secret.md"
+    outside.write_text("secret-content", encoding="utf-8")
+
+    assert input_text_from_file(outside) == ""
+
+    inside = allowed / "notes.md"
+    inside.write_text("allowed content", encoding="utf-8")
+    assert input_text_from_file(inside) == "allowed content"
+
+
+def test_input_text_from_file_refuses_everything_when_no_roots_configured(monkeypatch, tmp_path):
+    import app.researcher_adapter as adapter
+    monkeypatch.setattr(adapter.settings, "DEPLOYMENT_MODE", "local")
+    monkeypatch.setattr(adapter.settings, "LOCAL_INPUT_ROOTS", "")
+
+    document = tmp_path / "notes.md"
+    document.write_text("should not be read", encoding="utf-8")
+
+    assert input_text_from_file(document) == ""
+
+
+def test_collect_repository_context_refuses_roots_outside_allowed_roots(monkeypatch, tmp_path):
+    import app.researcher_adapter as adapter
+    monkeypatch.setattr(adapter.settings, "DEPLOYMENT_MODE", "local")
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+    monkeypatch.setattr(adapter.settings, "LOCAL_INPUT_ROOTS", str(allowed))
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "file.md").write_text("repository content", encoding="utf-8")
+
+    chunks, _ = collect_input_context({"repositories": [{"path": str(repo)}]})
+
+    assert chunks == []
+
+
+def test_append_input_sources_uses_uri_not_file_url():
+    from app.researcher_adapter import append_input_sources
+
+    sources, evidence, citations = [], [], []
+    append_input_sources(
+        "op-1",
+        [{"path": "/tmp/notes.md", "label": "Notes", "text": "content"}],
+        sources, evidence, citations,
+    )
+
+    assert sources[0]["url"] == ""
+    assert sources[0]["uri"] == "file:///tmp/notes.md"
+
+
+@pytest.mark.anyio
+async def test_conduct_web_research_redacts_provider_endpoint_sources(monkeypatch):
+    class ProviderSourceResearcher(FakeCompletedGPTResearcher):
+        def get_source_urls(self):
+            return ["https://api.tavily.com/search", "https://example.com/real"]
+
+    monkeypatch.setattr(researcher_adapter, "GPTResearcher", ProviderSourceResearcher)
+    monkeypatch.setattr(researcher_adapter, "is_safe_url", lambda url, profile: True)
+
+    reporter = MagicMock()
+    reporter.report = AsyncMock()
+
+    result = await conduct_web_research(
+        op_id="op-provider",
+        query="test query",
+        mode="standard",
+        profile="general",
+        limits={"maximumDurationSeconds": 30, "maximumSearches": 3, "maximumPages": 5, "maximumSources": 5},
+        source_policy=None,
+        freshness=None,
+        inputs=None,
+        model_provider=None,
+        model_name=None,
+        require_claim_verification=False,
+        reporter=reporter,
+        headers={},
+    )
+
+    urls = [source["url"] for source in result["sources"]]
+    assert "https://api.tavily.com/search" not in urls
+    assert "https://example.com/real" in urls
+
+
+@pytest.mark.anyio
+async def test_conduct_web_research_marks_degraded_when_no_passages(monkeypatch):
+    monkeypatch.setattr(researcher_adapter, "GPTResearcher", FakeCompletedGPTResearcher)
+    monkeypatch.setattr(researcher_adapter, "is_safe_url", lambda url, profile: True)
+
+    reporter = MagicMock()
+    reporter.report = AsyncMock()
+
+    result = await conduct_web_research(
+        op_id="op-degraded-fallback",
+        query="test query",
+        mode="standard",
+        profile="general",
+        limits={"maximumDurationSeconds": 30, "maximumSearches": 3, "maximumPages": 5, "maximumSources": 5},
+        source_policy=None,
+        freshness=None,
+        inputs=None,
+        model_provider=None,
+        model_name=None,
+        require_claim_verification=False,
+        reporter=reporter,
+        headers={},
+    )
+
+    # FakeCompletedGPTResearcher exposes no passage text, so the report-derived
+    # fallback runs and the result must say so rather than claim support.
+    assert result["degraded"] is True
+    assert any("unattributed" in reason for reason in result["degradedReasons"])
+    assert all(claim["verificationStatus"] == "inferred" for claim in result["claims"])
+
+
+@pytest.mark.anyio
+async def test_conduct_web_research_degrades_to_partial_on_search_budget(monkeypatch):
+    class BudgetExhaustedResearcher(FakeCompletedGPTResearcher):
+        async def conduct_research(self):
+            # Stand in for a search-provider call rejected at the budget boundary.
+            raise ConnectionError("provider refused the request")
+
+    monkeypatch.setattr(researcher_adapter, "GPTResearcher", BudgetExhaustedResearcher)
+    monkeypatch.setattr(researcher_adapter, "search_budget_exhausted", lambda: True)
+    monkeypatch.setattr(researcher_adapter, "is_safe_url", lambda url, profile: True)
+
+    reporter = MagicMock()
+    reporter.report = AsyncMock()
+
+    result = await conduct_web_research(
+        op_id="op-budget",
+        query="test query",
+        mode="standard",
+        profile="general",
+        limits={"maximumDurationSeconds": 30, "maximumSearches": 1, "maximumPages": 5, "maximumSources": 5},
+        source_policy=None,
+        freshness=None,
+        inputs=None,
+        model_provider=None,
+        model_name=None,
+        require_claim_verification=False,
+        reporter=reporter,
+        headers={},
+    )
+
+    # A budget stop is a bounded outcome, not an execution failure.
+    assert result["status"] == "partial"
+    assert result["degraded"] is True
+    assert any("maximumSearches" in reason for reason in result["degradedReasons"])
+
+
+@pytest.mark.anyio
+async def test_conduct_web_research_reports_degraded_storage(monkeypatch):
+    monkeypatch.setattr(researcher_adapter, "GPTResearcher", FakeCompletedGPTResearcher)
+    monkeypatch.setattr(researcher_adapter, "is_safe_url", lambda url, profile: True)
+    monkeypatch.setattr(researcher_adapter.storage_module.storage, "degraded", True, raising=False)
+
+    reporter = MagicMock()
+    reporter.report = AsyncMock()
+
+    try:
+        result = await conduct_web_research(
+            op_id="op-storage-degraded",
+            query="test query",
+            mode="standard",
+            profile="general",
+            limits={"maximumDurationSeconds": 30, "maximumSearches": 3, "maximumPages": 5, "maximumSources": 5},
+            source_policy=None,
+            freshness=None,
+            inputs=None,
+            model_provider=None,
+            model_name=None,
+            require_claim_verification=False,
+            reporter=reporter,
+            headers={},
+        )
+    finally:
+        monkeypatch.undo()
+
+    assert result["degraded"] is True
+    assert any("Durable storage is degraded" in reason for reason in result["degradedReasons"])
+
+
+
+def test_append_input_sources_produces_valid_file_uri_for_special_paths():
+    from app.researcher_adapter import append_input_sources
+
+    sources, evidence, citations = [], [], []
+    append_input_sources(
+        "op-special",
+        [{"path": "/tmp/dir with space/notes#1.md", "label": "Notes", "text": "content"}],
+        sources, evidence, citations,
+    )
+
+    uri = sources[0]["uri"]
+    assert uri.startswith("file://")
+    assert " " not in uri and "#" not in uri
+
+
+@pytest.mark.anyio
+async def test_conduct_web_research_source_cap_applies_after_redaction(monkeypatch):
+    class OnlyProviderThenRealResearcher(FakeCompletedGPTResearcher):
+        def get_source_urls(self):
+            return ["https://api.tavily.com/search", "https://example.com/real"]
+
+    monkeypatch.setattr(researcher_adapter, "GPTResearcher", OnlyProviderThenRealResearcher)
+    monkeypatch.setattr(researcher_adapter, "is_safe_url", lambda url, profile: True)
+
+    reporter = MagicMock()
+    reporter.report = AsyncMock()
+
+    result = await conduct_web_research(
+        op_id="op-cap",
+        query="test query",
+        mode="standard",
+        profile="general",
+        limits={"maximumDurationSeconds": 30, "maximumSearches": 3, "maximumPages": 5, "maximumSources": 1},
+        source_policy=None,
+        freshness=None,
+        inputs=None,
+        model_provider=None,
+        model_name=None,
+        require_claim_verification=False,
+        reporter=reporter,
+        headers={},
+    )
+
+    # With a cap of 1, a leading provider endpoint must not consume the only
+    # slot and strip the one valid source.
+    assert [source["url"] for source in result["sources"]] == ["https://example.com/real"]
+
+
+@pytest.mark.anyio
+async def test_conduct_web_research_marks_degraded_with_no_sources(monkeypatch):
+    class NoSourceResearcher(FakeCompletedGPTResearcher):
+        def get_source_urls(self):
+            return []
+
+    monkeypatch.setattr(researcher_adapter, "GPTResearcher", NoSourceResearcher)
+    monkeypatch.setattr(researcher_adapter, "is_safe_url", lambda url, profile: True)
+
+    reporter = MagicMock()
+    reporter.report = AsyncMock()
+
+    result = await conduct_web_research(
+        op_id="op-no-sources",
+        query="test query",
+        mode="standard",
+        profile="general",
+        limits={"maximumDurationSeconds": 30, "maximumSearches": 3, "maximumPages": 5, "maximumSources": 5},
+        source_policy=None,
+        freshness=None,
+        inputs=None,
+        model_provider=None,
+        model_name=None,
+        require_claim_verification=True,
+        reporter=reporter,
+        headers={},
+    )
+
+    assert result["degraded"] is True
+    assert any("No source-backed evidence" in reason for reason in result["degradedReasons"])
+
+
+def test_url_less_passage_is_not_attributed_to_an_unrelated_source():
+    sources = [
+        {"id": "src-op-2-0", "url": "https://example.com/a", "title": "A", "retrievedAt": 1, "sourceType": "web"},
+        {"id": "src-op-2-1", "url": "https://example.com/b", "title": "B", "retrievedAt": 1, "sourceType": "web"},
+    ]
+    # A context passage with no locator cannot be traced to either source.
+    passage_records = [
+        {"url": "", "title": "Research context", "text": "An untraceable passage that should not be pinned to a source."}
+    ]
+
+    evidence, _, citations = build_structured_findings_from_passages("op-2", passage_records, sources)
+
+    assert evidence == []
+    assert all(citation["evidenceIds"] == [] for citation in citations)

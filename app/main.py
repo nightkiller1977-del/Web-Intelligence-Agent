@@ -1,4 +1,5 @@
 # app/main.py
+import asyncio
 import logging
 import secrets
 from contextlib import asynccontextmanager
@@ -8,7 +9,7 @@ from fastapi.responses import JSONResponse, Response
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
 from app.config import auth_is_configured, settings, unauthenticated_docs_allowed
-from app.storage import storage
+from app.storage import storage, StorageUnavailable
 from app.cancellation import cancellation_manager
 from app.researcher_adapter import flush_pending_ingest_tasks
 from app.api import router
@@ -25,9 +26,36 @@ DOCS_PATHS = {"/docs", "/redoc", "/openapi.json", "/docs/oauth2-redirect"}
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Initializing storage backend lifecycle...")
-    await storage.init()
+    try:
+        await storage.init()
+    except StorageUnavailable as exc:
+        # Fail closed: a deployment that requires Redis must not silently serve
+        # from process-local memory. Refusing to start surfaces the misconfig
+        # instead of losing operations on the next restart.
+        emit_observability("startup_failed", reason="storage_unavailable")
+        logger.error("Refusing to start: %s", exc)
+        raise
     await storage.mark_stale_operations()
     redis_client = getattr(storage, "redis", None)
+
+    async def reconcile_stale_operations():
+        # A replacement replica usually runs the startup scan before the
+        # crashed owner's lease expires, so a one-shot scan can miss it. Keep
+        # reconciling periodically so an ownerless operation eventually becomes
+        # terminal instead of staying queued/running forever.
+        while True:
+            await asyncio.sleep(settings.STALE_RECONCILE_INTERVAL_SECONDS)
+            try:
+                await storage.mark_stale_operations()
+            except Exception:
+                logger.warning("Periodic stale-operation reconciliation failed; will retry.", exc_info=True)
+
+    # Recurring reconciliation is only meaningful for lease-aware (Redis)
+    # storage. With the single-process in-memory backend the startup scan is
+    # the only valid reconciliation point, so do not run a periodic one.
+    reconcile_task = None
+    if redis_client and not getattr(storage, "degraded", False):
+        reconcile_task = asyncio.create_task(reconcile_stale_operations())
     if redis_client and not getattr(storage, "degraded", False):
         await cancellation_manager.init(redis_client)
     emit_observability(
@@ -36,6 +64,12 @@ async def lifespan(app: FastAPI):
         redis_enabled=bool(redis_client),
     )
     yield
+    if reconcile_task is not None:
+        reconcile_task.cancel()
+        try:
+            await reconcile_task
+        except asyncio.CancelledError:
+            pass
     # Quiesce in-flight research first: a research task that finished after the
     # ingest snapshot below would schedule an untracked ingest into a closing
     # loop. Cancel/await active tasks, then drain the ingests they produced.

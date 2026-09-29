@@ -35,11 +35,12 @@ def _auth_headers():
 
 @pytest.fixture(autouse=True)
 def reset_storage_state():
-    for attr in ("operations", "events", "idempotency_keys", "operation_claims"):
+    for attr in ("operations", "events", "idempotency_keys", "operation_claims", "operation_owners"):
         if hasattr(api.storage, attr):
             getattr(api.storage, attr).clear()
+    if hasattr(api.storage, "_concurrency_slots"):
+        api.storage._concurrency_slots.clear()
     api.cancellation_manager.active_tasks.clear()
-    api._active_ops_count = 0
 
 
 def _wait_for_terminal_result(client, operation_id):
@@ -635,3 +636,113 @@ async def test_cancel_refuses_already_terminal_operation(monkeypatch):
 
     assert cancel_response.status_code == 200
     assert cancel_response.json() == {"operationId": operation_id, "status": "completed"}
+
+
+def _completed_result(op_id, **overrides):
+    result = {
+        "operationId": op_id,
+        "status": "completed",
+        "mode": "quick",
+        "profile": "general",
+        "answer": "Mock answer",
+        "sources": [], "evidence": [], "claims": [], "citations": [],
+        "searchesPerformed": [],
+        "metrics": {
+            "startedAt": "2026-01-01T00:00:00+00:00",
+            "completedAt": "2026-01-01T00:00:01+00:00",
+            "durationMs": 1,
+            "searchesPerformed": 0, "pagesRead": 0,
+            "sourcesConsidered": 0, "sourcesUsed": 0,
+        },
+    }
+    result.update(overrides)
+    return result
+
+
+def test_result_reports_requires_reconciliation_for_failed_operation(monkeypatch):
+    async def failing_research(**kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(api, "conduct_web_research", failing_research)
+
+    with TestClient(app) as client:
+        assert client.post(
+            "/v1/research", json=_payload("op-reconcile"), headers=_auth_headers()
+        ).status_code == 202
+        result = _wait_for_terminal_result(client, "op-reconcile")
+
+    assert result["status"] == "failed"
+    assert result["requiresReconciliation"] is True
+
+
+def test_result_reports_no_reconciliation_for_completed_operation(monkeypatch):
+    async def ok_research(**kwargs):
+        return _completed_result(kwargs["op_id"])
+
+    monkeypatch.setattr(api, "conduct_web_research", ok_research)
+
+    with TestClient(app) as client:
+        assert client.post(
+            "/v1/research", json=_payload("op-no-reconcile"), headers=_auth_headers()
+        ).status_code == 202
+        result = _wait_for_terminal_result(client, "op-no-reconcile")
+
+    assert result["status"] == "completed"
+    assert result["requiresReconciliation"] is False
+
+
+def test_result_reports_degraded_when_adapter_marks_it(monkeypatch):
+    async def degraded_research(**kwargs):
+        return _completed_result(
+            kwargs["op_id"],
+            degraded=True,
+            degradedReasons=["No source passage text was available."],
+        )
+
+    monkeypatch.setattr(api, "conduct_web_research", degraded_research)
+
+    with TestClient(app) as client:
+        assert client.post(
+            "/v1/research", json=_payload("op-degraded"), headers=_auth_headers()
+        ).status_code == 202
+        result = _wait_for_terminal_result(client, "op-degraded")
+
+    assert result["degraded"] is True
+    assert result["degradedReasons"]
+
+
+def test_new_operations_rejected_once_daily_spend_limit_reached(monkeypatch):
+    async def ok_research(**kwargs):
+        return _completed_result(kwargs["op_id"])
+
+    monkeypatch.setattr(api, "conduct_web_research", ok_research)
+    # Drive the authoritative shared ceiling: a limit below the per-operation
+    # reserve makes the atomic admission reservation fail without real research.
+    monkeypatch.setattr(settings, "DAILY_SPEND_LIMIT_USD", 0.01)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/research", json=_payload("op-spend"), headers=_auth_headers()
+        )
+
+    assert response.status_code == 429
+    assert "spend limit" in response.json()["detail"].lower()
+
+
+def test_failed_operation_still_reports_input_limitations(monkeypatch):
+    async def failing_research(**kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(api, "conduct_web_research", failing_research)
+    payload = _payload("op-fail-limits")
+    payload["inputs"] = {"documents": [{"path": "/tmp/notes.md", "displayName": "Notes"}]}
+
+    with TestClient(app) as client:
+        assert client.post(
+            "/v1/research", json=payload, headers=_auth_headers()
+        ).status_code == 202
+        result = _wait_for_terminal_result(client, "op-fail-limits")
+
+    assert result["status"] == "failed"
+    assert any("Local inputs" in item for item in result["limitations"])
+
