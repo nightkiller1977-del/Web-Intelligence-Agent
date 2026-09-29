@@ -32,13 +32,25 @@ redis.call('ZADD', KEYS[1], tonumber(ARGV[1]) + tonumber(ARGV[2]), ARGV[4])
 return 1
 """
 
-# Atomic stale transition: only fail the operation if no live owner lease exists.
+# Atomic stale transition: only fail the operation if no live owner lease
+# exists AND the stored operation is still queued/running. The state recheck
+# closes the snapshot race where a worker completes and releases its lease
+# after our list_operations() snapshot, which would otherwise let us overwrite
+# a completed result with a stale failure.
 _FAIL_IF_UNOWNED_LUA = """
-if redis.call('EXISTS', KEYS[1]) == 0 then
-  redis.call('HSET', KEYS[2], ARGV[1], ARGV[2])
-  return 1
+if redis.call('EXISTS', KEYS[1]) ~= 0 then
+  return 0
 end
-return 0
+local raw = redis.call('HGET', KEYS[2], ARGV[1])
+if not raw then
+  return 0
+end
+local op = cjson.decode(raw)
+if op['status'] ~= 'queued' and op['status'] ~= 'running' then
+  return 0
+end
+redis.call('HSET', KEYS[2], ARGV[1], ARGV[2])
+return 1
 """
 
 # Atomic owner compare-and-{delete,expire}: act only if the stored owner is us.
@@ -153,7 +165,10 @@ class InMemoryStorage(BaseStorage):
         self.operations: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
         self.events: Dict[str, List[Dict[str, Any]]] = {}
         self.idempotency_keys: "OrderedDict[str, str]" = OrderedDict()
-        self.operation_claims: Dict[str, str] = {}
+        # Operation-ID claims are tombstones that must outlive evicted result
+        # payloads too, so an evicted id cannot be silently reused by a
+        # different idempotency key. Bounded like the reservation map.
+        self.operation_claims: "OrderedDict[str, str]" = OrderedDict()
         self.operation_owners: Dict[str, str] = {}
         self.instance = _InstanceIdentity()
         # Identifiable slots (not a bare counter) so each release frees exactly
@@ -174,8 +189,10 @@ class InMemoryStorage(BaseStorage):
                 break
             self.operations.pop(evicted_key, None)
             self.events.pop(evicted_key, None)
-            self.operation_claims.pop(evicted_key, None)
             self.operation_owners.pop(evicted_key, None)
+            # operation_claims and idempotency_keys are deliberately retained as
+            # tombstones (bounded separately) so an evicted operationId cannot
+            # be reused by an unrelated idempotency key.
             # Idempotency reservations are intentionally retained so a retry of
             # evicted work still resolves to its original operation instead of
             # being accepted (and paid for) as new work.
@@ -184,6 +201,8 @@ class InMemoryStorage(BaseStorage):
     def _evict_idempotency_if_needed(self):
         while len(self.idempotency_keys) > IDEMPOTENCY_RESERVATION_LIMIT:
             self.idempotency_keys.popitem(last=False)
+        while len(self.operation_claims) > IDEMPOTENCY_RESERVATION_LIMIT:
+            self.operation_claims.popitem(last=False)
 
     async def save_operation(self, op_id: str, data: Dict[str, Any]):
         existing = self.operations.get(op_id)
@@ -202,8 +221,10 @@ class InMemoryStorage(BaseStorage):
     async def delete_operation(self, op_id: str):
         self.operations.pop(op_id, None)
         self.events.pop(op_id, None)
-        self.operation_claims.pop(op_id, None)
         self.operation_owners.pop(op_id, None)
+        # Explicit deletion clears the tombstone too; only bounded *eviction*
+        # retains it.
+        self.operation_claims.pop(op_id, None)
         for key, existing_op_id in list(self.idempotency_keys.items()):
             if existing_op_id == op_id:
                 self.idempotency_keys.pop(key, None)
@@ -236,6 +257,8 @@ class InMemoryStorage(BaseStorage):
                 return False
 
         self.operation_claims[op_id] = idempotency_key
+        self.operation_claims.move_to_end(op_id)
+        self._evict_idempotency_if_needed()
         return True
 
     async def release_operation_id(self, op_id: str, idempotency_key: Optional[str] = None) -> bool:
@@ -491,6 +514,14 @@ class RedisStorage(BaseStorage):
         # Atomic compare-and-expire: only extend a lease we still own.
         await self.redis.eval(
             _CAE_LUA, 1, owner_key, self.instance.instance_id, settings.CONCURRENCY_LEASE_TTL_SECONDS
+        )
+        # Renew this operation's own concurrency slot in lockstep with its
+        # heartbeat. Without this a run longer than the lease TTL would have
+        # its still-active slot reaped as expired by the next admission,
+        # exceeding MAX_CONCURRENT_OPS.
+        await self.redis.zadd(
+            "research:concurrency:slots",
+            {self.instance.lease_id(op_id): time.time() + settings.CONCURRENCY_LEASE_TTL_SECONDS},
         )
 
     async def release_operation_lease(self, op_id: str) -> None:

@@ -17,13 +17,14 @@ results it would against real Redis.
 """
 
 import asyncio
+import json
 
 import fakeredis.aioredis as fakeredis_aioredis
 import pytest
 import redis.asyncio as redis_asyncio_module
 
 from app.config import settings
-from app.storage import RedisStorage, StorageUnavailable
+from app.storage import _FAIL_IF_UNOWNED_LUA, RedisStorage, StorageUnavailable
 
 
 @pytest.fixture
@@ -258,3 +259,44 @@ async def test_redis_expired_slot_is_reclaimed(redis_storage, monkeypatch):
     # so a crashed instance cannot pin the ceiling forever.
     assert await redis_storage.acquire_concurrency_slot("op-dead") is True
     assert await redis_storage.acquire_concurrency_slot("op-new") is True
+
+
+@pytest.mark.anyio
+async def test_redis_stale_scan_does_not_overwrite_completed_operation(redis_storage):
+    # Simulate the snapshot race: an operation is snapshotted as running, then
+    # its worker completes it and releases the lease before the stale scan
+    # evaluates it. The atomic recheck must not clobber the completed result.
+    await redis_storage.save_operation("op-race", {"status": "running"})
+    snapshot = await redis_storage.get_operation("op-race")
+    await redis_storage.save_operation("op-race", {"status": "completed", "answer": "done"})
+
+    # Directly exercise the guard: no owner lease, but state is now terminal.
+    transitioned = await redis_storage.redis.eval(
+        _FAIL_IF_UNOWNED_LUA,
+        2,
+        "research:owners:op-race",
+        "research:operations",
+        "op-race",
+        json.dumps({**snapshot, "status": "failed"}),
+    )
+    assert transitioned == 0
+    assert (await redis_storage.get_operation("op-race"))["status"] == "completed"
+
+
+@pytest.mark.anyio
+async def test_redis_heartbeat_renews_concurrency_slot(redis_storage, monkeypatch):
+    monkeypatch.setattr(settings, "MAX_CONCURRENT_OPS", 1)
+    monkeypatch.setattr(settings, "CONCURRENCY_LEASE_TTL_SECONDS", 1)
+
+    assert await redis_storage.acquire_concurrency_slot("op-long") is True
+    assert await redis_storage.begin_operation("op-long") is True
+
+    # Force the slot's score into the past to stand in for elapsed time, then
+    # heartbeat: the slot must be renewed, not reaped by the next admission.
+    await redis_storage.redis.zadd("research:concurrency:slots", {"dead": 0})
+    await redis_storage.touch_operation("op-long")
+
+    score = await redis_storage.redis.zscore(
+        "research:concurrency:slots", redis_storage.instance.lease_id("op-long")
+    )
+    assert score is not None and score > 0

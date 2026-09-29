@@ -107,3 +107,19 @@ def test_eviction_preserves_live_operations():
         assert (await storage.get_operation("op-live"))["status"] == "running"
 
     asyncio.run(run())
+
+
+def test_eviction_retains_operation_id_claim_tombstone():
+    async def run():
+        storage = InMemoryStorage()
+        await storage.save_operation("op-keep", {"status": "completed"})
+        assert await storage.claim_operation_id("op-keep", "key-keep") is True
+        for i in range(storage_module.OPERATION_CACHE_LIMIT + 5):
+            await storage.save_operation(f"op-x-{i}", {"status": "completed"})
+
+        # The evicted operation's id must not be claimable by a different
+        # idempotency key; the original key still resolves to it.
+        assert await storage.claim_operation_id("op-keep", "other-key") is False
+        assert await storage.claim_operation_id("op-keep", "key-keep") is True
+
+    asyncio.run(run())
