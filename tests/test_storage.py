@@ -123,3 +123,27 @@ def test_eviction_retains_operation_id_claim_tombstone():
         assert await storage.claim_operation_id("op-keep", "key-keep") is True
 
     asyncio.run(run())
+
+
+def test_inmemory_shared_daily_spend_accumulates():
+    async def run():
+        storage = InMemoryStorage()
+        assert await storage.get_daily_spend() == 0.0
+        await storage.add_daily_spend(1.5)
+        await storage.add_daily_spend(2.0)
+        assert await storage.get_daily_spend() == 3.5
+
+    asyncio.run(run())
+
+
+def test_inmemory_begin_operation_is_exclusive():
+    async def run():
+        storage = InMemoryStorage()
+        assert await storage.begin_operation("op-excl") is True
+        # Mirrors Redis SET NX: a second live owner must be rejected, otherwise
+        # an evicted reservation could let a retry duplicate running work.
+        assert await storage.begin_operation("op-excl") is False
+        await storage.release_operation_lease("op-excl")
+        assert await storage.begin_operation("op-excl") is True
+
+    asyncio.run(run())

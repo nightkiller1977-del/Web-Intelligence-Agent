@@ -40,6 +40,10 @@ class Settings(BaseSettings):
     REDIS_REQUIRED: bool = os.getenv("REDIS_REQUIRED", "").lower() in ("1", "true", "yes")
     # Lease TTL for concurrency slots and operation liveness (seconds).
     CONCURRENCY_LEASE_TTL_SECONDS: int = int(os.getenv("CONCURRENCY_LEASE_TTL_SECONDS", 3600))
+    # How often a running service re-runs the stale-operation reconciliation
+    # scan. Must be shorter than CONCURRENCY_LEASE_TTL_SECONDS so an operation
+    # orphaned by a crash is eventually failed rather than stuck forever.
+    STALE_RECONCILE_INTERVAL_SECONDS: int = int(os.getenv("STALE_RECONCILE_INTERVAL_SECONDS", 60))
 
     # Local input ingestion
     # Explicit filesystem roots that local document/repository inputs may be

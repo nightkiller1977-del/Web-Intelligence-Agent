@@ -13,7 +13,7 @@ from app.cancellation import cancellation_manager
 from app.progress_adapter import ProgressReporter
 from app.researcher_adapter import conduct_web_research, schedule_outcome_ingest
 from app.security import is_safe_url
-from app.metrics import observe_research_result, spend_limit_exceeded
+from app.metrics import observe_research_result, record_operation_spend, spend_limit_exceeded
 
 logger = logging.getLogger("web-intelligence")
 router = APIRouter()
@@ -130,6 +130,7 @@ async def background_research_task(req: ResearchRequestInput, reporter: Progress
         # Save output result
         await storage.save_operation(op_id, result)
         observe_research_result(result)
+        await record_operation_spend(storage, result)
         # Only after the result is durable may the optional Brain outcome ingest
         # be scheduled; otherwise Brain could record a completed/partial outcome
         # for a result that was never stored.
@@ -239,8 +240,10 @@ async def start_research(
 
         # 3b. Enforce the configured daily spend ceiling for new work. Placed
         # after the idempotency-hit return so a retry of already-accepted work
-        # still resolves to its existing operation.
-        if spend_limit_exceeded():
+        # still resolves to its existing operation. The shared total is
+        # authoritative across replicas; the process-local estimate is a
+        # stricter local floor.
+        if spend_limit_exceeded() or await storage.get_daily_spend() >= settings.DAILY_SPEND_LIMIT_USD:
             raise HTTPException(
                 status_code=429,
                 detail="Daily spend limit reached. New research operations are paused until the limit resets."

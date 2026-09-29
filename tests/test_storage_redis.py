@@ -300,3 +300,11 @@ async def test_redis_heartbeat_renews_concurrency_slot(redis_storage, monkeypatc
         "research:concurrency:slots", redis_storage.instance.lease_id("op-long")
     )
     assert score is not None and score > 0
+@pytest.mark.anyio
+async def test_redis_shared_daily_spend_is_shared_and_expiring(redis_storage):
+    await redis_storage.add_daily_spend(2.5)
+    peer = RedisStorage()
+    peer.redis = redis_storage.redis
+    assert await peer.get_daily_spend() == 2.5
+    # The window key must carry a TTL so the total resets without a local timer.
+    assert await redis_storage.redis.ttl("research:spend:daily") > 0

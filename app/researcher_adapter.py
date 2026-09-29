@@ -368,7 +368,12 @@ def input_text_from_file(path: Path) -> str:
         return ""
     path = path.resolve()
     if not path_within_allowed_roots(path):
-        logger.warning("Refusing local input path outside LOCAL_INPUT_ROOTS: %s", path)
+        # Caller-supplied absolute paths can disclose sensitive filenames and
+        # carry newline/control characters, so log only a bounded digest.
+        logger.warning(
+            "Refusing local input path outside LOCAL_INPUT_ROOTS (path hash %s)",
+            hashlib.sha256(str(path).encode()).hexdigest()[:12],
+        )
         return ""
     if not path.is_file() or path.suffix.lower() not in SUPPORTED_INPUT_EXTENSIONS:
         return ""
@@ -408,7 +413,10 @@ def collect_repository_context(repositories: list[dict], remaining_chunks: int =
         if not root.is_dir():
             continue
         if not path_within_allowed_roots(root):
-            logger.warning("Refusing repository input outside LOCAL_INPUT_ROOTS: %s", root)
+            logger.warning(
+                "Refusing repository input outside LOCAL_INPUT_ROOTS (path hash %s)",
+                hashlib.sha256(str(root).encode()).hexdigest()[:12],
+            )
             continue
         visited = 0
         for current_root, dirnames, filenames in os.walk(root):
@@ -742,7 +750,7 @@ async def _run_research(env_manager, callbacks, reporter, op_id, query, display_
                 # Heartbeat this instance's ownership lease so a peer instance
                 # (or startup reconciliation) can tell the operation is still
                 # live and must not be marked stale.
-                await storage_module.touch_operation(op_id)
+                await storage_module.storage.touch_operation(op_id)
                 mem = get_memory_usage_mb()
                 if mem > 0.80 * max_memory:
                     logger.warning("Memory threshold exceeded: %.1fMB / %dMB limit. Triggering early synthesis.", mem, max_memory)
@@ -849,12 +857,12 @@ async def _run_research(env_manager, callbacks, reporter, op_id, query, display_
             if is_provider_host(url):
                 # A research result must not cite the service's own model/search
                 # provider endpoints as web sources.
-                logger.warning("Redacting provider endpoint from final result sources: %s", url)
+                logger.warning("Redacting a provider endpoint from final result sources.")
                 continue
             if is_safe_url(url, profile):
                 safe_sources.append(url)
             else:
-                logger.warning(f"Source URL {url} flagged by SSRF filter in final result. Redacting.")
+                logger.warning("A source URL was flagged by the SSRF filter in the final result. Redacting.")
 
         source_metadata = collect_source_metadata(researcher, search_results)
 

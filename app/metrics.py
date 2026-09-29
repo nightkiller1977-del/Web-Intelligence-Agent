@@ -84,6 +84,25 @@ def get_accumulated_daily_spend():
     _reset_spend_window_if_needed()
     return _daily_spend_usd
 
+async def record_operation_spend(storage, result: dict) -> None:
+    """Accumulate this result's estimated spend in shared storage.
+
+    The process-local counter behind spend_limit_exceeded() resets on restart,
+    so it alone cannot enforce a service-wide ceiling across replicas. Writing
+    the estimate to the shared backend lets every instance see the same
+    running total.
+    """
+    metrics = result.get("metrics") or {}
+    cost = metrics.get("estimatedModelCostUsd")
+    if cost is None:
+        cost = estimate_tokens(result.get("answer") or "") * 0.000010
+    if cost:
+        try:
+            await storage.add_daily_spend(float(cost))
+        except Exception:
+            logger.warning("Failed to record estimated spend in shared storage; using process-local estimate only.")
+
+
 def observe_research_result(result: dict):
     profile = result.get("profile", "unknown")
     mode = result.get("mode", "unknown")
