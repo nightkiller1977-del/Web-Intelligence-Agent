@@ -174,12 +174,12 @@ async def test_mark_stale_operations_respects_live_owner_lease(redis_storage, mo
 async def test_redis_concurrency_slot_is_service_wide(redis_storage, monkeypatch):
     monkeypatch.setattr(settings, "MAX_CONCURRENT_OPS", 2)
 
-    assert await redis_storage.acquire_concurrency_slot() is True
-    assert await redis_storage.acquire_concurrency_slot() is True
-    assert await redis_storage.acquire_concurrency_slot() is False
+    assert await redis_storage.acquire_concurrency_slot("op-a") is True
+    assert await redis_storage.acquire_concurrency_slot("op-b") is True
+    assert await redis_storage.acquire_concurrency_slot("op-c") is False
 
-    await redis_storage.release_concurrency_slot()
-    assert await redis_storage.acquire_concurrency_slot() is True
+    await redis_storage.release_concurrency_slot("op-a")
+    assert await redis_storage.acquire_concurrency_slot("op-c") is True
 
 
 @pytest.mark.anyio
@@ -194,3 +194,67 @@ async def test_redis_begin_operation_lease_is_exclusive(redis_storage):
 
     await redis_storage.release_operation_lease("op-exclusive")
     assert await peer.begin_operation("op-exclusive") is True
+
+
+@pytest.mark.anyio
+async def test_redis_stale_scan_does_not_fail_live_owned_operation(redis_storage):
+    # A queued operation with a live owner lease must survive reconciliation:
+    # the owner-check and state-write are atomic, so a peer cannot fail work
+    # that is actively owned.
+    await redis_storage.save_operation("op-live", {"status": "queued"})
+    assert await redis_storage.begin_operation("op-live") is True
+
+    await redis_storage.mark_stale_operations()
+
+    assert (await redis_storage.get_operation("op-live"))["status"] == "queued"
+
+
+@pytest.mark.anyio
+async def test_redis_stale_scan_fails_ownerless_operation(redis_storage):
+    await redis_storage.save_operation("op-orphan", {"status": "queued"})
+
+    await redis_storage.mark_stale_operations()
+
+    assert (await redis_storage.get_operation("op-orphan"))["status"] == "failed"
+
+
+@pytest.mark.anyio
+async def test_redis_release_lease_is_compare_and_delete(redis_storage):
+    peer = RedisStorage()
+    peer.redis = redis_storage.redis
+
+    assert await redis_storage.begin_operation("op-cad") is True
+    # A peer that does not own the lease must not clear it.
+    await peer.release_operation_lease("op-cad")
+    assert await redis_storage.redis.get("research:owners:op-cad") is not None
+
+    # The owner can clear its own lease and free it for the peer.
+    await redis_storage.release_operation_lease("op-cad")
+    assert await redis_storage.redis.get("research:owners:op-cad") is None
+    assert await peer.begin_operation("op-cad") is True
+
+
+@pytest.mark.anyio
+async def test_redis_release_slot_is_identity_scoped(redis_storage, monkeypatch):
+    monkeypatch.setattr(settings, "MAX_CONCURRENT_OPS", 1)
+
+    assert await redis_storage.acquire_concurrency_slot("op-1") is True
+    assert await redis_storage.acquire_concurrency_slot("op-2") is False
+
+    # Releasing a slot this instance never held must not free op-1's slot.
+    await redis_storage.release_concurrency_slot("op-not-held")
+    assert await redis_storage.acquire_concurrency_slot("op-2") is False
+
+    await redis_storage.release_concurrency_slot("op-1")
+    assert await redis_storage.acquire_concurrency_slot("op-2") is True
+
+
+@pytest.mark.anyio
+async def test_redis_expired_slot_is_reclaimed(redis_storage, monkeypatch):
+    monkeypatch.setattr(settings, "MAX_CONCURRENT_OPS", 1)
+    monkeypatch.setattr(settings, "CONCURRENCY_LEASE_TTL_SECONDS", -1)
+
+    # A slot whose lease has already expired is reclaimed by the next acquire,
+    # so a crashed instance cannot pin the ceiling forever.
+    assert await redis_storage.acquire_concurrency_slot("op-dead") is True
+    assert await redis_storage.acquire_concurrency_slot("op-new") is True

@@ -509,7 +509,9 @@ def append_input_sources(op_id: str, input_chunks: list[dict], sources: list[dic
             # so the locator is carried on uri and url stays empty rather than
             # smuggling a file:// pseudo-URL through an HTTP-shaped field.
             "url": "",
-            "uri": f"file://{chunk['path']}",
+            # Path.as_uri() percent-encodes reserved characters and rejects
+            # relative paths, so the locator is a syntactically valid URI.
+            "uri": Path(chunk["path"]).resolve().as_uri(),
             "title": chunk["label"],
             "retrievedAt": int(time.time() * 1000),
             "sourceType": source_type,
@@ -838,8 +840,11 @@ async def _run_research(env_manager, callbacks, reporter, op_id, query, display_
 
         # Verify SSRF on each retrieved source before presenting in final result
         safe_sources = []
-        for i, url in enumerate(raw_sources):
-            if i >= max_sources:
+        for url in raw_sources:
+            # Collect up to max_sources *usable* sources: apply the cap after
+            # filtering, otherwise provider/unsafe URLs earlier in the list can
+            # consume the whole budget and strip valid provenance.
+            if len(safe_sources) >= max_sources:
                 break
             if is_provider_host(url):
                 # A research result must not cite the service's own model/search
@@ -926,6 +931,14 @@ async def _run_research(env_manager, callbacks, reporter, op_id, query, display_
         if inferred_fallback:
             degraded_reasons.append(
                 "No source passage text was available, so claims are report-derived and unattributed rather than source-backed."
+            )
+        if not sources and not evidence:
+            # Neither web sources nor local-input evidence back this report, so
+            # it is degraded even though a report was produced. Evaluated after
+            # local inputs are appended so input-only evidence is not
+            # falsely flagged.
+            degraded_reasons.append(
+                "No source-backed evidence was available; the report is not supported by any source passage."
             )
         if getattr(storage_module.storage, "degraded", False):
             degraded_reasons.append("Durable storage is degraded; results may not survive a restart.")

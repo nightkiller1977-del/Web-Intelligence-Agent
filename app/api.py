@@ -105,13 +105,8 @@ async def background_research_task(req: ResearchRequestInput, reporter: Progress
     op_id = req.operationId
 
     try:
-        # Claim exclusive ownership of this operation. On a multi-instance
-        # backend this fails if another live instance is already running it, so
-        # a duplicate cannot execute the same operation concurrently.
-        if not await storage.begin_operation(op_id):
-            logger.warning("Operation %s is already owned by another live instance; not re-running.", op_id)
-            return
-
+        # Ownership was claimed at admission time (before any queued state was
+        # published), so this task is the sole owner and may proceed.
         await storage.save_operation(op_id, {"status": "running"})
         await reporter.report("planning", "Research task started.")
 
@@ -178,7 +173,7 @@ async def background_research_task(req: ResearchRequestInput, reporter: Progress
     finally:
         cancellation_manager.unregister_task(op_id)
         await storage.release_operation_lease(op_id)
-        await storage.release_concurrency_slot()
+        await storage.release_concurrency_slot(op_id)
 
 @router.post("/v1/research", status_code=status.HTTP_202_ACCEPTED)
 async def start_research(
@@ -189,6 +184,7 @@ async def start_research(
     claimed_lookup_key = None
     claimed_operation_id = False
     slot_reserved = False
+    operation_owned = False
 
     lookup_key = idempotency_key or req.idempotencyKey
     if not lookup_key:
@@ -200,6 +196,7 @@ async def start_research(
     claimed_lookup_key = None
     claimed_operation_id = False
     slot_reserved = False
+    operation_owned = False
     try:
         # 1. Secure initial query validation (check secrets, SSRF URLs if query is an explicit URL)
         query_str = req.query.strip()
@@ -260,17 +257,30 @@ async def start_research(
         # 4. Enforce a service-wide concurrency slot only for new operations.
         # The reservation lives in storage so the limit is shared across
         # instances/workers rather than being per-process.
-        if not await storage.acquire_concurrency_slot():
+        if not await storage.acquire_concurrency_slot(req.operationId):
             raise HTTPException(status_code=429, detail="Concurrency limit reached. Too many active operations.")
         slot_reserved = True
+
+        # 5. Claim exclusive ownership *before* any queued state is published.
+        # Publishing queued state first would let a concurrent startup
+        # reconciliation observe an ownerless queued operation and fail it out
+        # from under the worker that is about to run it.
+        if not await storage.begin_operation(req.operationId):
+            raise HTTPException(
+                status_code=409,
+                detail="operationId is already being processed by another live instance."
+            )
+        operation_owned = True
     except Exception as e:
         # Rollback reserved slot if validation fails
+        if operation_owned:
+            await storage.release_operation_lease(req.operationId)
         if claimed_operation_id:
             await storage.release_operation_id(req.operationId, lookup_key)
         if claimed_lookup_key:
             await storage.release_idempotency_key(claimed_lookup_key, req.operationId)
         if slot_reserved:
-            await storage.release_concurrency_slot()
+            await storage.release_concurrency_slot(req.operationId)
         raise e
 
     op_id = req.operationId
@@ -303,12 +313,14 @@ async def start_research(
         task_started = True
     except Exception as e:
         if not task_started:
+            if operation_owned:
+                await storage.release_operation_lease(req.operationId)
             if claimed_operation_id:
                 await storage.release_operation_id(req.operationId, lookup_key)
             if claimed_lookup_key:
                 await storage.release_idempotency_key(claimed_lookup_key, req.operationId)
             if slot_reserved:
-                await storage.release_concurrency_slot()
+                await storage.release_concurrency_slot(req.operationId)
         raise e
 
     return {"operationId": op_id, "status": "queued"}

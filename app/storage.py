@@ -4,6 +4,7 @@ import logging
 import os
 import socket
 import time
+import uuid
 from collections import OrderedDict
 from typing import Dict, Any, List, Optional
 from app.config import settings
@@ -14,7 +15,45 @@ logger = logging.getLogger("web-intelligence")
 # without limit. Web results stay queryable; input/reconciliation metadata is
 # dropped first so the evicted bytes are the large ones.
 OPERATION_CACHE_LIMIT = 500
-OPERATION_METADATA_PREFIX = "__meta:"
+# Idempotency reservations outlive evicted results: dropping one would let a
+# retry of old work be accepted as new (and paid for again). Kept as a bounded
+# FIFO tombstone independent of the operation payload cache.
+IDEMPOTENCY_RESERVATION_LIMIT = 10000
+
+# Atomic acquire of a concurrency slot. Expired slots are reclaimed first, so a
+# crashed instance's slot frees itself instead of pinning the counter forever,
+# and each slot carries its own expiry rather than sharing one global TTL.
+_ACQUIRE_SLOT_LUA = """
+redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', ARGV[1])
+if redis.call('ZCARD', KEYS[1]) >= tonumber(ARGV[3]) then
+  return 0
+end
+redis.call('ZADD', KEYS[1], tonumber(ARGV[1]) + tonumber(ARGV[2]), ARGV[4])
+return 1
+"""
+
+# Atomic stale transition: only fail the operation if no live owner lease exists.
+_FAIL_IF_UNOWNED_LUA = """
+if redis.call('EXISTS', KEYS[1]) == 0 then
+  redis.call('HSET', KEYS[2], ARGV[1], ARGV[2])
+  return 1
+end
+return 0
+"""
+
+# Atomic owner compare-and-{delete,expire}: act only if the stored owner is us.
+_CAD_LUA = """
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  return redis.call('DEL', KEYS[1])
+end
+return 0
+"""
+_CAE_LUA = """
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  return redis.call('EXPIRE', KEYS[1], tonumber(ARGV[2]))
+end
+return 0
+"""
 
 
 class StorageUnavailable(RuntimeError):
@@ -27,7 +66,10 @@ class StorageUnavailable(RuntimeError):
 
 
 def _new_instance_id() -> str:
-    return f"{socket.gethostname()}:{os.getpid()}:{int(time.time() * 1000)}"
+    # Include a random component so two instances created in the same process
+    # and millisecond (for example a peer in tests, or a fast restart) never
+    # share an id - owner compare-and-set would otherwise treat them as one.
+    return f"{socket.gethostname()}:{os.getpid()}:{int(time.time() * 1000)}:{uuid.uuid4().hex[:12]}"
 
 
 class _InstanceIdentity:
@@ -82,12 +124,12 @@ class BaseStorage:
     async def mark_stale_operations(self):
         raise NotImplementedError()
 
-    async def acquire_concurrency_slot(self) -> bool:
-        """Reserve a service-wide concurrent-operation slot."""
+    async def acquire_concurrency_slot(self, op_id: str) -> bool:
+        """Reserve a service-wide concurrent-operation slot for op_id."""
         raise NotImplementedError()
 
-    async def release_concurrency_slot(self) -> None:
-        """Release a previously reserved concurrent-operation slot."""
+    async def release_concurrency_slot(self, op_id: str) -> None:
+        """Release the slot reserved for op_id."""
         raise NotImplementedError()
 
     async def begin_operation(self, op_id: str) -> bool:
@@ -105,24 +147,43 @@ class BaseStorage:
 
 class InMemoryStorage(BaseStorage):
     def __init__(self):
-        # OrderedDict keyed by canonical op_id (metadata entries live under a
-        # namespaced key so they cannot collide with a caller-supplied op_id).
+        # OrderedDict keyed by canonical op_id. Ownership leases live in a
+        # separate mapping so a caller-supplied operation ID can never collide
+        # with internal metadata.
         self.operations: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
         self.events: Dict[str, List[Dict[str, Any]]] = {}
-        self.idempotency_keys: Dict[str, str] = {}
+        self.idempotency_keys: "OrderedDict[str, str]" = OrderedDict()
         self.operation_claims: Dict[str, str] = {}
+        self.operation_owners: Dict[str, str] = {}
         self.instance = _InstanceIdentity()
-        self._concurrency_active = 0
+        # Identifiable slots (not a bare counter) so each release frees exactly
+        # the slot it reserved.
+        self._concurrency_slots: set[str] = set()
 
     def _evict_if_needed(self):
-        while len(self.operations) > OPERATION_CACHE_LIMIT:
-            evicted_key, _ = self.operations.popitem(last=False)
+        # Evict oldest terminal operations first, and never evict queued/running
+        # work: dropping a live operation would make it unqueryable while it is
+        # still executing. Reservations are retained (see below).
+        if len(self.operations) <= OPERATION_CACHE_LIMIT:
+            return
+        for evicted_key in [
+            key for key, op in self.operations.items()
+            if op.get("status") not in ("queued", "running")
+        ]:
+            if len(self.operations) <= OPERATION_CACHE_LIMIT:
+                break
+            self.operations.pop(evicted_key, None)
             self.events.pop(evicted_key, None)
             self.operation_claims.pop(evicted_key, None)
-            for key, existing_op_id in list(self.idempotency_keys.items()):
-                if existing_op_id == evicted_key:
-                    self.idempotency_keys.pop(key, None)
+            self.operation_owners.pop(evicted_key, None)
+            # Idempotency reservations are intentionally retained so a retry of
+            # evicted work still resolves to its original operation instead of
+            # being accepted (and paid for) as new work.
             logger.info("Evicted operation %s from the in-memory cache (limit %d)", evicted_key, OPERATION_CACHE_LIMIT)
+
+    def _evict_idempotency_if_needed(self):
+        while len(self.idempotency_keys) > IDEMPOTENCY_RESERVATION_LIMIT:
+            self.idempotency_keys.popitem(last=False)
 
     async def save_operation(self, op_id: str, data: Dict[str, Any]):
         existing = self.operations.get(op_id)
@@ -142,6 +203,7 @@ class InMemoryStorage(BaseStorage):
         self.operations.pop(op_id, None)
         self.events.pop(op_id, None)
         self.operation_claims.pop(op_id, None)
+        self.operation_owners.pop(op_id, None)
         for key, existing_op_id in list(self.idempotency_keys.items()):
             if existing_op_id == op_id:
                 self.idempotency_keys.pop(key, None)
@@ -151,6 +213,8 @@ class InMemoryStorage(BaseStorage):
         if existing:
             return existing
         self.idempotency_keys[key] = op_id
+        self.idempotency_keys.move_to_end(key)
+        self._evict_idempotency_if_needed()
         return None
 
     async def release_idempotency_key(self, key: str, op_id: Optional[str] = None) -> bool:
@@ -193,37 +257,35 @@ class InMemoryStorage(BaseStorage):
         # Single-process backend: every queued/running operation belongs to this
         # process, so anything still live at startup was abandoned by a restart.
         for op_id, op in list(self.operations.items()):
-            if op_id.startswith(OPERATION_METADATA_PREFIX):
-                continue
             if op.get("status") in ("queued", "running"):
                 op["status"] = "failed"
                 op["error"] = {"code": "STALE_OPERATION", "message": "Operation was abandoned after a service restart.", "retryable": True}
                 logger.warning("Marked stale operation %s as failed", op_id)
 
-    async def acquire_concurrency_slot(self) -> bool:
-        # In-memory backend is single-process, so this counter is the whole
-        # service. It enforces the same MAX_CONCURRENT_OPS ceiling the shared
-        # Redis counter does, just without cross-instance visibility.
-        if self._concurrency_active >= settings.MAX_CONCURRENT_OPS:
+    async def acquire_concurrency_slot(self, op_id: str) -> bool:
+        # In-memory backend is single-process, so this set is the whole service.
+        # It enforces the same MAX_CONCURRENT_OPS ceiling the shared Redis slot
+        # set does, just without cross-instance visibility.
+        if len(self._concurrency_slots) >= settings.MAX_CONCURRENT_OPS:
             return False
-        self._concurrency_active += 1
+        self._concurrency_slots.add(self.instance.lease_id(op_id))
         return True
 
-    async def release_concurrency_slot(self) -> None:
-        self._concurrency_active = max(0, self._concurrency_active - 1)
+    async def release_concurrency_slot(self, op_id: str) -> None:
+        self._concurrency_slots.discard(self.instance.lease_id(op_id))
 
     async def begin_operation(self, op_id: str) -> bool:
-        self.operations[f"{OPERATION_METADATA_PREFIX}{op_id}"] = {
-            "owner": self.instance.instance_id
-        }
-        self._evict_if_needed()
+        self.operation_owners[op_id] = self.instance.instance_id
         return True
 
     async def touch_operation(self, op_id: str) -> None:
         return None
 
     async def release_operation_lease(self, op_id: str) -> None:
-        self.operations.pop(f"{OPERATION_METADATA_PREFIX}{op_id}", None)
+        # Only the owner may release, so a late finisher cannot clear a lease a
+        # newer owner has since taken.
+        if self.operation_owners.get(op_id) == self.instance.instance_id:
+            self.operation_owners.pop(op_id, None)
 
 class RedisStorage(BaseStorage):
     def __init__(self):
@@ -366,34 +428,50 @@ class RedisStorage(BaseStorage):
             if op.get("status") not in ("queued", "running"):
                 continue
             owner_key = f"research:owners:{op_id}"
-            live_owner = await self.redis.get(owner_key)
-            if live_owner:
-                logger.info("Leaving operation %s running; live owner lease %s", op_id, live_owner)
-                continue
-            op["status"] = "failed"
-            op["error"] = {"code": "STALE_OPERATION", "message": "Operation was abandoned after a service restart.", "retryable": True}
-            await self.redis.hset("research:operations", op_id, json.dumps(op))
-            logger.warning("Marked stale operation %s as failed", op_id)
+            # The owner check and the terminal-state write must be atomic:
+            # otherwise reconciliation can observe no owner and then overwrite
+            # the state of an operation a peer has meanwhile started running.
+            stale_op = dict(op)
+            stale_op["status"] = "failed"
+            stale_op["error"] = {"code": "STALE_OPERATION", "message": "Operation was abandoned after a service restart.", "retryable": True}
+            transitioned = await self.redis.eval(
+                _FAIL_IF_UNOWNED_LUA,
+                2,
+                owner_key,
+                "research:operations",
+                op_id,
+                json.dumps(stale_op),
+            )
+            if transitioned:
+                logger.warning("Marked stale operation %s as failed", op_id)
+            else:
+                logger.info("Leaving operation %s running; live owner lease present", op_id)
 
-    async def acquire_concurrency_slot(self) -> bool:
+    async def acquire_concurrency_slot(self, op_id: str) -> bool:
         if self.degraded:
-            return await self.fallback.acquire_concurrency_slot()
-        # Service-wide counter shared by every instance; the fixed key carries a
-        # safety TTL in case a process dies without releasing its slot.
-        value = await self.redis.incr("research:concurrency:active")
-        await self.redis.expire("research:concurrency:active", settings.CONCURRENCY_LEASE_TTL_SECONDS)
-        if value > settings.MAX_CONCURRENT_OPS:
-            await self.redis.decr("research:concurrency:active")
-            return False
-        return True
+            return await self.fallback.acquire_concurrency_slot(op_id)
+        # Each slot is an individual sorted-set member carrying its own expiry.
+        # The Lua script reclaims expired members fist and admits the new slot
+        # only below the ceiling, so a crashed instance frees its own slot and a
+        # single shared TTL can neither over-admit nor pin a leaked count.
+        now = time.time()
+        member = self.instance.lease_id(op_id)
+        acquired = await self.redis.eval(
+            _ACQUIRE_SLOT_LUA,
+            1,
+            "research:concurrency:slots",
+            now,
+            settings.CONCURRENCY_LEASE_TTL_SECONDS,
+            settings.MAX_CONCURRENT_OPS,
+            member,
+        )
+        return bool(acquired)
 
-    async def release_concurrency_slot(self) -> None:
+    async def release_concurrency_slot(self, op_id: str) -> None:
         if self.degraded:
-            return await self.fallback.release_concurrency_slot()
-        remaining = await self.redis.decr("research:concurrency:active")
-        if remaining < 0:
-            # Guard against over-release (for example a double finally).
-            await self.redis.set("research:concurrency:active", 0)
+            return await self.fallback.release_concurrency_slot(op_id)
+        # Idempotent: only the member this instance reserved is removed.
+        await self.redis.zrem("research:concurrency:slots", self.instance.lease_id(op_id))
 
     async def begin_operation(self, op_id: str) -> bool:
         if self.degraded:
@@ -410,19 +488,18 @@ class RedisStorage(BaseStorage):
         if self.degraded:
             return await self.fallback.touch_operation(op_id)
         owner_key = f"research:owners:{op_id}"
-        current = await self.redis.get(owner_key)
-        if current == self.instance.instance_id:
-            await self.redis.expire(owner_key, settings.CONCURRENCY_LEASE_TTL_SECONDS)
+        # Atomic compare-and-expire: only extend a lease we still own.
+        await self.redis.eval(
+            _CAE_LUA, 1, owner_key, self.instance.instance_id, settings.CONCURRENCY_LEASE_TTL_SECONDS
+        )
 
     async def release_operation_lease(self, op_id: str) -> None:
         if self.degraded:
             return await self.fallback.release_operation_lease(op_id)
         owner_key = f"research:owners:{op_id}"
-        # Only the owner may release the lease, so a late finisher cannot clear
-        # a lease a newer owner has since taken.
-        current = await self.redis.get(owner_key)
-        if current == self.instance.instance_id:
-            await self.redis.delete(owner_key)
+        # Atomic compare-and-delete: a lease that expired between a read and a
+        # write must not let this late finisher clear a newer owner's lease.
+        await self.redis.eval(_CAD_LUA, 1, owner_key, self.instance.instance_id)
 
     async def push_progress_event(self, op_id: str, event: Dict[str, Any]):
         if self.degraded:

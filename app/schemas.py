@@ -92,12 +92,17 @@ class ResearchRequestInput(BaseModel):
         """Input-context limitations known before research runs.
 
         Deterministic and side-effect free so a failed run can still report the
-        same input-context limitations a successful run would.
+        same input-context limitations a successful run would. It deliberately
+        does not claim the inputs were read: at this point their read status is
+        unknown, and reporting them as processed would be false provenance for
+        an operation that fails before the adapter runs.
         """
         inputs = self.inputs or {}
         if not (inputs.get("documents") or inputs.get("repositories")):
             return []
-        limitations = ["Local document/repository inputs were processed as bounded first-party evidence."]
+        limitations = [
+            "Local document/repository inputs were declared; their read status is unknown if the run did not produce results."
+        ]
         if inputs.get("allowExternalUse") is True:
             limitations.append("Local inputs were explicitly allowed for external research prompt context.")
         else:

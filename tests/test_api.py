@@ -35,11 +35,11 @@ def _auth_headers():
 
 @pytest.fixture(autouse=True)
 def reset_storage_state():
-    for attr in ("operations", "events", "idempotency_keys", "operation_claims"):
+    for attr in ("operations", "events", "idempotency_keys", "operation_claims", "operation_owners"):
         if hasattr(api.storage, attr):
             getattr(api.storage, attr).clear()
-    if hasattr(api.storage, "_concurrency_active"):
-        api.storage._concurrency_active = 0
+    if hasattr(api.storage, "_concurrency_slots"):
+        api.storage._concurrency_slots.clear()
     api.cancellation_manager.active_tasks.clear()
 
 

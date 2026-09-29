@@ -818,3 +818,83 @@ async def test_conduct_web_research_reports_degraded_storage(monkeypatch):
     assert result["degraded"] is True
     assert any("Durable storage is degraded" in reason for reason in result["degradedReasons"])
 
+
+
+def test_append_input_sources_produces_valid_file_uri_for_special_paths():
+    from app.researcher_adapter import append_input_sources
+
+    sources, evidence, citations = [], [], []
+    append_input_sources(
+        "op-special",
+        [{"path": "/tmp/dir with space/notes#1.md", "label": "Notes", "text": "content"}],
+        sources, evidence, citations,
+    )
+
+    uri = sources[0]["uri"]
+    assert uri.startswith("file://")
+    assert " " not in uri and "#" not in uri
+
+
+@pytest.mark.anyio
+async def test_conduct_web_research_source_cap_applies_after_redaction(monkeypatch):
+    class OnlyProviderThenRealResearcher(FakeCompletedGPTResearcher):
+        def get_source_urls(self):
+            return ["https://api.tavily.com/search", "https://example.com/real"]
+
+    monkeypatch.setattr(researcher_adapter, "GPTResearcher", OnlyProviderThenRealResearcher)
+    monkeypatch.setattr(researcher_adapter, "is_safe_url", lambda url, profile: True)
+
+    reporter = MagicMock()
+    reporter.report = AsyncMock()
+
+    result = await conduct_web_research(
+        op_id="op-cap",
+        query="test query",
+        mode="standard",
+        profile="general",
+        limits={"maximumDurationSeconds": 30, "maximumSearches": 3, "maximumPages": 5, "maximumSources": 1},
+        source_policy=None,
+        freshness=None,
+        inputs=None,
+        model_provider=None,
+        model_name=None,
+        require_claim_verification=False,
+        reporter=reporter,
+        headers={},
+    )
+
+    # With a cap of 1, a leading provider endpoint must not consume the only
+    # slot and strip the one valid source.
+    assert [source["url"] for source in result["sources"]] == ["https://example.com/real"]
+
+
+@pytest.mark.anyio
+async def test_conduct_web_research_marks_degraded_with_no_sources(monkeypatch):
+    class NoSourceResearcher(FakeCompletedGPTResearcher):
+        def get_source_urls(self):
+            return []
+
+    monkeypatch.setattr(researcher_adapter, "GPTResearcher", NoSourceResearcher)
+    monkeypatch.setattr(researcher_adapter, "is_safe_url", lambda url, profile: True)
+
+    reporter = MagicMock()
+    reporter.report = AsyncMock()
+
+    result = await conduct_web_research(
+        op_id="op-no-sources",
+        query="test query",
+        mode="standard",
+        profile="general",
+        limits={"maximumDurationSeconds": 30, "maximumSearches": 3, "maximumPages": 5, "maximumSources": 5},
+        source_policy=None,
+        freshness=None,
+        inputs=None,
+        model_provider=None,
+        model_name=None,
+        require_claim_verification=True,
+        reporter=reporter,
+        headers={},
+    )
+
+    assert result["degraded"] is True
+    assert any("No source-backed evidence" in reason for reason in result["degradedReasons"])
