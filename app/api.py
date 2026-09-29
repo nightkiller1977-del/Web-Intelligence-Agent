@@ -183,8 +183,12 @@ async def background_research_task(req: ResearchRequestInput, reporter: Progress
     finally:
         # Charge the real cost above on success; on cancel/failure release the
         # admission hold so it does not permanently consume the daily budget.
+        # A budget-release failure must not skip lease/slot cleanup below.
         if spend_reserved and not spend_reconciled:
-            await storage.release_daily_spend(spend_reserved)
+            try:
+                await storage.release_daily_spend(spend_reserved)
+            except Exception:
+                logger.warning("Failed to release spend hold for operation %s.", op_id, exc_info=True)
         cancellation_manager.unregister_task(op_id)
         await storage.release_operation_lease(op_id)
         await storage.release_concurrency_slot(op_id)
@@ -311,7 +315,10 @@ async def start_research(
         if slot_reserved:
             await storage.release_concurrency_slot(req.operationId)
         if spend_reserved:
-            await storage.release_daily_spend(spend_reserved)
+            try:
+                await storage.release_daily_spend(spend_reserved)
+            except Exception:
+                logger.warning("Failed to release admission spend hold during rollback.", exc_info=True)
         raise e
 
     op_id = req.operationId
@@ -353,7 +360,10 @@ async def start_research(
             if slot_reserved:
                 await storage.release_concurrency_slot(req.operationId)
             if spend_reserved:
-                await storage.release_daily_spend(spend_reserved)
+                try:
+                    await storage.release_daily_spend(spend_reserved)
+                except Exception:
+                    logger.warning("Failed to release admission spend hold during rollback.", exc_info=True)
         raise e
 
     return {"operationId": op_id, "status": "queued"}

@@ -15,6 +15,10 @@ from app.security import PROFILE_DOMAINS, enforce_egress_protection, is_safe_url
 from app.config import brain_memory_client, settings
 import app.storage as storage_module
 
+
+class _LeaseLostError(RuntimeError):
+    """Raised internally when this worker no longer owns an operation."""
+
 logger = logging.getLogger("web-intelligence")
 import psutil
 import os
@@ -758,7 +762,14 @@ async def _run_research(env_manager, callbacks, reporter, op_id, query, display_
                 # Heartbeat this instance's ownership lease so a peer instance
                 # (or startup reconciliation) can tell the operation is still
                 # live and must not be marked stale.
-                owns = await storage_module.storage.touch_operation(op_id)
+                try:
+                    owns = await storage_module.storage.touch_operation(op_id)
+                except Exception:
+                    # A failing heartbeat means we can no longer prove ownership,
+                    # so treat it as lost and fail closed rather than assume the
+                    # lease is still ours.
+                    logger.warning("Heartbeat for operation %s raised; treating ownership as lost.", op_id, exc_info=True)
+                    owns = False
                 if owns is False:
                     # Ownership or the concurrency slot was lost (e.g. a long
                     # pause let the lease expire). This is fail-closed: do not
@@ -824,7 +835,7 @@ async def _run_research(env_manager, callbacks, reporter, op_id, query, display_
             if lease_lost:
                 # Fail closed: another worker may own this operation now, so do
                 # not synthesize or persist a competing result.
-                raise RuntimeError(
+                raise _LeaseLostError(
                     "Operation ownership lease was lost; aborting without writing a result."
                 )
             if memory_cancelled:
