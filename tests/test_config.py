@@ -26,3 +26,16 @@ def test_brain_memory_settings_load_from_dotenv(tmp_path):
     assert settings.BRAIN_MEMORY_ENABLED is True
     assert settings.BRAIN_MEMORY_CONTEXT_ENABLED is True
     assert settings.BRAIN_MEMORY_URL == "https://brain.example"
+
+
+def test_non_positive_operational_limits_are_rejected(monkeypatch, tmp_path):
+    import pytest
+
+    monkeypatch.setenv("CONCURRENCY_LEASE_TTL_SECONDS", "0")
+    with pytest.raises(Exception):
+        Settings(_env_file=tmp_path / "missing.env")
+
+    monkeypatch.setenv("CONCURRENCY_LEASE_TTL_SECONDS", "3600")
+    monkeypatch.setenv("DEFAULT_OPERATION_COST_RESERVE_USD", "0")
+    with pytest.raises(Exception):
+        Settings(_env_file=tmp_path / "missing.env")

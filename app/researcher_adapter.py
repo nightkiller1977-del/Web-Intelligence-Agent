@@ -741,10 +741,11 @@ async def _run_research(env_manager, callbacks, reporter, op_id, query, display_
 
         research_task = asyncio.current_task()
         memory_cancelled = False
+        lease_lost = False
         client_cancel_event = asyncio.Event()
 
         async def monitor_memory():
-            nonlocal memory_cancelled
+            nonlocal memory_cancelled, lease_lost
             while True:
                 await asyncio.sleep(1.0)
                 # Heartbeat this instance's ownership lease so a peer instance
@@ -753,10 +754,10 @@ async def _run_research(env_manager, callbacks, reporter, op_id, query, display_
                 owns = await storage_module.storage.touch_operation(op_id)
                 if owns is False:
                     # Ownership or the concurrency slot was lost (e.g. a long
-                    # pause let the lease expire). Continuing would let two
-                    # workers write the same operation, so stop this one.
+                    # pause let the lease expire). This is fail-closed: do not
+                    # synthesize or persist a result another worker may own.
                     logger.warning("Lost ownership of operation %s during heartbeat; aborting research.", op_id)
-                    memory_cancelled = True
+                    lease_lost = True
                     research_task.cancel()
                     break
                 mem = get_memory_usage_mb()
@@ -813,6 +814,12 @@ async def _run_research(env_manager, callbacks, reporter, op_id, query, display_
             report_text, status = await bounded_synthesis("duration limit")
 
         except asyncio.CancelledError:
+            if lease_lost:
+                # Fail closed: another worker may own this operation now, so do
+                # not synthesize or persist a competing result.
+                raise RuntimeError(
+                    "Operation ownership lease was lost; aborting without writing a result."
+                )
             if memory_cancelled:
                 logger.warning("Research operation %s cancelled due to memory pressure limit.", op_id)
                 await reporter.report("synthesizing", "Memory limit exceeded. Synthesizing partial report.")

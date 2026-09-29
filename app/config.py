@@ -62,8 +62,10 @@ class Settings(BaseSettings):
             raise ValueError("STALE_RECONCILE_INTERVAL_SECONDS must be a positive integer.")
         if self.DAILY_SPEND_LIMIT_USD <= 0:
             raise ValueError("DAILY_SPEND_LIMIT_USD must be positive.")
-        if self.DEFAULT_OPERATION_COST_RESERVE_USD < 0:
-            raise ValueError("DEFAULT_OPERATION_COST_RESERVE_USD must not be negative.")
+        if self.DEFAULT_OPERATION_COST_RESERVE_USD <= 0:
+            # A zero reserve would make every admission reservation a no-op, so
+            # concurrent operations would bypass the daily ceiling entirely.
+            raise ValueError("DEFAULT_OPERATION_COST_RESERVE_USD must be positive.")
         return self
 
     # Local input ingestion
