@@ -80,6 +80,8 @@ return -1
 # Atomic budget reservation: admit only if the shared total plus this
 # operation's estimate stays within the ceiling, then reserve it in one step.
 # Prevents concurrent replicas from all passing a non-atomic read-then-admit.
+# The window TTL is set in the same atomic script, so a crash cannot leave a
+# key that has crossed the limit with no expiry.
 _RESERVE_SPEND_LUA = """
 local total = tonumber(redis.call('GET', KEYS[1]) or '0')
 if total + tonumber(ARGV[1]) > tonumber(ARGV[2]) then
@@ -92,13 +94,29 @@ end
 return 1
 """
 
-# Atomic budget release: give back a reservation (or reconcile a reservation
-# down to the actual observed cost).
-_RELEASE_SPEND_LUA = """
+# Atomic budget reconcile: replace a reservation with the observed cost in one
+# step so freed capacity cannot be grabbed between a release and a charge.
+_RECONCILE_SPEND_LUA = """
 local total = tonumber(redis.call('GET', KEYS[1]) or '0')
-local next_total = total - tonumber(ARGV[1])
+local next_total = total - tonumber(ARGV[1]) + tonumber(ARGV[2])
 if next_total < 0 then next_total = 0 end
-redis.call('SET', KEYS[1], tostring(next_total))
+redis.call('SET', KEYS[1], tostring(next_total), 'KEEPTTL')
+if redis.call('TTL', KEYS[1]) < 0 then
+  redis.call('EXPIRE', KEYS[1], 86400)
+end
+return 1
+"""
+
+# Atomic budget release: give back a reservation (or reconcile it down to the
+# observed cost). Uses INCRBYFLOAT on the existing key so the daily window TTL
+# is preserved; SET would reset the window to a fresh 24 hours on every
+# release, so regular completions could keep the "daily" total from ever
+# resetting.
+_RELEASE_SPEND_LUA = """
+local delta = -tonumber(ARGV[1])
+local next_total = tonumber(redis.call('GET', KEYS[1]) or '0') + delta
+if next_total < 0 then next_total = 0 end
+redis.call('SET', KEYS[1], tostring(next_total), 'KEEPTTL')
 if redis.call('TTL', KEYS[1]) < 0 then
   redis.call('EXPIRE', KEYS[1], 86400)
 end
@@ -207,6 +225,10 @@ class BaseStorage:
 
     async def release_daily_spend(self, amount_usd: float) -> None:
         """Give back a reservation (or reconcile it to the observed cost)."""
+        raise NotImplementedError()
+
+    async def reconcile_daily_spend(self, reserved_usd: float, actual_usd: float) -> None:
+        """Atomically replace a reservation with the observed cost."""
         raise NotImplementedError()
 
 class InMemoryStorage(BaseStorage):
@@ -397,6 +419,10 @@ class InMemoryStorage(BaseStorage):
         self._reset_spend_window_if_needed()
         self._daily_spend_usd = max(0.0, self._daily_spend_usd - float(amount_usd))
 
+    async def reconcile_daily_spend(self, reserved_usd: float, actual_usd: float) -> None:
+        self._reset_spend_window_if_needed()
+        self._daily_spend_usd = max(0.0, self._daily_spend_usd - float(reserved_usd) + float(actual_usd))
+
 class RedisStorage(BaseStorage):
     def __init__(self):
         self.redis = None
@@ -557,6 +583,19 @@ class RedisStorage(BaseStorage):
             return await self.fallback.release_daily_spend(amount_usd)
         await self.redis.eval(_RELEASE_SPEND_LUA, 1, "research:spend:daily", float(amount_usd))
 
+    async def reconcile_daily_spend(self, reserved_usd: float, actual_usd: float) -> None:
+        if self.degraded:
+            return await self.fallback.reconcile_daily_spend(reserved_usd, actual_usd)
+        # Single atomic swap: drop the reservation and add the observed cost so
+        # the freed capacity is never briefly visible to another replica.
+        await self.redis.eval(
+            _RECONCILE_SPEND_LUA,
+            1,
+            "research:spend:daily",
+            float(reserved_usd),
+            float(actual_usd),
+        )
+
     async def mark_stale_operations(self):
         if self.degraded:
             return await self.fallback.mark_stale_operations()
@@ -624,7 +663,10 @@ class RedisStorage(BaseStorage):
         )
         return bool(acquired)
 
-    async def touch_operation(self, op_id: str) -> None:
+    async def touch_operation(self, op_id: str) -> bool:
+        """Heartbeat ownership. Returns False when this instance has lost
+        ownership or its slot, so the caller can abort work that is no longer
+        the exclusive owner."""
         if self.degraded:
             return await self.fallback.touch_operation(op_id)
         owner_key = f"research:owners:{op_id}"
@@ -643,8 +685,13 @@ class RedisStorage(BaseStorage):
             settings.CONCURRENCY_LEASE_TTL_SECONDS,
             time.time(),
         )
+        if result == 0:
+            logger.warning("Ownership lease for operation %s was lost; heartbeat cannot renew it.", op_id)
+            return False
         if result == -1:
-            logger.warning("Concurrency slot for operation %s was lost and will not be re-reserved.", op_id)
+            logger.warning("Concurrency slot for operation %s was lost; heartbeat cannot renew it.", op_id)
+            return False
+        return True
 
     async def release_operation_lease(self, op_id: str) -> None:
         if self.degraded:

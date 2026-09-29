@@ -750,7 +750,15 @@ async def _run_research(env_manager, callbacks, reporter, op_id, query, display_
                 # Heartbeat this instance's ownership lease so a peer instance
                 # (or startup reconciliation) can tell the operation is still
                 # live and must not be marked stale.
-                await storage_module.storage.touch_operation(op_id)
+                owns = await storage_module.storage.touch_operation(op_id)
+                if owns is False:
+                    # Ownership or the concurrency slot was lost (e.g. a long
+                    # pause let the lease expire). Continuing would let two
+                    # workers write the same operation, so stop this one.
+                    logger.warning("Lost ownership of operation %s during heartbeat; aborting research.", op_id)
+                    memory_cancelled = True
+                    research_task.cancel()
+                    break
                 mem = get_memory_usage_mb()
                 if mem > 0.80 * max_memory:
                     logger.warning("Memory threshold exceeded: %.1fMB / %dMB limit. Triggering early synthesis.", mem, max_memory)
@@ -936,7 +944,9 @@ async def _run_research(env_manager, callbacks, reporter, op_id, query, display_
             # real source-linked evidence, the earlier "no passage text" web
             # fallback no longer describes the final result, so drop it to
             # avoid contradicting the appended evidence and citations.
-            if inferred_fallback and any(citation.get("evidenceIds") for citation in citations):
+            if inferred_fallback and any(
+                claim.get("verificationStatus") == "supported" for claim in claims
+            ):
                 inferred_fallback = False
 
         degraded_reasons = []

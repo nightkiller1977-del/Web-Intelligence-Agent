@@ -84,6 +84,15 @@ def get_accumulated_daily_spend():
     _reset_spend_window_if_needed()
     return _daily_spend_usd
 
+def observed_result_cost(result: dict) -> float:
+    """Estimated spend for a completed result, falling back to a text estimate."""
+    metrics = result.get("metrics") or {}
+    cost = metrics.get("estimatedModelCostUsd")
+    if cost is None:
+        cost = estimate_tokens(result.get("answer") or "") * 0.000010
+    return float(cost or 0.0)
+
+
 async def record_operation_spend(storage, result: dict) -> None:
     """Accumulate this result's estimated spend in shared storage.
 

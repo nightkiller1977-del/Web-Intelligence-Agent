@@ -13,7 +13,7 @@ from app.cancellation import cancellation_manager
 from app.progress_adapter import ProgressReporter
 from app.researcher_adapter import conduct_web_research, schedule_outcome_ingest
 from app.security import is_safe_url
-from app.metrics import observe_research_result, record_operation_spend, spend_limit_exceeded
+from app.metrics import observed_result_cost, observe_research_result, record_operation_spend, spend_limit_exceeded
 
 logger = logging.getLogger("web-intelligence")
 router = APIRouter()
@@ -131,12 +131,15 @@ async def background_research_task(req: ResearchRequestInput, reporter: Progress
         # Save output result
         await storage.save_operation(op_id, result)
         observe_research_result(result)
-        # Reconcile the admission reservation to the observed cost: release the
-        # hold, then charge the actual estimate.
+        # Reconcile the admission reservation to the observed cost in one
+        # atomic step, so another replica cannot reserve the temporarily freed
+        # capacity in between.
+        actual = observed_result_cost(result)
         if spend_reserved:
-            await storage.release_daily_spend(spend_reserved)
+            await storage.reconcile_daily_spend(spend_reserved, actual)
             spend_reconciled = True
-        await record_operation_spend(storage, result)
+        else:
+            await record_operation_spend(storage, result)
         # Only after the result is durable may the optional Brain outcome ingest
         # be scheduled; otherwise Brain could record a completed/partial outcome
         # for a result that was never stored.
@@ -349,6 +352,8 @@ async def start_research(
                 await storage.release_idempotency_key(claimed_lookup_key, req.operationId)
             if slot_reserved:
                 await storage.release_concurrency_slot(req.operationId)
+            if spend_reserved:
+                await storage.release_daily_spend(spend_reserved)
         raise e
 
     return {"operationId": op_id, "status": "queued"}

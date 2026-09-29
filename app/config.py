@@ -2,7 +2,7 @@
 import os
 import secrets
 import logging
-from pydantic import AliasChoices, Field
+from pydantic import AliasChoices, Field, model_validator
 from pydantic_settings import BaseSettings
 from pydantic_settings import SettingsConfigDict
 
@@ -51,6 +51,20 @@ class Settings(BaseSettings):
     # scan. Must be shorter than CONCURRENCY_LEASE_TTL_SECONDS so an operation
     # orphaned by a crash is eventually failed rather than stuck forever.
     STALE_RECONCILE_INTERVAL_SECONDS: int = int(os.getenv("STALE_RECONCILE_INTERVAL_SECONDS", 60))
+
+    @model_validator(mode="after")
+    def _validate_operational_limits(self):
+        # These settings gate leases and reconciliation loops; non-positive
+        # values would make Redis SET ... EX fail or create a tight scan loop.
+        if self.CONCURRENCY_LEASE_TTL_SECONDS <= 0:
+            raise ValueError("CONCURRENCY_LEASE_TTL_SECONDS must be a positive integer.")
+        if self.STALE_RECONCILE_INTERVAL_SECONDS <= 0:
+            raise ValueError("STALE_RECONCILE_INTERVAL_SECONDS must be a positive integer.")
+        if self.DAILY_SPEND_LIMIT_USD <= 0:
+            raise ValueError("DAILY_SPEND_LIMIT_USD must be positive.")
+        if self.DEFAULT_OPERATION_COST_RESERVE_USD < 0:
+            raise ValueError("DEFAULT_OPERATION_COST_RESERVE_USD must not be negative.")
+        return self
 
     # Local input ingestion
     # Explicit filesystem roots that local document/repository inputs may be

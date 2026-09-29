@@ -330,3 +330,25 @@ async def test_redis_reserve_daily_spend_is_atomic(redis_storage):
     assert await redis_storage.get_daily_spend() == 4.0
     await redis_storage.release_daily_spend(4.0)
     assert await redis_storage.get_daily_spend() == 0.0
+
+
+@pytest.mark.anyio
+async def test_redis_reconcile_spend_preserves_window_ttl(redis_storage):
+    assert await redis_storage.reserve_daily_spend(4.0, 50.0) is True
+    ttl_before = await redis_storage.redis.ttl("research:spend:daily")
+
+    await redis_storage.reconcile_daily_spend(4.0, 1.5)
+
+    assert await redis_storage.get_daily_spend() == 1.5
+    # Releasing/reconciling must not reset the daily window to a fresh 24h.
+    assert await redis_storage.redis.ttl("research:spend:daily") <= ttl_before
+
+
+@pytest.mark.anyio
+async def test_redis_heartbeat_reports_lost_ownership(redis_storage):
+    assert await redis_storage.begin_operation("op-hb") is True
+    assert await redis_storage.acquire_concurrency_slot("op-hb") is True
+    assert await redis_storage.touch_operation("op-hb") is True
+    # Simulate another instance taking over the lease.
+    await redis_storage.redis.delete("research:owners:op-hb")
+    assert await redis_storage.touch_operation("op-hb") is False
