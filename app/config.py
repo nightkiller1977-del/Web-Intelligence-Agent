@@ -66,6 +66,13 @@ class Settings(BaseSettings):
             # A zero reserve would make every admission reservation a no-op, so
             # concurrent operations would bypass the daily ceiling entirely.
             raise ValueError("DEFAULT_OPERATION_COST_RESERVE_USD must be positive.")
+        if self.STALE_RECONCILE_INTERVAL_SECONDS >= self.CONCURRENCY_LEASE_TTL_SECONDS:
+            # The scan must run within the lease window, otherwise an operation
+            # orphaned by a crash stays queued/running for longer than its lease
+            # implies and blocks a concurrency slot until the next pass.
+            raise ValueError(
+                "STALE_RECONCILE_INTERVAL_SECONDS must be shorter than CONCURRENCY_LEASE_TTL_SECONDS."
+            )
         if (
             self.DEFAULT_OPERATION_COST_RESERVE_USD > self.DAILY_SPEND_LIMIT_USD
             and "DEFAULT_OPERATION_COST_RESERVE_USD" not in self.model_fields_set

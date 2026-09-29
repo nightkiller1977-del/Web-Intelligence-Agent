@@ -393,7 +393,9 @@ def input_text_from_file(path: Path) -> str:
             raw = input_file.read(MAX_INPUT_FILE_BYTES)
         return raw.decode("utf-8", errors="replace")
     except OSError:
-        logger.warning("Unable to read input file: %s", path)
+        # Do not log the caller-supplied path: it can disclose sensitive
+        # filenames and carry newline/control characters into the log.
+        logger.warning("Unable to read a declared local input file (suffix %s).", path.suffix)
         return ""
 
 def collect_document_context(documents: list[dict], remaining_chunks: int = MAX_INPUT_CHUNKS) -> list[dict]:

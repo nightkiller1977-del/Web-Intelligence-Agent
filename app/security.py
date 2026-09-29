@@ -291,8 +291,8 @@ def _consume_search_budget(url: str):
             # connection errors, so the research loop detects a budget stop by
             # observing this flag rather than by catching the exception type.
             budget["exhausted"] = True
-            logger.error("Search provider budget exhausted before request to %s", url)
-            raise SearchBudgetExhausted(f"Search budget exhausted before outbound request: {url}")
+            logger.error("Search provider budget exhausted before an outbound request.")
+            raise SearchBudgetExhausted("Search budget exhausted before outbound request.")
         budget["remaining"] = remaining - 1
 
 def _ensure_safe_url(url: str):
@@ -305,7 +305,10 @@ def _ensure_safe_url(url: str):
         else is_safe_egress_url(str(url))
     )
     if not is_safe:
-        logger.error("SSRF egress guard denied request to %s", url)
+        # Log only the scheme+host, not the full URL: query strings can carry
+        # provider credentials or sensitive parameters.
+        parsed = urlparse(str(url))
+        logger.error("SSRF egress guard denied request to %s://%s", parsed.scheme, parsed.hostname)
         raise PermissionError(f"SSRF blocked outbound request: {url}")
     _consume_search_budget(str(url))
 

@@ -24,11 +24,13 @@ IDEMPOTENCY_RESERVATION_LIMIT = 10000
 # crashed instance's slot frees itself instead of pinning the counter forever,
 # and each slot carries its own expiry rather than sharing one global TTL.
 _ACQUIRE_SLOT_LUA = """
-redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', ARGV[1])
-if redis.call('ZCARD', KEYS[1]) >= tonumber(ARGV[3]) then
+local t = redis.call('TIME')
+local now = tonumber(t[1]) + tonumber(t[2]) / 1000000
+redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', now)
+if redis.call('ZCARD', KEYS[1]) >= tonumber(ARGV[2]) then
   return 0
 end
-redis.call('ZADD', KEYS[1], tonumber(ARGV[1]) + tonumber(ARGV[2]), ARGV[4])
+redis.call('ZADD', KEYS[1], now + tonumber(ARGV[1]), ARGV[3])
 return 1
 """
 
@@ -71,7 +73,9 @@ if redis.call('GET', KEYS[1]) ~= ARGV[1] then
 end
 redis.call('EXPIRE', KEYS[1], tonumber(ARGV[3]))
 if redis.call('ZSCORE', KEYS[2], ARGV[2]) then
-  redis.call('ZADD', KEYS[2], tonumber(ARGV[4]) + tonumber(ARGV[3]), ARGV[2])
+  local t = redis.call('TIME')
+  local now = tonumber(t[1]) + tonumber(t[2]) / 1000000
+  redis.call('ZADD', KEYS[2], now + tonumber(ARGV[3]), ARGV[2])
   return 1
 end
 return -1
@@ -84,12 +88,26 @@ return -1
 # key that has crossed the limit with no expiry.
 _RESERVE_SPEND_LUA = """
 local total = tonumber(redis.call('GET', KEYS[1]) or '0')
-if total + tonumber(ARGV[1]) > tonumber(ARGV[2]) then
+local amount = tonumber(ARGV[1])
+local op_id = ARGV[3]
+if op_id ~= '' then
+  -- Idempotent: a retry of the same operation must not reserve twice.
+  if redis.call('HEXISTS', KEYS[2], op_id) == 1 then
+    return 1
+  end
+end
+if total + amount > tonumber(ARGV[2]) then
   return 0
 end
 redis.call('INCRBYFLOAT', KEYS[1], ARGV[1])
 if redis.call('TTL', KEYS[1]) < 0 then
   redis.call('EXPIRE', KEYS[1], 86400)
+end
+if redis.call('TTL', KEYS[2]) < 0 then
+  redis.call('EXPIRE', KEYS[2], 86400)
+end
+if op_id ~= '' then
+  redis.call('HSET', KEYS[2], op_id, ARGV[1])
 end
 return 1
 """
@@ -98,12 +116,26 @@ return 1
 # step so freed capacity cannot be grabbed between a release and a charge.
 _RECONCILE_SPEND_LUA = """
 local total = tonumber(redis.call('GET', KEYS[1]) or '0')
-local next_total = total - tonumber(ARGV[1]) + tonumber(ARGV[2])
+local reserved = tonumber(ARGV[1])
+local op_id = ARGV[4]
+if op_id ~= '' then
+  -- Retry-safe: if this operation's reservation is gone, its reconciliation
+  -- already happened (or was released), so do not charge it twice.
+  local existing = redis.call('HGET', KEYS[2], op_id)
+  if not existing then
+    return 0
+  end
+  reserved = tonumber(existing)
+end
+local next_total = total - reserved + tonumber(ARGV[2])
 if next_total < 0 then next_total = 0 end
 if next_total > tonumber(ARGV[3]) then next_total = tonumber(ARGV[3]) end
 redis.call('SET', KEYS[1], tostring(next_total), 'KEEPTTL')
 if redis.call('TTL', KEYS[1]) < 0 then
   redis.call('EXPIRE', KEYS[1], 86400)
+end
+if op_id ~= '' then
+  redis.call('HDEL', KEYS[2], op_id)
 end
 return 1
 """
@@ -114,12 +146,25 @@ return 1
 # release, so regular completions could keep the "daily" total from ever
 # resetting.
 _RELEASE_SPEND_LUA = """
-local delta = -tonumber(ARGV[1])
-local next_total = tonumber(redis.call('GET', KEYS[1]) or '0') + delta
+local amount = tonumber(ARGV[1])
+local op_id = ARGV[2]
+if op_id ~= '' then
+  -- Retry-safe: releasing an operation whose reservation is already gone is a
+  -- no-op, so a lost response cannot subtract the hold twice.
+  local existing = redis.call('HGET', KEYS[2], op_id)
+  if not existing then
+    return 0
+  end
+  amount = tonumber(existing)
+end
+local next_total = tonumber(redis.call('GET', KEYS[1]) or '0') - amount
 if next_total < 0 then next_total = 0 end
 redis.call('SET', KEYS[1], tostring(next_total), 'KEEPTTL')
 if redis.call('TTL', KEYS[1]) < 0 then
   redis.call('EXPIRE', KEYS[1], 86400)
+end
+if op_id ~= '' then
+  redis.call('HDEL', KEYS[2], op_id)
 end
 return 1
 """
@@ -253,6 +298,8 @@ class InMemoryStorage(BaseStorage):
         self._concurrency_slots: set[str] = set()
         self._daily_spend_usd = 0.0
         self._spend_window_started = time.time()
+        # Per-operation reservations, so a moved retry cannot double-charge.
+        self._spend_reservations: Dict[str, float] = {}
 
     def _evict_if_needed(self):
         # Evict oldest terminal operations first, and never evict queued/running
@@ -401,6 +448,7 @@ class InMemoryStorage(BaseStorage):
         now = time.time()
         if now - self._spend_window_started >= 86400:
             self._daily_spend_usd = 0.0
+            self._spend_reservations.clear()
             self._spend_window_started = now
 
     async def add_daily_spend(self, amount_usd: float) -> None:
@@ -411,20 +459,34 @@ class InMemoryStorage(BaseStorage):
         self._reset_spend_window_if_needed()
         return self._daily_spend_usd
 
-    async def reserve_daily_spend(self, amount_usd: float, limit_usd: float) -> bool:
+    async def reserve_daily_spend(self, amount_usd: float, limit_usd: float, op_id: str = "") -> bool:
         self._reset_spend_window_if_needed()
+        if op_id and op_id in self._spend_reservations:
+            return True
         if self._daily_spend_usd + amount_usd > limit_usd:
             return False
         self._daily_spend_usd += float(amount_usd)
+        if op_id:
+            self._spend_reservations[op_id] = float(amount_usd)
         return True
 
-    async def release_daily_spend(self, amount_usd: float) -> None:
+    async def release_daily_spend(self, amount_usd: float, op_id: str = "") -> None:
         self._reset_spend_window_if_needed()
-        self._daily_spend_usd = max(0.0, self._daily_spend_usd - float(amount_usd))
+        amount = float(amount_usd)
+        if op_id:
+            if op_id not in self._spend_reservations:
+                return
+            amount = self._spend_reservations.pop(op_id)
+        self._daily_spend_usd = max(0.0, self._daily_spend_usd - amount)
 
-    async def reconcile_daily_spend(self, reserved_usd: float, actual_usd: float, limit_usd: float) -> None:
+    async def reconcile_daily_spend(self, reserved_usd: float, actual_usd: float, limit_usd: float, op_id: str = "") -> None:
         self._reset_spend_window_if_needed()
-        reconciled = self._daily_spend_usd - float(reserved_usd) + float(actual_usd)
+        reserved = float(reserved_usd)
+        if op_id:
+            if op_id not in self._spend_reservations:
+                return
+            reserved = self._spend_reservations.pop(op_id)
+        reconciled = self._daily_spend_usd - reserved + float(actual_usd)
         self._daily_spend_usd = max(0.0, min(float(limit_usd), reconciled))
 
 class RedisStorage(BaseStorage):
@@ -582,32 +644,45 @@ class RedisStorage(BaseStorage):
         value = await self.redis.get("research:spend:daily")
         return float(value) if value else 0.0
 
-    async def reserve_daily_spend(self, amount_usd: float, limit_usd: float) -> bool:
+    async def reserve_daily_spend(self, amount_usd: float, limit_usd: float, op_id: str = "") -> bool:
         if self.degraded:
-            return await self.fallback.reserve_daily_spend(amount_usd, limit_usd)
+            return await self.fallback.reserve_daily_spend(amount_usd, limit_usd, op_id)
         reserved = await self.redis.eval(
-            _RESERVE_SPEND_LUA, 1, "research:spend:daily", float(amount_usd), float(limit_usd)
+            _RESERVE_SPEND_LUA,
+            2,
+            "research:spend:daily",
+            "research:spend:reservations",
+            float(amount_usd),
+            float(limit_usd),
+            op_id,
         )
         return bool(reserved)
 
-    async def release_daily_spend(self, amount_usd: float) -> None:
+    async def release_daily_spend(self, amount_usd: float, op_id: str = "") -> None:
         if self.degraded:
-            return await self.fallback.release_daily_spend(amount_usd)
-        await self.redis.eval(_RELEASE_SPEND_LUA, 1, "research:spend:daily", float(amount_usd))
+            return await self.fallback.release_daily_spend(amount_usd, op_id)
+        await self.redis.eval(
+            _RELEASE_SPEND_LUA, 2, "research:spend:daily", "research:spend:reservations",
+            float(amount_usd), op_id,
+        )
 
-    async def reconcile_daily_spend(self, reserved_usd: float, actual_usd: float, limit_usd: float) -> None:
+    async def reconcile_daily_spend(self, reserved_usd: float, actual_usd: float, limit_usd: float, op_id: str = "") -> None:
         if self.degraded:
-            return await self.fallback.reconcile_daily_spend(reserved_usd, actual_usd, limit_usd)
+            return await self.fallback.reconcile_daily_spend(reserved_usd, actual_usd, limit_usd, op_id)
         # Single atomic swap: drop the reservation and add the observed cost so
         # the freed capacity is never briefly visible to another replica, and
-        # clamp to the ceiling so a large actual cost cannot overspend.
+        # clamp to the ceiling so a large actual cost cannot overspend. Keyed by
+        # op_id, so a retried reconciliation after a lost response cannot charge
+        # the completed operation twice or release its hold without charging.
         await self.redis.eval(
             _RECONCILE_SPEND_LUA,
-            1,
+            2,
             "research:spend:daily",
+            "research:spend:reservations",
             float(reserved_usd),
             float(actual_usd),
             float(limit_usd),
+            op_id,
         )
 
     async def mark_stale_operations(self):
@@ -656,16 +731,16 @@ class RedisStorage(BaseStorage):
         if self.degraded:
             return await self.fallback.acquire_concurrency_slot(op_id)
         # Each slot is an individual sorted-set member carrying its own expiry.
-        # The Lua script reclaims expired members fist and admits the new slot
+        # The Lua script reclaims expired members first and admits the new slot
         # only below the ceiling, so a crashed instance frees its own slot and a
-        # single shared TTL can neither over-admit nor pin a leaked count.
-        now = time.time()
+        # single shared TTL can neither over-admit nor pin a leaked count. The
+        # expiry timestamp comes from Redis TIME, so a replica with a skewed
+        # clock cannot reap live peers' slots or create already-expired ones.
         member = self.instance.lease_id(op_id)
         acquired = await self.redis.eval(
             _ACQUIRE_SLOT_LUA,
             1,
             "research:concurrency:slots",
-            now,
             settings.CONCURRENCY_LEASE_TTL_SECONDS,
             settings.MAX_CONCURRENT_OPS,
             member,
@@ -709,7 +784,6 @@ class RedisStorage(BaseStorage):
             self.instance.instance_id,
             slot_key,
             settings.CONCURRENCY_LEASE_TTL_SECONDS,
-            time.time(),
         )
         if result == 0:
             logger.warning("Ownership lease for operation %s was lost; heartbeat cannot renew it.", op_id)

@@ -58,3 +58,12 @@ def test_explicit_reserve_may_exceed_daily_limit(monkeypatch, tmp_path):
     monkeypatch.setenv("DEFAULT_OPERATION_COST_RESERVE_USD", "0.50")
     settings = Settings(_env_file=tmp_path / "missing.env")
     assert settings.DAILY_SPEND_LIMIT_USD == 0.10
+
+
+def test_reconcile_interval_must_be_shorter_than_lease_ttl(monkeypatch, tmp_path):
+    import pytest
+
+    monkeypatch.setenv("STALE_RECONCILE_INTERVAL_SECONDS", "3600")
+    monkeypatch.setenv("CONCURRENCY_LEASE_TTL_SECONDS", "3600")
+    with pytest.raises(Exception):
+        Settings(_env_file=tmp_path / "missing.env")

@@ -11,7 +11,7 @@ from app.storage import storage
 from app.schemas import ResearchRequestInput, ResearchResultResponse, CapabilitiesInfo
 from app.cancellation import cancellation_manager
 from app.progress_adapter import ProgressReporter
-from app.researcher_adapter import conduct_web_research, schedule_outcome_ingest
+from app.researcher_adapter import conduct_web_research, _LeaseLostError, schedule_outcome_ingest
 from app.security import is_safe_url
 from app.metrics import observed_result_cost, observe_research_result, record_operation_spend
 
@@ -133,13 +133,23 @@ async def background_research_task(req: ResearchRequestInput, reporter: Progress
         observe_research_result(result)
         # Reconcile the admission reservation to the observed cost in one
         # atomic step, so another replica cannot reserve the temporarily freed
-        # capacity in between.
+        # capacity in between. Isolated from the result path: a transient
+        # accounting failure must not overwrite the completed result with a
+        # failure, and the operation is left fail-closed (spend_reconciled stays
+        # True) so the finally block does not release the hold and undercharge.
         actual = observed_result_cost(result)
         if spend_reserved:
-            await storage.reconcile_daily_spend(spend_reserved, actual, settings.DAILY_SPEND_LIMIT_USD)
-            spend_reconciled = True
+            try:
+                await storage.reconcile_daily_spend(spend_reserved, actual, settings.DAILY_SPEND_LIMIT_USD, op_id)
+                spend_reconciled = True
+            except Exception:
+                spend_reconciled = True
+                logger.warning("Failed to reconcile spend for operation %s; retaining the reservation.", op_id, exc_info=True)
         else:
-            await record_operation_spend(storage, result)
+            try:
+                await record_operation_spend(storage, result)
+            except Exception:
+                logger.warning("Failed to record observed spend for operation %s.", op_id, exc_info=True)
         # Only after the result is durable may the optional Brain outcome ingest
         # be scheduled; otherwise Brain could record a completed/partial outcome
         # for a result that was never stored.
@@ -161,6 +171,10 @@ async def background_research_task(req: ResearchRequestInput, reporter: Progress
         observe_research_result(cancelled_state)
         await reporter.report("cancelled", "Research task cancelled.")
 
+    except _LeaseLostError:
+        # Ownership was lost mid-run: skip persistence so this worker cannot
+        # overwrite the terminal state reconciliation (or the new owner) wrote.
+        logger.warning("Operation %s lost its ownership lease; not persisting a failed state.", op_id)
     except Exception:
         logger.exception("Execution failed for operation %s", op_id)
         failed_state = {
@@ -181,17 +195,27 @@ async def background_research_task(req: ResearchRequestInput, reporter: Progress
         await reporter.report("failed", "Research task failed. Check server logs for redacted diagnostics.")
 
     finally:
-        # Charge the real cost above on success; on cancel/failure release the
-        # admission hold so it does not permanently consume the daily budget.
-        # A budget-release failure must not skip lease/slot cleanup below.
+        # Cleanup steps are independent: a failure in one (for example a
+        # transient Redis error releasing the spend hold) must not skip the
+        # others, or the owner lease and concurrency slot would stay pinned for
+        # the full lease TTL and the task would leak in the local registry.
         if spend_reserved and not spend_reconciled:
             try:
-                await storage.release_daily_spend(spend_reserved)
+                await storage.release_daily_spend(spend_reserved, op_id)
             except Exception:
                 logger.warning("Failed to release spend hold for operation %s.", op_id, exc_info=True)
-        cancellation_manager.unregister_task(op_id)
-        await storage.release_operation_lease(op_id)
-        await storage.release_concurrency_slot(op_id)
+        try:
+            cancellation_manager.unregister_task(op_id)
+        except Exception:
+            logger.warning("Failed to unregister task for operation %s.", op_id, exc_info=True)
+        try:
+            await storage.release_operation_lease(op_id)
+        except Exception:
+            logger.warning("Failed to release owner lease for operation %s.", op_id, exc_info=True)
+        try:
+            await storage.release_concurrency_slot(op_id)
+        except Exception:
+            logger.warning("Failed to release concurrency slot for operation %s.", op_id, exc_info=True)
 
 @router.post("/v1/research", status_code=status.HTTP_202_ACCEPTED)
 async def start_research(
@@ -267,7 +291,7 @@ async def start_research(
             if req.limits and req.limits.maximumModelCostUsd is not None
             else settings.DEFAULT_OPERATION_COST_RESERVE_USD
         )
-        if not await storage.reserve_daily_spend(reserve_amount, settings.DAILY_SPEND_LIMIT_USD):
+        if not await storage.reserve_daily_spend(reserve_amount, settings.DAILY_SPEND_LIMIT_USD, req.operationId):
             raise HTTPException(
                 status_code=429,
                 detail="Daily spend limit reached. New research operations are paused until the limit resets."
@@ -311,7 +335,7 @@ async def start_research(
             await storage.release_concurrency_slot(req.operationId)
         if spend_reserved:
             try:
-                await storage.release_daily_spend(spend_reserved)
+                await storage.release_daily_spend(spend_reserved, req.operationId)
             except Exception:
                 logger.warning("Failed to release admission spend hold during rollback.", exc_info=True)
         raise e
@@ -356,7 +380,7 @@ async def start_research(
                 await storage.release_concurrency_slot(req.operationId)
             if spend_reserved:
                 try:
-                    await storage.release_daily_spend(spend_reserved)
+                    await storage.release_daily_spend(spend_reserved, req.operationId)
                 except Exception:
                     logger.warning("Failed to release admission spend hold during rollback.", exc_info=True)
         raise e

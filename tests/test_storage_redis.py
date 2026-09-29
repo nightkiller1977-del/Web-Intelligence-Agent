@@ -375,3 +375,50 @@ async def test_redis_stale_scan_only_walks_active_operations(redis_storage):
     await redis_storage.mark_stale_operations()
 
     assert (await redis_storage.get_operation("op-history"))["status"] == "completed"
+
+
+@pytest.mark.anyio
+async def test_redis_reconcile_spend_is_retry_safe(redis_storage):
+    assert await redis_storage.reserve_daily_spend(4.0, 50.0, "op-retry") is True
+    await redis_storage.reconcile_daily_spend(4.0, 1.5, 50.0, "op-retry")
+    assert await redis_storage.get_daily_spend() == 1.5
+
+    # A retried reconciliation (for example after a lost response) must not
+    # subtract or charge the completed operation a second time.
+    await redis_storage.reconcile_daily_spend(4.0, 1.5, 50.0, "op-retry")
+    assert await redis_storage.get_daily_spend() == 1.5
+
+
+@pytest.mark.anyio
+async def test_redis_reserve_spend_is_idempotent_per_operation(redis_storage):
+    assert await redis_storage.reserve_daily_spend(4.0, 50.0, "op-once") is True
+    # A retried admission reservation for the same operation must not double.
+    assert await redis_storage.reserve_daily_spend(4.0, 50.0, "op-once") is True
+    assert await redis_storage.get_daily_spend() == 4.0
+
+    # A release after reconciliation (reservation already consumed) is a no-op.
+    await redis_storage.reconcile_daily_spend(4.0, 2.0, 50.0, "op-once")
+    await redis_storage.release_daily_spend(4.0, "op-once")
+    assert await redis_storage.get_daily_spend() == 2.0
+
+
+@pytest.mark.anyio
+async def test_redis_slot_expiry_uses_server_time(redis_storage, monkeypatch):
+    monkeypatch.setattr(settings, "MAX_CONCURRENT_OPS", 1)
+    monkeypatch.setattr(settings, "CONCURRENCY_LEASE_TTL_SECONDS", 3600)
+    # Slot expiry must be derived from Redis server TIME rather than the
+    # application clock, so replicas with skewed clocks share one timebase. The
+    # stored score is therefore near server time (plus the TTL), not the
+    # application's own time.time().
+    monkeypatch.setattr("app.storage.time.time", lambda: 10_000_000_000.0)
+    assert await redis_storage.acquire_concurrency_slot("op-skew-a") is True
+    assert await redis_storage.acquire_concurrency_slot("op-skew-b") is False
+
+    server_now = await redis_storage.redis.execute_command("TIME")
+    server_ts = float(server_now[0]) + float(server_now[1]) / 1_000_000
+    score = float(
+        await redis_storage.redis.zscore(
+            "research:concurrency:slots", redis_storage.instance.lease_id("op-skew-a")
+        )
+    )
+    assert abs(score - (server_ts + 3600)) < 60

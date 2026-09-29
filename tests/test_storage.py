@@ -177,3 +177,16 @@ def test_inmemory_stale_scan_preserves_live_owned_operations():
         assert storage.operations["op-orphan"]["status"] == "failed"
 
     asyncio.run(run())
+
+
+def test_inmemory_spend_reconciliation_is_retry_safe():
+    async def run():
+        storage = InMemoryStorage()
+        assert await storage.reserve_daily_spend(4.0, 50.0, "op-a") is True
+        await storage.reconcile_daily_spend(4.0, 1.5, 50.0, "op-a")
+        assert await storage.get_daily_spend() == 1.5
+        # A retried reconciliation must not charge or release twice.
+        await storage.reconcile_daily_spend(4.0, 1.5, 50.0, "op-a")
+        assert await storage.get_daily_spend() == 1.5
+
+    asyncio.run(run())
