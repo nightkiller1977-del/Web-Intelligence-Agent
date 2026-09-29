@@ -898,3 +898,19 @@ async def test_conduct_web_research_marks_degraded_with_no_sources(monkeypatch):
 
     assert result["degraded"] is True
     assert any("No source-backed evidence" in reason for reason in result["degradedReasons"])
+
+
+def test_url_less_passage_is_not_attributed_to_an_unrelated_source():
+    sources = [
+        {"id": "src-op-2-0", "url": "https://example.com/a", "title": "A", "retrievedAt": 1, "sourceType": "web"},
+        {"id": "src-op-2-1", "url": "https://example.com/b", "title": "B", "retrievedAt": 1, "sourceType": "web"},
+    ]
+    # A context passage with no locator cannot be traced to either source.
+    passage_records = [
+        {"url": "", "title": "Research context", "text": "An untraceable passage that should not be pinned to a source."}
+    ]
+
+    evidence, _, citations = build_structured_findings_from_passages("op-2", passage_records, sources)
+
+    assert evidence == []
+    assert all(citation["evidenceIds"] == [] for citation in citations)

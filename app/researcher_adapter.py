@@ -237,9 +237,16 @@ def build_structured_findings_from_passages(op_id: str, passage_records: list[di
     for record in passage_records:
         if len(evidence) >= maximum_items:
             break
-        source = source_by_url.get(record.get("url")) or default_source
-        if not source:
-            continue
+        source = source_by_url.get(record.get("url"))
+        if source is None:
+            # A passage whose URL is absent or not a known source cannot be
+            # attributed. Only adopt the single-source fallback when there is
+            # exactly one candidate, so a passage is never pinned to an
+            # unrelated source it cannot be traced to.
+            if len(sources) == 1 and not record.get("url"):
+                source = default_source
+            else:
+                continue
         for passage in select_passages(record.get("text", "")):
             if len(evidence) >= maximum_items:
                 break

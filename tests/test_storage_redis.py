@@ -337,7 +337,7 @@ async def test_redis_reconcile_spend_preserves_window_ttl(redis_storage):
     assert await redis_storage.reserve_daily_spend(4.0, 50.0) is True
     ttl_before = await redis_storage.redis.ttl("research:spend:daily")
 
-    await redis_storage.reconcile_daily_spend(4.0, 1.5)
+    await redis_storage.reconcile_daily_spend(4.0, 1.5, 50.0)
 
     assert await redis_storage.get_daily_spend() == 1.5
     # Releasing/reconciling must not reset the daily window to a fresh 24h.

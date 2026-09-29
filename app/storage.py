@@ -100,6 +100,7 @@ _RECONCILE_SPEND_LUA = """
 local total = tonumber(redis.call('GET', KEYS[1]) or '0')
 local next_total = total - tonumber(ARGV[1]) + tonumber(ARGV[2])
 if next_total < 0 then next_total = 0 end
+if next_total > tonumber(ARGV[3]) then next_total = tonumber(ARGV[3]) end
 redis.call('SET', KEYS[1], tostring(next_total), 'KEEPTTL')
 if redis.call('TTL', KEYS[1]) < 0 then
   redis.call('EXPIRE', KEYS[1], 86400)
@@ -227,8 +228,10 @@ class BaseStorage:
         """Give back a reservation (or reconcile it to the observed cost)."""
         raise NotImplementedError()
 
-    async def reconcile_daily_spend(self, reserved_usd: float, actual_usd: float) -> None:
-        """Atomically replace a reservation with the observed cost."""
+    async def reconcile_daily_spend(self, reserved_usd: float, actual_usd: float, limit_usd: float) -> None:
+        """Atomically replace a reservation with the observed cost, clamped to
+        the daily ceiling so a large actual cost cannot push the shared total
+        past the limit and silently overspend."""
         raise NotImplementedError()
 
 class InMemoryStorage(BaseStorage):
@@ -419,9 +422,10 @@ class InMemoryStorage(BaseStorage):
         self._reset_spend_window_if_needed()
         self._daily_spend_usd = max(0.0, self._daily_spend_usd - float(amount_usd))
 
-    async def reconcile_daily_spend(self, reserved_usd: float, actual_usd: float) -> None:
+    async def reconcile_daily_spend(self, reserved_usd: float, actual_usd: float, limit_usd: float) -> None:
         self._reset_spend_window_if_needed()
-        self._daily_spend_usd = max(0.0, self._daily_spend_usd - float(reserved_usd) + float(actual_usd))
+        reconciled = self._daily_spend_usd - float(reserved_usd) + float(actual_usd)
+        self._daily_spend_usd = max(0.0, min(float(limit_usd), reconciled))
 
 class RedisStorage(BaseStorage):
     def __init__(self):
@@ -583,17 +587,19 @@ class RedisStorage(BaseStorage):
             return await self.fallback.release_daily_spend(amount_usd)
         await self.redis.eval(_RELEASE_SPEND_LUA, 1, "research:spend:daily", float(amount_usd))
 
-    async def reconcile_daily_spend(self, reserved_usd: float, actual_usd: float) -> None:
+    async def reconcile_daily_spend(self, reserved_usd: float, actual_usd: float, limit_usd: float) -> None:
         if self.degraded:
-            return await self.fallback.reconcile_daily_spend(reserved_usd, actual_usd)
+            return await self.fallback.reconcile_daily_spend(reserved_usd, actual_usd, limit_usd)
         # Single atomic swap: drop the reservation and add the observed cost so
-        # the freed capacity is never briefly visible to another replica.
+        # the freed capacity is never briefly visible to another replica, and
+        # clamp to the ceiling so a large actual cost cannot overspend.
         await self.redis.eval(
             _RECONCILE_SPEND_LUA,
             1,
             "research:spend:daily",
             float(reserved_usd),
             float(actual_usd),
+            float(limit_usd),
         )
 
     async def mark_stale_operations(self):

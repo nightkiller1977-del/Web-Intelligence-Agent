@@ -136,7 +136,7 @@ async def background_research_task(req: ResearchRequestInput, reporter: Progress
         # capacity in between.
         actual = observed_result_cost(result)
         if spend_reserved:
-            await storage.reconcile_daily_spend(spend_reserved, actual)
+            await storage.reconcile_daily_spend(spend_reserved, actual, settings.DAILY_SPEND_LIMIT_USD)
             spend_reconciled = True
         else:
             await record_operation_spend(storage, result)
