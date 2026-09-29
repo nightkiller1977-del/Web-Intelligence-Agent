@@ -36,6 +36,7 @@ async def lifespan(app: FastAPI):
         logger.error("Refusing to start: %s", exc)
         raise
     await storage.mark_stale_operations()
+    redis_client = getattr(storage, "redis", None)
 
     async def reconcile_stale_operations():
         # A replacement replica usually runs the startup scan before the
@@ -49,8 +50,12 @@ async def lifespan(app: FastAPI):
             except Exception:
                 logger.warning("Periodic stale-operation reconciliation failed; will retry.", exc_info=True)
 
-    reconcile_task = asyncio.create_task(reconcile_stale_operations())
-    redis_client = getattr(storage, "redis", None)
+    # Recurring reconciliation is only meaningful for lease-aware (Redis)
+    # storage. With the single-process in-memory backend the startup scan is
+    # the only valid reconciliation point, so do not run a periodic one.
+    reconcile_task = None
+    if redis_client and not getattr(storage, "degraded", False):
+        reconcile_task = asyncio.create_task(reconcile_stale_operations())
     if redis_client and not getattr(storage, "degraded", False):
         await cancellation_manager.init(redis_client)
     emit_observability(
@@ -59,11 +64,12 @@ async def lifespan(app: FastAPI):
         redis_enabled=bool(redis_client),
     )
     yield
-    reconcile_task.cancel()
-    try:
-        await reconcile_task
-    except asyncio.CancelledError:
-        pass
+    if reconcile_task is not None:
+        reconcile_task.cancel()
+        try:
+            await reconcile_task
+        except asyncio.CancelledError:
+            pass
     # Quiesce in-flight research first: a research task that finished after the
     # ingest snapshot below would schedule an untracked ingest into a closing
     # loop. Cancel/await active tasks, then drain the ingests they produced.

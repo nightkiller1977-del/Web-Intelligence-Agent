@@ -60,14 +60,50 @@ if redis.call('GET', KEYS[1]) == ARGV[1] then
 end
 return 0
 """
-_CAE_LUA = """
-if redis.call('GET', KEYS[1]) == ARGV[1] then
-  return redis.call('EXPIRE', KEYS[1], tonumber(ARGV[2]))
+
+# Atomic heartbeat: extend the ownership lease only if we still own it, and
+# renew this operation's own concurrency slot only if that slot still exists.
+# Returns 1 when both were renewed, 0 when we no longer own the lease, and -1
+# when ownership is valid but the slot was already reaped (lost).
+_RENEW_LUA = """
+if redis.call('GET', KEYS[1]) ~= ARGV[1] then
+  return 0
 end
-return 0
+redis.call('EXPIRE', KEYS[1], tonumber(ARGV[3]))
+if redis.call('ZSCORE', KEYS[2], ARGV[2]) then
+  redis.call('ZADD', KEYS[2], tonumber(ARGV[4]) + tonumber(ARGV[3]), ARGV[2])
+  return 1
+end
+return -1
 """
 
+# Atomic budget reservation: admit only if the shared total plus this
+# operation's estimate stays within the ceiling, then reserve it in one step.
+# Prevents concurrent replicas from all passing a non-atomic read-then-admit.
+_RESERVE_SPEND_LUA = """
+local total = tonumber(redis.call('GET', KEYS[1]) or '0')
+if total + tonumber(ARGV[1]) > tonumber(ARGV[2]) then
+  return 0
+end
+redis.call('INCRBYFLOAT', KEYS[1], ARGV[1])
+if redis.call('TTL', KEYS[1]) < 0 then
+  redis.call('EXPIRE', KEYS[1], 86400)
+end
+return 1
+"""
 
+# Atomic budget release: give back a reservation (or reconcile a reservation
+# down to the actual observed cost).
+_RELEASE_SPEND_LUA = """
+local total = tonumber(redis.call('GET', KEYS[1]) or '0')
+local next_total = total - tonumber(ARGV[1])
+if next_total < 0 then next_total = 0 end
+redis.call('SET', KEYS[1], tostring(next_total))
+if redis.call('TTL', KEYS[1]) < 0 then
+  redis.call('EXPIRE', KEYS[1], 86400)
+end
+return 1
+"""
 class StorageUnavailable(RuntimeError):
     """Raised at startup when a required durable backend cannot be reached.
 
@@ -163,6 +199,14 @@ class BaseStorage:
 
     async def get_daily_spend(self) -> float:
         """Return the shared daily spend estimate, or 0 when unavailable."""
+        raise NotImplementedError()
+
+    async def reserve_daily_spend(self, amount_usd: float, limit_usd: float) -> bool:
+        """Atomically reserve budget if total+amount stays within limit."""
+        raise NotImplementedError()
+
+    async def release_daily_spend(self, amount_usd: float) -> None:
+        """Give back a reservation (or reconcile it to the observed cost)."""
         raise NotImplementedError()
 
 class InMemoryStorage(BaseStorage):
@@ -288,9 +332,12 @@ class InMemoryStorage(BaseStorage):
 
     async def mark_stale_operations(self):
         # Single-process backend: every queued/running operation belongs to this
-        # process, so anything still live at startup was abandoned by a restart.
+        # process, so anything still live and unowned at startup was abandoned
+        # by a restart. Operations with a live in-process owner are preserved:
+        # unlike Redis there is no cross-instance lease to consult, so a
+        # recurring scan must not fail work this same process is still running.
         for op_id, op in list(self.operations.items()):
-            if op.get("status") in ("queued", "running"):
+            if op.get("status") in ("queued", "running") and op_id not in self.operation_owners:
                 op["status"] = "failed"
                 op["error"] = {"code": "STALE_OPERATION", "message": "Operation was abandoned after a service restart.", "retryable": True}
                 logger.warning("Marked stale operation %s as failed", op_id)
@@ -338,6 +385,17 @@ class InMemoryStorage(BaseStorage):
     async def get_daily_spend(self) -> float:
         self._reset_spend_window_if_needed()
         return self._daily_spend_usd
+
+    async def reserve_daily_spend(self, amount_usd: float, limit_usd: float) -> bool:
+        self._reset_spend_window_if_needed()
+        if self._daily_spend_usd + amount_usd > limit_usd:
+            return False
+        self._daily_spend_usd += float(amount_usd)
+        return True
+
+    async def release_daily_spend(self, amount_usd: float) -> None:
+        self._reset_spend_window_if_needed()
+        self._daily_spend_usd = max(0.0, self._daily_spend_usd - float(amount_usd))
 
 class RedisStorage(BaseStorage):
     def __init__(self):
@@ -486,6 +544,19 @@ class RedisStorage(BaseStorage):
         value = await self.redis.get("research:spend:daily")
         return float(value) if value else 0.0
 
+    async def reserve_daily_spend(self, amount_usd: float, limit_usd: float) -> bool:
+        if self.degraded:
+            return await self.fallback.reserve_daily_spend(amount_usd, limit_usd)
+        reserved = await self.redis.eval(
+            _RESERVE_SPEND_LUA, 1, "research:spend:daily", float(amount_usd), float(limit_usd)
+        )
+        return bool(reserved)
+
+    async def release_daily_spend(self, amount_usd: float) -> None:
+        if self.degraded:
+            return await self.fallback.release_daily_spend(amount_usd)
+        await self.redis.eval(_RELEASE_SPEND_LUA, 1, "research:spend:daily", float(amount_usd))
+
     async def mark_stale_operations(self):
         if self.degraded:
             return await self.fallback.mark_stale_operations()
@@ -557,24 +628,23 @@ class RedisStorage(BaseStorage):
         if self.degraded:
             return await self.fallback.touch_operation(op_id)
         owner_key = f"research:owners:{op_id}"
-        # Atomic compare-and-expire: only extend a lease we still own.
-        await self.redis.eval(
-            _CAE_LUA, 1, owner_key, self.instance.instance_id, settings.CONCURRENCY_LEASE_TTL_SECONDS
-        )
-        # Renew this operation's own concurrency slot in lockstep with its
-        # heartbeat. Without this a run longer than the lease TTL would have
-        # its still-active slot reaped as expired by the next admission,
-        # exceeding MAX_CONCURRENT_OPS.
         slot_key = self.instance.lease_id(op_id)
-        slots_key = "research:concurrency:slots"
-        if await self.redis.zscore(slots_key, slot_key) is None:
-            # The slot was reclaimed while we were still active (for example a
-            # longer-than-TTL pause between heartbeats). Surface it and re-reserve
-            # rather than silently running unbounded.
-            logger.warning("Concurrency slot for operation %s was lost; re-reserving.", op_id)
-        await self.redis.zadd(
-            slots_key, {slot_key: time.time() + settings.CONCURRENCY_LEASE_TTL_SECONDS}
+        # Renew the ownership lease and this operation's own slot atomically.
+        # The old slot is renewed only if it still exists, so a delayed
+        # heartbeat cannot resurrect a reaped slot and push the set above
+        # MAX_CONCURRENT_OPS.
+        result = await self.redis.eval(
+            _RENEW_LUA,
+            2,
+            owner_key,
+            "research:concurrency:slots",
+            self.instance.instance_id,
+            slot_key,
+            settings.CONCURRENCY_LEASE_TTL_SECONDS,
+            time.time(),
         )
+        if result == -1:
+            logger.warning("Concurrency slot for operation %s was lost and will not be re-reserved.", op_id)
 
     async def release_operation_lease(self, op_id: str) -> None:
         if self.degraded:

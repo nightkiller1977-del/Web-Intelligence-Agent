@@ -101,8 +101,9 @@ async def capabilities():
         }
     }
 
-async def background_research_task(req: ResearchRequestInput, reporter: ProgressReporter, headers: dict):
+async def background_research_task(req: ResearchRequestInput, reporter: ProgressReporter, headers: dict, spend_reserved: float = 0.0):
     op_id = req.operationId
+    spend_reconciled = False
 
     try:
         # Ownership was claimed at admission time (before any queued state was
@@ -130,6 +131,11 @@ async def background_research_task(req: ResearchRequestInput, reporter: Progress
         # Save output result
         await storage.save_operation(op_id, result)
         observe_research_result(result)
+        # Reconcile the admission reservation to the observed cost: release the
+        # hold, then charge the actual estimate.
+        if spend_reserved:
+            await storage.release_daily_spend(spend_reserved)
+            spend_reconciled = True
         await record_operation_spend(storage, result)
         # Only after the result is durable may the optional Brain outcome ingest
         # be scheduled; otherwise Brain could record a completed/partial outcome
@@ -172,6 +178,10 @@ async def background_research_task(req: ResearchRequestInput, reporter: Progress
         await reporter.report("failed", "Research task failed. Check server logs for redacted diagnostics.")
 
     finally:
+        # Charge the real cost above on success; on cancel/failure release the
+        # admission hold so it does not permanently consume the daily budget.
+        if spend_reserved and not spend_reconciled:
+            await storage.release_daily_spend(spend_reserved)
         cancellation_manager.unregister_task(op_id)
         await storage.release_operation_lease(op_id)
         await storage.release_concurrency_slot(op_id)
@@ -186,6 +196,7 @@ async def start_research(
     claimed_operation_id = False
     slot_reserved = False
     operation_owned = False
+    spend_reserved = 0.0
 
     lookup_key = idempotency_key or req.idempotencyKey
     if not lookup_key:
@@ -238,16 +249,28 @@ async def start_research(
             return {"operationId": existing_op_id, "status": op_state.get("status") if op_state else "unknown"}
         claimed_lookup_key = lookup_key
 
-        # 3b. Enforce the configured daily spend ceiling for new work. Placed
-        # after the idempotency-hit return so a retry of already-accepted work
-        # still resolves to its existing operation. The shared total is
-        # authoritative across replicas; the process-local estimate is a
-        # stricter local floor.
-        if spend_limit_exceeded() or await storage.get_daily_spend() >= settings.DAILY_SPEND_LIMIT_USD:
+        # 3b. Atomically reserve budget for this new operation. The check-and-
+        # reserve happens in one step so concurrent replicas cannot all pass a
+        # non-atomic read-then-admit and collectively exceed the ceiling. The
+        # reservation is reconciled to the observed cost on completion, or
+        # released on cancel/failure. Placed after the idempotency-hit return
+        # so a retry of already-accepted work still resolves to its operation.
+        if spend_limit_exceeded():
             raise HTTPException(
                 status_code=429,
                 detail="Daily spend limit reached. New research operations are paused until the limit resets."
             )
+        reserve_amount = (
+            req.limits.maximumModelCostUsd
+            if req.limits and req.limits.maximumModelCostUsd is not None
+            else settings.DEFAULT_OPERATION_COST_RESERVE_USD
+        )
+        if not await storage.reserve_daily_spend(reserve_amount, settings.DAILY_SPEND_LIMIT_USD):
+            raise HTTPException(
+                status_code=429,
+                detail="Daily spend limit reached. New research operations are paused until the limit resets."
+            )
+        spend_reserved = reserve_amount
 
         operation_claimed = await storage.claim_operation_id(req.operationId, lookup_key)
         if not operation_claimed:
@@ -284,6 +307,8 @@ async def start_research(
             await storage.release_idempotency_key(claimed_lookup_key, req.operationId)
         if slot_reserved:
             await storage.release_concurrency_slot(req.operationId)
+        if spend_reserved:
+            await storage.release_daily_spend(spend_reserved)
         raise e
 
     op_id = req.operationId
@@ -311,7 +336,7 @@ async def start_research(
         await reporter.report("planning", "Request received. Research task queued.")
 
         # Spawn research execution task in background
-        task = asyncio.create_task(background_research_task(req, reporter, headers))
+        task = asyncio.create_task(background_research_task(req, reporter, headers, spend_reserved))
         cancellation_manager.register_task(op_id, task)
         task_started = True
     except Exception as e:

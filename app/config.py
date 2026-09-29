@@ -32,6 +32,13 @@ class Settings(BaseSettings):
     MAX_CONCURRENT_OPS: int = int(os.getenv("MAX_CONCURRENT_OPS", 3))
     MAX_MEMORY_MB: int = int(os.getenv("MAX_MEMORY_MB", 512))
     DAILY_SPEND_LIMIT_USD: float = float(os.getenv("DAILY_SPEND_LIMIT_USD", 50.0))
+    # Conservative per-operation budget reserved at admission, before the real
+    # cost is known. Reservation makes the daily ceiling atomic across
+    # replicas; it is released and reconciled to the observed cost on
+    # completion, or released outright on cancel/failure.
+    DEFAULT_OPERATION_COST_RESERVE_USD: float = float(
+        os.getenv("DEFAULT_OPERATION_COST_RESERVE_USD", 0.25)
+    )
 
     # Durability
     # When redis storage is selected but the backend is unreachable, refuse to

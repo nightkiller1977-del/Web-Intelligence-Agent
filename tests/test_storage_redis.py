@@ -308,3 +308,25 @@ async def test_redis_shared_daily_spend_is_shared_and_expiring(redis_storage):
     assert await peer.get_daily_spend() == 2.5
     # The window key must carry a TTL so the total resets without a local timer.
     assert await redis_storage.redis.ttl("research:spend:daily") > 0
+
+
+@pytest.mark.anyio
+async def test_redis_renew_does_not_resurrect_reaped_slot(redis_storage):
+    assert await redis_storage.acquire_concurrency_slot("op-reap") is True
+    # Simulate the slot being reaped as expired (e.g. by another admission).
+    await redis_storage.redis.zrem("research:concurrency:slots", redis_storage.instance.lease_id("op-reap"))
+
+    await redis_storage.touch_operation("op-reap")
+
+    # The heartbeat must not recreate a slot that was already reclaimed.
+    assert await redis_storage.redis.zscore("research:concurrency:slots", redis_storage.instance.lease_id("op-reap")) is None
+
+
+@pytest.mark.anyio
+async def test_redis_reserve_daily_spend_is_atomic(redis_storage):
+    assert await redis_storage.reserve_daily_spend(4.0, 5.0) is True
+    # Concurrent replicas must not both pass a check that would cross the limit.
+    assert await redis_storage.reserve_daily_spend(4.0, 5.0) is False
+    assert await redis_storage.get_daily_spend() == 4.0
+    await redis_storage.release_daily_spend(4.0)
+    assert await redis_storage.get_daily_spend() == 0.0

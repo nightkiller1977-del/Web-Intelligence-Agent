@@ -932,6 +932,12 @@ async def _run_research(env_manager, callbacks, reporter, op_id, query, display_
             for citation in citations:
                 citation["claimIds"] = []
             claims = verify_claims_against_evidence(op_id, report_text, evidence, citations) or claims
+            # Local evidence is now in play. If it re-verified claims against
+            # real source-linked evidence, the earlier "no passage text" web
+            # fallback no longer describes the final result, so drop it to
+            # avoid contradicting the appended evidence and citations.
+            if inferred_fallback and any(citation.get("evidenceIds") for citation in citations):
+                inferred_fallback = False
 
         degraded_reasons = []
         if search_budget_exhausted():

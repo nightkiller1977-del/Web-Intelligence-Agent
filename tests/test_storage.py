@@ -147,3 +147,33 @@ def test_inmemory_begin_operation_is_exclusive():
         assert await storage.begin_operation("op-excl") is True
 
     asyncio.run(run())
+
+
+def test_inmemory_reserve_daily_spend_enforces_ceiling_atomically():
+    async def run():
+        storage = InMemoryStorage()
+        assert await storage.reserve_daily_spend(4.0, 5.0) is True
+        # Second reservation would cross the ceiling and must be rejected.
+        assert await storage.reserve_daily_spend(4.0, 5.0) is False
+        assert await storage.get_daily_spend() == 4.0
+        # Releasing the hold frees budget again for a later operation.
+        await storage.release_daily_spend(4.0)
+        assert await storage.get_daily_spend() == 0.0
+
+    asyncio.run(run())
+
+
+def test_inmemory_stale_scan_preserves_live_owned_operations():
+    async def run():
+        storage = InMemoryStorage()
+        await storage.save_operation("op-live", {"status": "running"})
+        await storage.begin_operation("op-live")
+        await storage.save_operation("op-orphan", {"status": "queued"})
+
+        await storage.mark_stale_operations()
+
+        # A recurring scan must not fail work this process still owns.
+        assert storage.operations["op-live"]["status"] == "running"
+        assert storage.operations["op-orphan"]["status"] == "failed"
+
+    asyncio.run(run())
