@@ -1,10 +1,7 @@
 # app/metrics.py
 import logging
-import time
 
 from prometheus_client import Counter, Histogram
-
-from app.config import settings
 
 logger = logging.getLogger("web-intelligence")
 
@@ -34,41 +31,16 @@ research_cost_tokens = Counter(
     ["agent_profile", "token_type"]
 )
 
-_daily_spend_usd = 0.0
-_spend_window_started = time.time()
-
-
-def _reset_spend_window_if_needed():
-    global _daily_spend_usd, _spend_window_started
-    now = time.time()
-    if now - _spend_window_started >= 86400:
-        _daily_spend_usd = 0.0
-        _spend_window_started = now
-
-
 def estimate_tokens(text: str) -> int:
     if not text:
         return 0
     return max(1, len(text.split()) * 4 // 3)
 
 def track_operation_cost(agent_profile: str, output_tokens: int):
-    global _daily_spend_usd
-
-    _reset_spend_window_if_needed()
-
-    # Rough default estimate: $10 per 1M output tokens.
-    output_rate = 0.000010
-    cost = output_tokens * output_rate
-
+    # Cost enforcement lives entirely in the shared, atomic reservation in
+    # storage. A process-local counter here would reset on restart and grant
+    # every replica a separate allowance, so only the metric is recorded.
     research_cost_tokens.labels(agent_profile=agent_profile, token_type="output").inc(output_tokens)
-    _daily_spend_usd += cost
-
-    if _daily_spend_usd > settings.DAILY_SPEND_LIMIT_USD:
-        logger.warning(
-            "Daily web intelligence spend estimate exceeded limit: current=$%.2f limit=$%.2f",
-            _daily_spend_usd,
-            settings.DAILY_SPEND_LIMIT_USD
-        )
 
 def observed_result_cost(result: dict) -> float:
     """Estimated spend for a completed result, falling back to a text estimate."""

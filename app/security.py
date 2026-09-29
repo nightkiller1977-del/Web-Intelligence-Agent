@@ -232,6 +232,13 @@ def _active_search_budget() -> dict | None:
 # same domain as their API, so the host alone is not enough to decide redaction.
 _PROVIDER_API_PATH_PREFIXES = ("/v1/", "/v1beta/", "/v1internal/", "/api/v1/")
 
+# Per-provider machine endpoints on mixed content domains. SerpApi's search API
+# lives at /search.json, which the generic versioned-API prefixes above do not
+# match, so list it explicitly rather than falling back to the public page rule.
+_MIXED_PROVIDER_API_PATHS = {
+    "serpapi.com": ("/search", "/account", "/locations"),
+}
+
 
 def _is_provider_api_url(url: str) -> bool:
     """True when url targets a model provider's API host the service itself calls.
@@ -262,7 +269,12 @@ def is_provider_host(url: str) -> bool:
         return False
     if _match_domain(hostname, _MIXED_PROVIDER_DOMAINS):
         path = urlparse(str(url)).path or ""
-        return any(path.startswith(prefix) for prefix in _PROVIDER_API_PATH_PREFIXES)
+        if any(path.startswith(prefix) for prefix in _PROVIDER_API_PATH_PREFIXES):
+            return True
+        for domain, extra_prefixes in _MIXED_PROVIDER_API_PATHS.items():
+            if _match_domain(hostname, (domain,)) and any(path.startswith(pfx) for pfx in extra_prefixes):
+                return True
+        return False
     return True
 
 

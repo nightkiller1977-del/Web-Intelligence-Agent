@@ -422,3 +422,50 @@ async def test_redis_slot_expiry_uses_server_time(redis_storage, monkeypatch):
         )
     )
     assert abs(score - (server_ts + 3600)) < 60
+
+
+@pytest.mark.anyio
+async def test_redis_stale_window_reservation_is_not_subtracted(redis_storage):
+    # Reserve in the current window, then simulate the window rolling over: the
+    # old hold must be dropped without touching the new window's total, or it
+    # would erase another operation's fresh reservation.
+    assert await redis_storage.reserve_daily_spend(4.0, 50.0, "op-old-window") is True
+    await redis_storage.redis.set("research:spend:window", "9999999999.0")
+    await redis_storage.redis.set("research:spend:daily", "4.0", keepttl=True)
+
+    await redis_storage.reconcile_daily_spend(4.0, 1.5, 50.0, "op-old-window")
+    assert await redis_storage.get_daily_spend() == 4.0
+
+    # The stale reservation entry is dropped so a later release is also a no-op.
+    await redis_storage.release_daily_spend(4.0, "op-old-window")
+    assert await redis_storage.get_daily_spend() == 4.0
+
+
+@pytest.mark.anyio
+async def test_redis_reservations_hash_carries_expiry(redis_storage):
+    assert await redis_storage.reserve_daily_spend(4.0, 50.0, "op-ttl") is True
+    ttl = await redis_storage.redis.ttl("research:spend:reservations")
+    assert 0 < ttl <= 86400
+
+
+@pytest.mark.anyio
+async def test_redis_save_operation_tracks_active_index(redis_storage):
+    await redis_storage.save_operation("op-active", {"status": "running"})
+    assert "op-active" in await redis_storage.redis.smembers("research:active_ops")
+
+    await redis_storage.save_operation("op-active", {"status": "completed"})
+    assert "op-active" not in await redis_storage.redis.smembers("research:active_ops")
+
+
+@pytest.mark.anyio
+async def test_redis_stale_scan_backfills_preindex_active_operations(redis_storage):
+    # Simulate a pre-index record written by an older version: only the
+    # operations hash holds it, and it has no live owner.
+    await redis_storage.redis.hset(
+        "research:operations", "op-legacy", json.dumps({"status": "running"})
+    )
+    assert "op-legacy" not in await redis_storage.redis.smembers("research:active_ops")
+
+    await redis_storage.mark_stale_operations()
+
+    assert (await redis_storage.get_operation("op-legacy"))["status"] == "failed"

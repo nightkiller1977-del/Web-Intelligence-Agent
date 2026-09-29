@@ -6,6 +6,12 @@ from pydantic import AliasChoices, Field, model_validator
 from pydantic_settings import BaseSettings
 from pydantic_settings import SettingsConfigDict
 
+# Minimum ownership-lease TTL. The heartbeat renews once per second, so a lease
+# must comfortably exceed that cadence to survive normal scheduling/network
+# jitter without being treated as lost.
+MIN_CONCURRENCY_LEASE_TTL_SECONDS = 30
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="allow")
 
@@ -56,8 +62,13 @@ class Settings(BaseSettings):
     def _validate_operational_limits(self):
         # These settings gate leases and reconciliation loops; non-positive
         # values would make Redis SET ... EX fail or create a tight scan loop.
-        if self.CONCURRENCY_LEASE_TTL_SECONDS <= 0:
-            raise ValueError("CONCURRENCY_LEASE_TTL_SECONDS must be a positive integer.")
+        if self.CONCURRENCY_LEASE_TTL_SECONDS < MIN_CONCURRENCY_LEASE_TTL_SECONDS:
+            # The ownership heartbeat runs on a fixed one-second cadence, so a
+            # lease shorter than this margin expires between heartbeats and
+            # aborts healthy operations as lease-lost.
+            raise ValueError(
+                f"CONCURRENCY_LEASE_TTL_SECONDS must be at least {MIN_CONCURRENCY_LEASE_TTL_SECONDS} seconds."
+            )
         if self.STALE_RECONCILE_INTERVAL_SECONDS <= 0:
             raise ValueError("STALE_RECONCILE_INTERVAL_SECONDS must be a positive integer.")
         if self.DAILY_SPEND_LIMIT_USD <= 0:

@@ -34,6 +34,19 @@ redis.call('ZADD', KEYS[1], now + tonumber(ARGV[1]), ARGV[3])
 return 1
 """
 
+# Atomic save of an operation together with its active-index membership, so a
+# crash between the state write and the index update cannot leave a queued/
+# running record the reconciliation scan never discovers.
+_SAVE_OPERATION_LUA = """
+redis.call('HSET', KEYS[1], ARGV[1], ARGV[2])
+if ARGV[3] == '1' then
+  redis.call('SADD', KEYS[2], ARGV[1])
+else
+  redis.call('SREM', KEYS[2], ARGV[1])
+end
+return 1
+"""
+
 # Atomic stale transition: only fail the operation if no live owner lease
 # exists AND the stored operation is still queued/running. The state recheck
 # closes the snapshot race where a worker completes and releases its lease
@@ -90,24 +103,40 @@ _RESERVE_SPEND_LUA = """
 local total = tonumber(redis.call('GET', KEYS[1]) or '0')
 local amount = tonumber(ARGV[1])
 local op_id = ARGV[3]
+local t = redis.call('TIME')
+local now = tonumber(t[1]) + tonumber(t[2]) / 1000000
+-- The window marker identifies the current daily window. It is created with the
+-- total and expires with it, so a reservation made in an earlier window can be
+-- recognized and never subtracted from a later window's total.
+local win = redis.call('GET', KEYS[3])
+if redis.call('TTL', KEYS[1]) < 0 then
+  win = tostring(now)
+  redis.call('SET', KEYS[3], win, 'EX', 86400)
+  redis.call('SET', KEYS[1], redis.call('GET', KEYS[1]) or '0', 'EX', 86400)
+elseif not win then
+  win = tostring(now)
+  redis.call('SET', KEYS[3], win, 'EX', redis.call('TTL', KEYS[1]))
+end
 if op_id ~= '' then
-  -- Idempotent: a retry of the same operation must not reserve twice.
-  if redis.call('HEXISTS', KEYS[2], op_id) == 1 then
-    return 1
+  local existing = redis.call('HGET', KEYS[2], op_id)
+  if existing then
+    -- Idempotent within the same window: a retry must not reserve twice. A
+    -- hold from an earlier window is stale and is replaced below.
+    local sep = string.find(existing, ':', 1, true)
+    if string.sub(existing, sep + 1) == win then
+      return 1
+    end
   end
 end
 if total + amount > tonumber(ARGV[2]) then
   return 0
 end
 redis.call('INCRBYFLOAT', KEYS[1], ARGV[1])
-if redis.call('TTL', KEYS[1]) < 0 then
-  redis.call('EXPIRE', KEYS[1], 86400)
-end
-if redis.call('TTL', KEYS[2]) < 0 then
-  redis.call('EXPIRE', KEYS[2], 86400)
-end
 if op_id ~= '' then
-  redis.call('HSET', KEYS[2], op_id, ARGV[1])
+  -- Create the entry before expiring the hash, otherwise the first reservation
+  -- on a fresh database leaves an unexpiring hash behind.
+  redis.call('HSET', KEYS[2], op_id, ARGV[1] .. ':' .. win)
+  redis.call('EXPIRE', KEYS[2], 86400)
 end
 return 1
 """
@@ -125,7 +154,14 @@ if op_id ~= '' then
   if not existing then
     return 0
   end
-  reserved = tonumber(existing)
+  local sep = string.find(existing, ':', 1, true)
+  reserved = tonumber(string.sub(existing, 1, sep - 1))
+  -- A hold from an earlier window must not be subtracted from the current
+  -- window's total (the old total is already gone); just drop it.
+  if redis.call('GET', KEYS[3]) ~= string.sub(existing, sep + 1) then
+    redis.call('HDEL', KEYS[2], op_id)
+    return 0
+  end
 end
 local next_total = total - reserved + tonumber(ARGV[2])
 if next_total < 0 then next_total = 0 end
@@ -155,7 +191,14 @@ if op_id ~= '' then
   if not existing then
     return 0
   end
-  amount = tonumber(existing)
+  local sep = string.find(existing, ':', 1, true)
+  amount = tonumber(string.sub(existing, 1, sep - 1))
+  -- A hold from an earlier window is stale: drop it without touching the
+  -- current window's total, which no longer contains that reservation.
+  if redis.call('GET', KEYS[3]) ~= string.sub(existing, sep + 1) then
+    redis.call('HDEL', KEYS[2], op_id)
+    return 0
+  end
 end
 local next_total = tonumber(redis.call('GET', KEYS[1]) or '0') - amount
 if next_total < 0 then next_total = 0 end
@@ -523,14 +566,19 @@ class RedisStorage(BaseStorage):
         existing = await self.get_operation(op_id)
         new_data = dict(existing) if existing else {}
         new_data.update(data)
-        await self.redis.hset("research:operations", op_id, json.dumps(new_data))
-        # Track queued/running operations in a bounded index so recurring
-        # reconciliation scans only active work instead of every retained
-        # (potentially large) historical result.
-        if new_data.get("status") in ("queued", "running"):
-            await self.redis.sadd("research:active_ops", op_id)
-        else:
-            await self.redis.srem("research:active_ops", op_id)
+        # Persist the state and its active-index membership in one atomic step.
+        # A crash between the two would otherwise leave a queued/running record
+        # that the reconciliation index never scans, stuck forever.
+        is_active = "1" if new_data.get("status") in ("queued", "running") else "0"
+        await self.redis.eval(
+            _SAVE_OPERATION_LUA,
+            2,
+            "research:operations",
+            "research:active_ops",
+            op_id,
+            json.dumps(new_data),
+            is_active,
+        )
 
     async def get_operation(self, op_id: str) -> Optional[Dict[str, Any]]:
         if self.degraded:
@@ -649,9 +697,10 @@ class RedisStorage(BaseStorage):
             return await self.fallback.reserve_daily_spend(amount_usd, limit_usd, op_id)
         reserved = await self.redis.eval(
             _RESERVE_SPEND_LUA,
-            2,
+            3,
             "research:spend:daily",
             "research:spend:reservations",
+            "research:spend:window",
             float(amount_usd),
             float(limit_usd),
             op_id,
@@ -662,8 +711,8 @@ class RedisStorage(BaseStorage):
         if self.degraded:
             return await self.fallback.release_daily_spend(amount_usd, op_id)
         await self.redis.eval(
-            _RELEASE_SPEND_LUA, 2, "research:spend:daily", "research:spend:reservations",
-            float(amount_usd), op_id,
+            _RELEASE_SPEND_LUA, 3, "research:spend:daily", "research:spend:reservations",
+            "research:spend:window", float(amount_usd), op_id,
         )
 
     async def reconcile_daily_spend(self, reserved_usd: float, actual_usd: float, limit_usd: float, op_id: str = "") -> None:
@@ -676,9 +725,10 @@ class RedisStorage(BaseStorage):
         # the completed operation twice or release its hold without charging.
         await self.redis.eval(
             _RECONCILE_SPEND_LUA,
-            2,
+            3,
             "research:spend:daily",
             "research:spend:reservations",
+            "research:spend:window",
             float(reserved_usd),
             float(actual_usd),
             float(limit_usd),
@@ -696,6 +746,14 @@ class RedisStorage(BaseStorage):
         # every retained (possibly large) result, so recurring reconciliation
         # does not become an unbounded transfer/parse of historical reports.
         active_op_ids = await self.redis.smembers("research:active_ops")
+        # One-time compatibility backfill: queued/running records written before
+        # the active index existed are only in research:operations. Without this
+        # they would never be scanned and could stay nonterminal forever.
+        if await self.redis.set("research:active_ops:backfilled", "1", nx=True, ex=86400):
+            for op_id, op in (await self.list_operations()).items():
+                if op.get("status") in ("queued", "running"):
+                    await self.redis.sadd("research:active_ops", op_id)
+                    active_op_ids.add(op_id)
         if not active_op_ids:
             return
         ops = {}

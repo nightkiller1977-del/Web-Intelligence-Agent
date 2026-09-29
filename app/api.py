@@ -101,6 +101,39 @@ async def capabilities():
         }
     }
 
+async def _rollback_admission(
+    operation_id: str,
+    lookup_key: str,
+    claimed_lookup_key: bool,
+    claimed_operation_id: bool,
+    slot_reserved: bool,
+    operation_owned: bool,
+    spend_reserved: float,
+) -> None:
+    """Release admission state after a failed request.
+
+    Each release is isolated so one transient backend error cannot skip the
+    others and pin a concurrency slot, owner lease, idempotency claim, or budget
+    hold for the full lease/window TTL.
+    """
+    async def _run(label: str, coro_factory):
+        try:
+            await coro_factory()
+        except Exception:
+            logger.warning("Failed to %s for operation %s during rollback.", label, operation_id, exc_info=True)
+
+    if operation_owned:
+        await _run("release owner lease", lambda: storage.release_operation_lease(operation_id))
+    if claimed_operation_id:
+        await _run("release operation claim", lambda: storage.release_operation_id(operation_id, lookup_key))
+    if claimed_lookup_key:
+        await _run("release idempotency key", lambda: storage.release_idempotency_key(lookup_key, operation_id))
+    if slot_reserved:
+        await _run("release concurrency slot", lambda: storage.release_concurrency_slot(operation_id))
+    if spend_reserved:
+        await _run("release spend hold", lambda: storage.release_daily_spend(spend_reserved, operation_id))
+
+
 async def background_research_task(req: ResearchRequestInput, reporter: ProgressReporter, headers: dict, spend_reserved: float = 0.0):
     op_id = req.operationId
     spend_reconciled = False
@@ -325,19 +358,10 @@ async def start_research(
         operation_owned = True
     except Exception as e:
         # Rollback reserved slot if validation fails
-        if operation_owned:
-            await storage.release_operation_lease(req.operationId)
-        if claimed_operation_id:
-            await storage.release_operation_id(req.operationId, lookup_key)
-        if claimed_lookup_key:
-            await storage.release_idempotency_key(claimed_lookup_key, req.operationId)
-        if slot_reserved:
-            await storage.release_concurrency_slot(req.operationId)
-        if spend_reserved:
-            try:
-                await storage.release_daily_spend(spend_reserved, req.operationId)
-            except Exception:
-                logger.warning("Failed to release admission spend hold during rollback.", exc_info=True)
+        await _rollback_admission(
+            req.operationId, lookup_key, claimed_lookup_key,
+            claimed_operation_id, slot_reserved, operation_owned, spend_reserved,
+        )
         raise e
 
     op_id = req.operationId
@@ -370,19 +394,10 @@ async def start_research(
         task_started = True
     except Exception as e:
         if not task_started:
-            if operation_owned:
-                await storage.release_operation_lease(req.operationId)
-            if claimed_operation_id:
-                await storage.release_operation_id(req.operationId, lookup_key)
-            if claimed_lookup_key:
-                await storage.release_idempotency_key(claimed_lookup_key, req.operationId)
-            if slot_reserved:
-                await storage.release_concurrency_slot(req.operationId)
-            if spend_reserved:
-                try:
-                    await storage.release_daily_spend(spend_reserved, req.operationId)
-                except Exception:
-                    logger.warning("Failed to release admission spend hold during rollback.", exc_info=True)
+            await _rollback_admission(
+                req.operationId, lookup_key, claimed_lookup_key,
+                claimed_operation_id, slot_reserved, operation_owned, spend_reserved,
+            )
         raise e
 
     return {"operationId": op_id, "status": "queued"}

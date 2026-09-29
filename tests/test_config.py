@@ -67,3 +67,11 @@ def test_reconcile_interval_must_be_shorter_than_lease_ttl(monkeypatch, tmp_path
     monkeypatch.setenv("CONCURRENCY_LEASE_TTL_SECONDS", "3600")
     with pytest.raises(Exception):
         Settings(_env_file=tmp_path / "missing.env")
+
+
+def test_lease_ttl_below_heartbeat_margin_is_rejected(monkeypatch, tmp_path):
+    import pytest
+
+    monkeypatch.setenv("CONCURRENCY_LEASE_TTL_SECONDS", "1")
+    with pytest.raises(Exception):
+        Settings(_env_file=tmp_path / "missing.env")
