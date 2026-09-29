@@ -13,7 +13,7 @@ from app.cancellation import cancellation_manager
 from app.progress_adapter import ProgressReporter
 from app.researcher_adapter import conduct_web_research, schedule_outcome_ingest
 from app.security import is_safe_url
-from app.metrics import observed_result_cost, observe_research_result, record_operation_spend, spend_limit_exceeded
+from app.metrics import observed_result_cost, observe_research_result, record_operation_spend
 
 logger = logging.getLogger("web-intelligence")
 router = APIRouter()
@@ -262,11 +262,6 @@ async def start_research(
         # reservation is reconciled to the observed cost on completion, or
         # released on cancel/failure. Placed after the idempotency-hit return
         # so a retry of already-accepted work still resolves to its operation.
-        if spend_limit_exceeded():
-            raise HTTPException(
-                status_code=429,
-                detail="Daily spend limit reached. New research operations are paused until the limit resets."
-            )
         reserve_amount = (
             req.limits.maximumModelCostUsd
             if req.limits and req.limits.maximumModelCostUsd is not None

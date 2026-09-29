@@ -965,13 +965,13 @@ async def _run_research(env_manager, callbacks, reporter, op_id, query, display_
             for citation in citations:
                 citation["claimIds"] = []
             claims = verify_claims_against_evidence(op_id, report_text, evidence, citations) or claims
-            # Local evidence is now in play. If it re-verified claims against
-            # real source-linked evidence, the earlier "no passage text" web
-            # fallback no longer describes the final result, so drop it to
-            # avoid contradicting the appended evidence and citations.
-            if inferred_fallback and any(
-                claim.get("verificationStatus") == "supported" for claim in claims
-            ):
+            # Local evidence is now in play. If any final claim is linked to
+            # real evidence (supported, partially-supported, or conflicting),
+            # the earlier "no passage text / unattributed" web fallback no
+            # longer describes the final result, so recompute it after the
+            # post-input verification pass instead of relying on the pre-input
+            # state or on only the highest support score.
+            if inferred_fallback and any(claim.get("evidenceIds") for claim in claims):
                 inferred_fallback = False
 
         degraded_reasons = []

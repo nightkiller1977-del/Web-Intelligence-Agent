@@ -352,3 +352,26 @@ async def test_redis_heartbeat_reports_lost_ownership(redis_storage):
     # Simulate another instance taking over the lease.
     await redis_storage.redis.delete("research:owners:op-hb")
     assert await redis_storage.touch_operation("op-hb") is False
+
+
+@pytest.mark.anyio
+async def test_redis_active_index_is_maintained_by_state(redis_storage):
+    await redis_storage.save_operation("op-active", {"status": "queued"})
+    assert bool(await redis_storage.redis.sismember("research:active_ops", "op-active")) is True
+
+    await redis_storage.save_operation("op-active", {"status": "completed", "answer": "done"})
+    # A terminal transition drops the index membership so reconciliation does
+    # not keep scanning finished work.
+    assert bool(await redis_storage.redis.sismember("research:active_ops", "op-active")) is False
+
+
+@pytest.mark.anyio
+async def test_redis_stale_scan_only_walks_active_operations(redis_storage):
+    # A completed historical operation is not in the active index, so the scan
+    # never transfers or parses it.
+    await redis_storage.save_operation("op-history", {"status": "completed", "answer": "x" * 1000})
+    await redis_storage.redis.srem("research:active_ops", "op-history")
+
+    await redis_storage.mark_stale_operations()
+
+    assert (await redis_storage.get_operation("op-history"))["status"] == "completed"

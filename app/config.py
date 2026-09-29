@@ -66,6 +66,19 @@ class Settings(BaseSettings):
             # A zero reserve would make every admission reservation a no-op, so
             # concurrent operations would bypass the daily ceiling entirely.
             raise ValueError("DEFAULT_OPERATION_COST_RESERVE_USD must be positive.")
+        if (
+            self.DEFAULT_OPERATION_COST_RESERVE_USD > self.DAILY_SPEND_LIMIT_USD
+            and "DEFAULT_OPERATION_COST_RESERVE_USD" not in self.model_fields_set
+        ):
+            # The documented default reserve exceeds the configured ceiling, so
+            # every operator-facing request without a smaller explicit
+            # maximumModelCostUsd would be rejected. Fail clearly at startup
+            # (only when the reserve was left at its default) instead of
+            # appearing healthy while refusing all normal work.
+            raise ValueError(
+                "DEFAULT_OPERATION_COST_RESERVE_USD exceeds DAILY_SPEND_LIMIT_USD; "
+                "increase the daily limit or lower the per-operation reserve."
+            )
         return self
 
     # Local input ingestion

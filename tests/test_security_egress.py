@@ -151,3 +151,16 @@ def test_direct_socket_connect_private_ip_still_blocked_under_profiled_egress():
                 sock.connect(("10.0.0.1", 80))
         finally:
             sock.close()
+
+
+def test_provider_redaction_allows_public_pages_on_provider_domains():
+    from app.security import is_provider_host
+
+    # Public documentation pages are not API endpoints and must not be redacted.
+    assert is_provider_host("https://openrouter.ai/docs/quickstart") is False
+    assert is_provider_host("https://serpapi.com/blog/how-it-works") is False
+    # Machine API endpoints on the same domains/machine hosts are redacted.
+    assert is_provider_host("https://api.openai.com/v1/chat/completions") is True
+    assert is_provider_host("https://openrouter.ai/api/v1/models") is True
+    assert is_provider_host("https://api.tavily.com/search") is True
+    assert is_provider_host("https://google.serper.dev/search") is True

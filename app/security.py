@@ -227,15 +227,43 @@ def _active_search_budget() -> dict | None:
         logger.error("SSRF egress guard found overlapping search budgets; failing closed")
         return {"remaining": 0}
 
+# Path prefixes that mark a provider-owned API surface rather than a public
+# page. Some providers publish documentation and other public content on the
+# same domain as their API, so the host alone is not enough to decide redaction.
+_PROVIDER_API_PATH_PREFIXES = ("/v1/", "/v1beta/", "/v1internal/", "/api/v1/")
+
+
 def _is_provider_api_url(url: str) -> bool:
+    """True when url targets a model provider's API host the service itself calls.
+
+    Used for outbound egress/DNS decisions, where any request to a provider host
+    is treated as the provider API.
+    """
     hostname = _hostname_from_url(str(url))
     return bool(hostname and _match_domain(hostname, PROVIDER_API_HOSTS))
 
 
+# Provider domains that also serve public web content (docs, blogs, marketing
+# pages). On these, only API paths are the service's own endpoints; other pages
+# are legitimate public sources and must not be redacted.
+_MIXED_PROVIDER_DOMAINS = ("openrouter.ai", "serpapi.com")
+
+
 def is_provider_host(url: str) -> bool:
-    """True when url targets a model/search provider endpoint the service owns."""
+    """True when url is one of the service's own provider API endpoints and must
+    not be cited as a public web source.
+
+    A public page hosted on a provider domain (for example a docs page on
+    ``openrouter.ai`` or a help article on ``serpapi.com``) is not an API
+    endpoint and is not redacted; only the machine API surfaces are.
+    """
     hostname = _hostname_from_url(str(url))
-    return bool(hostname and _match_domain(hostname, PROVIDER_HOSTS))
+    if not hostname or not _match_domain(hostname, PROVIDER_HOSTS):
+        return False
+    if _match_domain(hostname, _MIXED_PROVIDER_DOMAINS):
+        path = urlparse(str(url)).path or ""
+        return any(path.startswith(prefix) for prefix in _PROVIDER_API_PATH_PREFIXES)
+    return True
 
 
 def search_budget_exhausted() -> bool:

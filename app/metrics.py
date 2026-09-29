@@ -70,20 +70,6 @@ def track_operation_cost(agent_profile: str, output_tokens: int):
             settings.DAILY_SPEND_LIMIT_USD
         )
 
-def spend_limit_exceeded() -> bool:
-    """True when the process-local estimated daily spend is over the limit.
-
-    Used as a fail-closed gate on accepting new research work. The estimate is
-    per-process and resets on restart, so it complements rather than replaces
-    provider-side budget controls.
-    """
-    _reset_spend_window_if_needed()
-    return _daily_spend_usd >= settings.DAILY_SPEND_LIMIT_USD
-
-def get_accumulated_daily_spend():
-    _reset_spend_window_if_needed()
-    return _daily_spend_usd
-
 def observed_result_cost(result: dict) -> float:
     """Estimated spend for a completed result, falling back to a text estimate."""
     metrics = result.get("metrics") or {}
@@ -96,10 +82,9 @@ def observed_result_cost(result: dict) -> float:
 async def record_operation_spend(storage, result: dict) -> None:
     """Accumulate this result's estimated spend in shared storage.
 
-    The process-local counter behind spend_limit_exceeded() resets on restart,
-    so it alone cannot enforce a service-wide ceiling across replicas. Writing
-    the estimate to the shared backend lets every instance see the same
-    running total.
+    Admission enforcement lives entirely in the shared atomic reservation; this
+    records the observed cost so the shared window stays a faithful running
+    total across replicas.
     """
     metrics = result.get("metrics") or {}
     cost = metrics.get("estimatedModelCostUsd")

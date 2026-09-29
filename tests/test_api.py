@@ -716,8 +716,9 @@ def test_new_operations_rejected_once_daily_spend_limit_reached(monkeypatch):
         return _completed_result(kwargs["op_id"])
 
     monkeypatch.setattr(api, "conduct_web_research", ok_research)
-    # Force the process-local spend gate closed without running real research.
-    monkeypatch.setattr(api, "spend_limit_exceeded", lambda: True)
+    # Drive the authoritative shared ceiling: a limit below the per-operation
+    # reserve makes the atomic admission reservation fail without real research.
+    monkeypatch.setattr(settings, "DAILY_SPEND_LIMIT_USD", 0.01)
 
     with TestClient(app) as client:
         response = client.post(

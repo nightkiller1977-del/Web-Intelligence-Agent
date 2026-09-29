@@ -462,6 +462,13 @@ class RedisStorage(BaseStorage):
         new_data = dict(existing) if existing else {}
         new_data.update(data)
         await self.redis.hset("research:operations", op_id, json.dumps(new_data))
+        # Track queued/running operations in a bounded index so recurring
+        # reconciliation scans only active work instead of every retained
+        # (potentially large) historical result.
+        if new_data.get("status") in ("queued", "running"):
+            await self.redis.sadd("research:active_ops", op_id)
+        else:
+            await self.redis.srem("research:active_ops", op_id)
 
     async def get_operation(self, op_id: str) -> Optional[Dict[str, Any]]:
         if self.degraded:
@@ -479,6 +486,7 @@ class RedisStorage(BaseStorage):
         if self.degraded:
             return await self.fallback.delete_operation(op_id)
         await self.redis.hdel("research:operations", op_id)
+        await self.redis.srem("research:active_ops", op_id)
         await self.redis.delete(f"research:events:{op_id}")
         await self.redis.delete(f"research:operation_claims:{op_id}")
         await self.redis.delete(f"research:owners:{op_id}")
@@ -608,7 +616,18 @@ class RedisStorage(BaseStorage):
         # Multi-instance backend: only fail operations that no live instance
         # still owns. A rolling deploy or a second replica must not overwrite the
         # state of work actively running elsewhere.
-        ops = await self.list_operations()
+        #
+        # Scan only the bounded active-operation index rather than HGETALL over
+        # every retained (possibly large) result, so recurring reconciliation
+        # does not become an unbounded transfer/parse of historical reports.
+        active_op_ids = await self.redis.smembers("research:active_ops")
+        if not active_op_ids:
+            return
+        ops = {}
+        for op_id in active_op_ids:
+            op = await self.get_operation(op_id)
+            if op is not None:
+                ops[op_id] = op
         for op_id, op in ops.items():
             if op.get("status") not in ("queued", "running"):
                 continue
@@ -628,6 +647,7 @@ class RedisStorage(BaseStorage):
                 json.dumps(stale_op),
             )
             if transitioned:
+                await self.redis.srem("research:active_ops", op_id)
                 logger.warning("Marked stale operation %s as failed", op_id)
             else:
                 logger.info("Leaving operation %s running; live owner lease present", op_id)
