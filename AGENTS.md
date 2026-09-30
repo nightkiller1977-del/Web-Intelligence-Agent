@@ -40,12 +40,12 @@ OpenHands skills live under `.agents/skills/`. Claude Code skills live under `.c
 
 ## Pull request review policy
 
-- **Use the AI Commander Code Review Agent for AI-assisted pull-request review**; treat its findings as hypotheses to verify against the current head, source, tests, and deterministic evidence. This is the automated reviewer actually wired in today.
-- OpenHands is the intended long-term replacement for Codex-CLI-based review and is GitHub-blind by design (reviews a scoped local checkout/diff; never gets direct GitHub/secret access — an already-authorized agent or service would post its findings). Today it only has a working review-invocation path as an internal, pre-PR review gate inside `Ai-Command-Center-Desktop-App`'s own self-healing pipeline (ACES-500) — there is no mechanism yet for OpenHands to review an already-opened GitHub PR in this repo. Do not claim to have run an OpenHands PR review until that mechanism exists here; rely on the AI Commander Code Review Agent instead, and do not fall back to requesting GitHub Copilot Code Review.
-- Do **not** request GitHub Copilot Code Review, and do **not** request, invoke, enable, or depend on Codex/OpenAI/ChatGPT pull-request review, including `@codex review`.
-- GitHub Copilot Code Review and the "Codex" GitHub connector (`chatgpt-codex-connector`) are installed integrations that auto-review PRs on open/push independent of this policy — no doc or code change here disables them. Turning them off is a GitHub/OpenAI account-settings action (repo/org Copilot code-review settings; `https://chatgpt.com/codex/cloud/settings/general`; and the app installation under `github.com/settings/installations`), owned by whoever administers those accounts.
-- Historical Copilot, Codex, or other reviewer comments may remain as evidence, but do not trigger new Copilot or Codex review rounds.
-- AI Commander Code Review Agent findings do not replace deterministic merge evidence: required CI, tests, lint, security checks, and repository-specific validation still must pass.
+- OpenHands and the AI Commander Code Review Agent are the only AI reviewers authorized to run automatically on pull requests.
+- OpenHands is the primary automatic reviewer. The AI Commander Code Review Agent is an independent automatic second reviewer using its own deterministic checks and authorized model path.
+- Do not automatically request, invoke, enable, or depend on ChatGPT/Codex, Claude, GitHub Copilot, or any other AI pull-request reviewer.
+- Another named AI reviewer may review a pull request only when Anthony explicitly requests that reviewer for that PR. The request authorizes one independent review of the current head SHA only; later commits require another request.
+- A requested reviewer must inspect the current head, diff, surrounding implementation, and validation evidence itself. It must not copy, repackage, aggregate, or merely endorse OpenHands, Code-Review-Agent, or another review.
+- AI findings are hypotheses. Required CI, tests, lint, security checks, source verification, and repository-specific merge controls remain authoritative.
 
 ## AI Commander ecosystem map and shared infrastructure
 
@@ -85,3 +85,4 @@ OpenHands skills live under `.agents/skills/`. Claude Code skills live under `.c
 3. Preserve local-first behavior: cloud, Render, MongoDB Atlas, and Tailscale outages must degrade explicitly without inventing success.
 4. Treat network reachability, a stored secret, or a model response as capability inputs—not authorization or completion proof.
 5. Record follow-up work in the owning repository/Jira component instead of duplicating the capability locally.
+
