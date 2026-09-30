@@ -19,6 +19,11 @@ from unittest.mock import patch, MagicMock, AsyncMock, MagicMock as MockModule
 # Generate ephemeral test token (randomized per test run for security)
 test_token = os.getenv('WEB_INTELLIGENCE_AUTH_TOKEN', secrets.token_hex(32))
 
+
+def live_operation_ids():
+    run_id = os.getenv("LIVE_TEST_RUN_ID") or secrets.token_hex(8)
+    return f"test-live-{run_id}", f"idem-live-{run_id}"
+
 # Set environment for remote mode testing BEFORE importing app
 os.environ.setdefault('DEPLOYMENT_MODE', 'remote')
 os.environ.setdefault('STORAGE_BACKEND', 'local')  # Use local storage to avoid Redis dependency
@@ -551,6 +556,23 @@ class TestDeploymentEnvironmentVariables:
         assert '--query "properties.fqdn"' in smoke_step
         assert "properties.configuration.ingress.fqdn" not in smoke_step
 
+    def test_live_gate_reuses_the_workflow_run_id_for_retries(self):
+        workflow = Path(__file__).parents[1].joinpath(
+            ".github/workflows/sidecar-tests.yml"
+        ).read_text()
+        live_step = workflow.split("- name: Run live Azure integration tests", 1)[1]
+
+        assert "LIVE_TEST_RUN_ID: ${{ github.run_id }}" in live_step
+
+    def test_live_operation_ids_are_stable_for_a_workflow_run(self, monkeypatch):
+        monkeypatch.setenv("LIVE_TEST_RUN_ID", "123456")
+
+        assert live_operation_ids() == live_operation_ids()
+        assert live_operation_ids() == (
+            "test-live-123456",
+            "idem-live-123456",
+        )
+
 
 class TestContainerRecycle:
     """Test recovery behavior after container recycle (stateless transition)."""
@@ -593,7 +615,6 @@ class TestLiveDeployment:
     @pytest.mark.anyio
     async def test_live_research_workflow(self, service_url):
         """Test end-to-end research workflow on live deployment."""
-        import time
         async with httpx.AsyncClient(timeout=30.0) as client:
             # 1. Get the deployment's test credential.
             token = os.getenv('WEB_INTELLIGENCE_AUTH_TOKEN')
@@ -602,10 +623,11 @@ class TestLiveDeployment:
             headers = {"Authorization": f"Bearer {token}"}
 
             # 2. Submit research query
+            operation_id, idempotency_key = live_operation_ids()
             payload = {
-                "operationId": f"test-live-{int(time.time())}",
-                "attemptId": "live-attempt-1",
-                "idempotencyKey": f"idem-live-{int(time.time())}",
+                "operationId": operation_id,
+                "attemptId": f"attempt-{operation_id}",
+                "idempotencyKey": idempotency_key,
                 "query": "What is the latest version of FastAPI?",
                 "mode": "standard",
                 "profile": "general",

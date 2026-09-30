@@ -239,4 +239,5 @@ jobs:
         run: pytest tests/test_remote_mode.py::TestLiveDeployment -v --tb=short
         timeout-minutes: 5
         env:
+          LIVE_TEST_RUN_ID: ${{ github.run_id }}
           WEB_INTELLIGENCE_AUTH_TOKEN: ${{ secrets.WEB_INTELLIGENCE_AUTH_TOKEN }}
