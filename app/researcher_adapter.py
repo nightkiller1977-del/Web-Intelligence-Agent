@@ -11,8 +11,13 @@ from gpt_researcher import GPTResearcher
 
 from app.progress_adapter import ProgressReporter, GPTResearcherCallbackHandler
 from app.model_adapter import RequestEnvironmentManager
-from app.security import enforce_egress_protection, is_safe_url
-from app.config import settings
+from app.security import PROFILE_DOMAINS, enforce_egress_protection, is_safe_url, is_provider_host, search_budget_exhausted
+from app.config import brain_memory_client, settings
+import app.storage as storage_module
+
+
+class _LeaseLostError(RuntimeError):
+    """Raised internally when this worker no longer owns an operation."""
 
 logger = logging.getLogger("web-intelligence")
 import psutil
@@ -34,6 +39,10 @@ STOP_WORDS = {
     "to", "was", "were", "with"
 }
 NEGATION_TERMS = {"no", "not", "never", "none", "without", "cannot", "can't", "isn't", "wasn't", "won't"}
+# Claims are only emitted for report sentences with enough substance to be
+# meaningful. This is what keeps the report-derived fallback from minting a
+# claim+evidence pair for every trivial fragment.
+MIN_CLAIM_SENTENCE_CHARS = 24
 
 def get_memory_usage_mb() -> float:
     try:
@@ -64,7 +73,15 @@ def trim_to_token_budget(text: str, maximum_tokens: int) -> str:
 
 def split_sentences(text: str) -> list[str]:
     candidates = re.split(r"(?<=[.!?])\s+", text.replace("\n", " ").strip())
-    return [candidate.strip() for candidate in candidates if len(candidate.strip()) >= 24]
+    return [candidate.strip() for candidate in candidates if candidate.strip()]
+
+
+def select_claim_sentences(text: str, maximum: int) -> list[str]:
+    """Substantive report sentences eligible to become claims/evidence."""
+    return [
+        sentence for sentence in split_sentences(text)
+        if len(sentence) >= MIN_CLAIM_SENTENCE_CHARS
+    ][:maximum]
 
 def normalize_source_text(value: Any) -> str:
     if value is None:
@@ -199,7 +216,7 @@ def collect_passage_records(researcher, safe_source_urls: list[str]) -> list[dic
     return records
 
 def select_passages(text: str, maximum_passages: int = 3) -> list[str]:
-    sentences = split_sentences(text)
+    sentences = [sentence for sentence in split_sentences(text) if len(sentence) >= MIN_CLAIM_SENTENCE_CHARS]
     if sentences:
         return sentences[:maximum_passages]
     compact = " ".join(text.split())
@@ -224,9 +241,16 @@ def build_structured_findings_from_passages(op_id: str, passage_records: list[di
     for record in passage_records:
         if len(evidence) >= maximum_items:
             break
-        source = source_by_url.get(record.get("url")) or default_source
-        if not source:
-            continue
+        source = source_by_url.get(record.get("url"))
+        if source is None:
+            # A passage whose URL is absent or not a known source cannot be
+            # attributed. Only adopt the single-source fallback when there is
+            # exactly one candidate, so a passage is never pinned to an
+            # unrelated source it cannot be traced to.
+            if len(sources) == 1 and not record.get("url"):
+                source = default_source
+            else:
+                continue
         for passage in select_passages(record.get("text", "")):
             if len(evidence) >= maximum_items:
                 break
@@ -254,7 +278,7 @@ def verify_claims_against_evidence(op_id: str, report_text: str, evidence: list[
         for evidence_id in citation.get("evidenceIds", []):
             citation_by_evidence[evidence_id] = citation
 
-    for claim_text in split_sentences(report_text)[:maximum_claims]:
+    for claim_text in select_claim_sentences(report_text, maximum_claims):
         best_evidence = None
         best_score = 0.0
         for item in evidence:
@@ -287,49 +311,35 @@ def verify_claims_against_evidence(op_id: str, report_text: str, evidence: list[
     return claims
 
 def build_structured_findings(op_id: str, report_text: str, sources: list[dict], maximum_items: int = 8) -> tuple[list[dict], list[dict], list[dict]]:
-    evidence = []
-    claims = []
-    citations_by_source = {
-        source["id"]: {
+    """Report-derived fallback used only when no source passage text is available.
+
+    A report sentence cannot be attributed to a specific source without passage
+    text, so no evidence is fabricated here. Claims are emitted as ``inferred``
+    with no evidence IDs and citations are left empty. Presenting index-ordered
+    attribution as supporting evidence would overstate provenance for a service
+    whose contract is source-backed evidence.
+    """
+    citations = [
+        {
             "id": f"cite-{op_id}-{idx}",
             "sourceId": source["id"],
             "evidenceIds": [],
             "claimIds": []
         }
         for idx, source in enumerate(sources)
-    }
+    ]
 
-    sentences = split_sentences(report_text)[:maximum_items]
-    for idx, sentence in enumerate(sentences):
-        source = sources[idx % len(sources)] if sources else None
-        evidence_id = f"ev-{op_id}-{idx}"
-        claim_id = f"claim-{op_id}-{idx}"
-
-        if source:
-            evidence.append({
-                "id": evidence_id,
-                "sourceId": source["id"],
-                "passage": sentence,
-                "contentHash": content_hash(sentence),
-                "relevanceScore": 0.8
-            })
-            evidence_ids = [evidence_id]
-            verification_status = "partially-supported"
-            citations_by_source[source["id"]]["evidenceIds"].append(evidence_id)
-            citations_by_source[source["id"]]["claimIds"].append(claim_id)
-        else:
-            evidence_ids = []
-            verification_status = "inferred"
-
+    claims = []
+    for sentence in select_claim_sentences(report_text, maximum_items):
         claims.append({
-            "id": claim_id,
+            "id": f"claim-{op_id}-{len(claims)}",
             "text": sentence,
-            "evidenceIds": evidence_ids,
-            "confidence": 0.7 if evidence_ids else 0.45,
-            "verificationStatus": verification_status
+            "evidenceIds": [],
+            "confidence": 0.4,
+            "verificationStatus": "inferred"
         })
 
-    return evidence, claims, list(citations_by_source.values())
+    return [], claims, citations
 
 def freshness_instruction(freshness: Dict[str, str] | None) -> str:
     if not freshness:
@@ -343,10 +353,39 @@ def freshness_instruction(freshness: Dict[str, str] | None) -> str:
         parts.append(f"prefer sources from the last {freshness['maxAgeDays']} days")
     return "; ".join(parts)
 
+def allowed_input_roots() -> list[Path]:
+    """Configured roots that local document/repository inputs may be read from.
+
+    Local input ingestion reads caller-supplied filesystem paths, so it must be
+    confined to explicitly authorized roots rather than any absolute path.
+    """
+    roots = []
+    for raw in (settings.LOCAL_INPUT_ROOTS or "").split(os.pathsep):
+        raw = raw.strip()
+        if not raw:
+            continue
+        roots.append(Path(raw).expanduser().resolve())
+    return roots
+
+def path_within_allowed_roots(path: Path) -> bool:
+    resolved = path.resolve()
+    for root in allowed_input_roots():
+        if resolved == root or root in resolved.parents:
+            return True
+    return False
+
 def input_text_from_file(path: Path) -> str:
     if settings.DEPLOYMENT_MODE != "local":
         return ""
     path = path.resolve()
+    if not path_within_allowed_roots(path):
+        # Caller-supplied absolute paths can disclose sensitive filenames and
+        # carry newline/control characters, so log only a bounded digest.
+        logger.warning(
+            "Refusing local input path outside LOCAL_INPUT_ROOTS (path hash %s)",
+            hashlib.sha256(str(path).encode()).hexdigest()[:12],
+        )
+        return ""
     if not path.is_file() or path.suffix.lower() not in SUPPORTED_INPUT_EXTENSIONS:
         return ""
     try:
@@ -354,7 +393,9 @@ def input_text_from_file(path: Path) -> str:
             raw = input_file.read(MAX_INPUT_FILE_BYTES)
         return raw.decode("utf-8", errors="replace")
     except OSError:
-        logger.warning("Unable to read input file: %s", path)
+        # Do not log the caller-supplied path: it can disclose sensitive
+        # filenames and carry newline/control characters into the log.
+        logger.warning("Unable to read a declared local input file (suffix %s).", path.suffix)
         return ""
 
 def collect_document_context(documents: list[dict], remaining_chunks: int = MAX_INPUT_CHUNKS) -> list[dict]:
@@ -383,6 +424,12 @@ def collect_repository_context(repositories: list[dict], remaining_chunks: int =
             continue
         root = Path(str(item["path"])).expanduser()
         if not root.is_dir():
+            continue
+        if not path_within_allowed_roots(root):
+            logger.warning(
+                "Refusing repository input outside LOCAL_INPUT_ROOTS (path hash %s)",
+                hashlib.sha256(str(root).encode()).hexdigest()[:12],
+            )
             continue
         visited = 0
         for current_root, dirnames, filenames in os.walk(root):
@@ -443,7 +490,13 @@ def format_input_context_for_query(chunks: list[dict]) -> str:
         sections.append(f"Input: {chunk['label']}\n{chunk['text']}")
     return "\n\n---\n\n".join(sections)
 
-def build_effective_query(query: str, freshness: Dict[str, str] | None, input_chunks: list[dict], allow_external_inputs: bool) -> tuple[str, list[str]]:
+def build_effective_query(
+    query: str,
+    freshness: Dict[str, str] | None,
+    input_chunks: list[dict],
+    allow_external_inputs: bool,
+    raw_inputs: Dict[str, Any] | None = None
+) -> tuple[str, list[str]]:
     additions = []
     limitations = []
     fresh = freshness_instruction(freshness)
@@ -456,6 +509,13 @@ def build_effective_query(query: str, freshness: Dict[str, str] | None, input_ch
             limitations.append("Local inputs were explicitly allowed for external research prompt context.")
         else:
             limitations.append("Local inputs were not sent to external research providers because inputs.allowExternalUse was not true.")
+    elif raw_inputs and (raw_inputs.get("documents") or raw_inputs.get("repositories")):
+        # Inputs were requested but produced no usable chunks (for example a
+        # path outside LOCAL_INPUT_ROOTS). Still report that they were declared,
+        # so the caller is not misled into thinking inputs were honored.
+        limitations.append("Local document/repository inputs were declared but no readable content was available.")
+        if raw_inputs.get("allowExternalUse") is not True:
+            limitations.append("Local inputs were not sent to external research providers because inputs.allowExternalUse was not true.")
     if not additions:
         return query, limitations
     return query + "\n\n" + "\n\n".join(additions), limitations
@@ -466,7 +526,13 @@ def append_input_sources(op_id: str, input_chunks: list[dict], sources: list[dic
         source_type = "repository" if chunk.get("repository") else "document"
         source = {
             "id": source_id,
-            "url": f"file://{chunk['path']}",
+            # url is the HTTP(S) contract field; a local file has no HTTP URL,
+            # so the locator is carried on uri and url stays empty rather than
+            # smuggling a file:// pseudo-URL through an HTTP-shaped field.
+            "url": "",
+            # Path.as_uri() percent-encodes reserved characters and rejects
+            # relative paths, so the locator is a syntactically valid URI.
+            "uri": Path(chunk["path"]).resolve().as_uri(),
             "title": chunk["label"],
             "retrievedAt": int(time.time() * 1000),
             "sourceType": source_type,
@@ -492,6 +558,62 @@ def append_input_sources(op_id: str, input_chunks: list[dict], sources: list[dic
             citation["evidenceIds"].append(evidence_id)
         citations.append(citation)
 
+_pending_ingest_tasks: set = set()
+
+
+def _schedule_outcome_ingest(client, result: Dict[str, Any], op_id: str, mode: str) -> None:
+    """Persist an optional Brain outcome best-effort, off the critical path.
+
+    The task is kept referenced so it is not garbage-collected mid-flight and
+    tracked in ``_pending_ingest_tasks`` so tests and shutdown can await an
+    explicit completion signal.
+    """
+    # Count only claims carrying independently extracted source evidence.
+    # The report-only fallback in build_structured_findings() manufactures
+    # evidence from the generated report itself and labels those claims
+    # "partially-supported", so counting that status would ingest a fabricated
+    # verification success. "supported" against a real passage (or any status
+    # backed by an evidence id) is the independently evidenced shape.
+    verified_claim_count = sum(
+        1 for claim in result.get("claims", [])
+        if claim.get("verificationStatus") == "supported" and claim.get("evidenceIds")
+    )
+    sources = result.get("sources", [])
+    task = asyncio.create_task(asyncio.to_thread(
+        client.ingest_verified_outcome,
+        operation_id=op_id, status=result["status"], mode=mode,
+        source_count=len(sources), verified_claim_count=verified_claim_count,
+        source_types=[source.get("sourceType", "") for source in sources],
+    ))
+    _pending_ingest_tasks.add(task)
+    task.add_done_callback(_pending_ingest_tasks.discard)
+
+
+async def flush_pending_ingest_tasks(timeout: float = 6.0) -> int:
+    """Await best-effort ingestion tasks. Tests and shutdown call this."""
+    pending = [task for task in _pending_ingest_tasks if not task.done()]
+    if not pending:
+        return 0
+    await asyncio.wait(pending, timeout=timeout)
+    return len(pending)
+
+
+def schedule_outcome_ingest(result: Dict[str, Any], op_id: str, mode: str) -> bool:
+    """Schedule the optional Brain outcome ingest once the result is durable.
+
+    Called by the caller after a successful ``storage.save_operation`` so a
+    completed/partial research run is never recorded in Brain unless it was
+    persisted. Returns True only when a task was scheduled.
+    """
+    if result.get("status") not in ("completed", "partial"):
+        return False
+    client = brain_memory_client()
+    if not client:
+        return False
+    _schedule_outcome_ingest(client, result, op_id, mode)
+    return True
+
+
 async def conduct_web_research(
     op_id: str,
     query: str,
@@ -516,10 +638,39 @@ async def conduct_web_research(
     max_sources = limits.get("maximumSources", 10)
     max_memory = limits.get("maximumMemoryMb") or settings.MAX_MEMORY_MB
     query_domains = None
-    if isinstance(source_policy, dict) and isinstance(source_policy.get("allowedDomains"), list):
+    has_explicit_domain_allowlist = (
+        isinstance(source_policy, dict)
+        and isinstance(source_policy.get("allowedDomains"), list)
+    )
+    if has_explicit_domain_allowlist:
         query_domains = source_policy["allowedDomains"]
     input_chunks, allow_external_inputs = collect_input_context(inputs)
-    effective_query, input_limitations = build_effective_query(query, freshness, input_chunks, allow_external_inputs)
+    effective_query, input_limitations = build_effective_query(query, freshness, input_chunks, allow_external_inputs, inputs)
+    memory_client = brain_memory_client()
+    # Recalled evidence has no per-domain provenance filter in the current Brain
+    # contract, so recall is disabled whenever the effective source allowlist is
+    # narrower than "anything the profile permits". That covers both an explicit
+    # sourcePolicy.allowedDomains and any profile that carries its own allowlist
+    # (app/security.py PROFILE_DOMAINS): historical text from a domain the live
+    # search would reject must not reach the report.
+    profile_rules = PROFILE_DOMAINS.get(profile) or {}
+    profile_restricts_domains = bool(profile_rules.get("allowed"))
+    if (
+        memory_client
+        and settings.BRAIN_MEMORY_CONTEXT_ENABLED
+        and not has_explicit_domain_allowlist
+        and not profile_restricts_domains
+    ):
+        remaining = max(0.0, max_duration - (time.time() - start_time))
+        try:
+            historical_context = await asyncio.wait_for(
+                asyncio.to_thread(memory_client.recall_context, query),
+                timeout=min(3.0, remaining),
+            )
+        except (asyncio.TimeoutError, ValueError):
+            historical_context = ""
+        if historical_context:
+            effective_query = f"{effective_query}\n\n{historical_context}"
 
     # Determine gpt-researcher report types based on mode
     report_type = "research_report"
@@ -546,18 +697,22 @@ async def conduct_web_research(
 
     env_manager = RequestEnvironmentManager(headers, model_provider=model_provider, model_name=model_name)
     callbacks = GPTResearcherCallbackHandler(reporter)
+    execution_duration = max(0.0, max_duration - (time.time() - start_time))
+    if execution_duration <= 0:
+        raise TimeoutError("maximumDurationSeconds exhausted before research execution")
 
     with enforce_egress_protection(profile, maximum_searches=max_searches):
-        return await _run_research(
+        result = await _run_research(
             env_manager,
             callbacks,
             reporter,
             op_id,
             effective_query,
+            query,
             mode,
             profile,
             report_type,
-            max_duration,
+            execution_duration,
             max_searches,
             max_pages,
             max_sources,
@@ -570,8 +725,13 @@ async def conduct_web_research(
             input_limitations,
             start_time
         )
+    # Outcome ingestion is intentionally NOT scheduled here. The caller
+    # (app/api.py background_research_task) persists the result durably first
+    # and only then calls schedule_outcome_ingest(), so Brain can never record a
+    # completed/partial outcome for a result that was never durably stored.
+    return result
 
-async def _run_research(env_manager, callbacks, reporter, op_id, query, mode, profile, report_type, max_duration, max_searches, max_pages, max_sources, max_memory, query_domains, limits, require_claim_verification, headers, input_chunks, input_limitations, start_time):
+async def _run_research(env_manager, callbacks, reporter, op_id, query, display_query, mode, profile, report_type, max_duration, max_searches, max_pages, max_sources, max_memory, query_domains, limits, require_claim_verification, headers, input_chunks, input_limitations, start_time):
     with env_manager.apply_keys():
         await callbacks.on_planning("Initializing research configuration...")
 
@@ -594,12 +754,32 @@ async def _run_research(env_manager, callbacks, reporter, op_id, query, mode, pr
 
         research_task = asyncio.current_task()
         memory_cancelled = False
+        lease_lost = False
         client_cancel_event = asyncio.Event()
 
         async def monitor_memory():
-            nonlocal memory_cancelled
+            nonlocal memory_cancelled, lease_lost
             while True:
                 await asyncio.sleep(1.0)
+                # Heartbeat this instance's ownership lease so a peer instance
+                # (or startup reconciliation) can tell the operation is still
+                # live and must not be marked stale.
+                try:
+                    owns = await storage_module.storage.touch_operation(op_id)
+                except Exception:
+                    # A failing heartbeat means we can no longer prove ownership,
+                    # so treat it as lost and fail closed rather than assume the
+                    # lease is still ours.
+                    logger.warning("Heartbeat for operation %s raised; treating ownership as lost.", op_id, exc_info=True)
+                    owns = False
+                if owns is False:
+                    # Ownership or the concurrency slot was lost (e.g. a long
+                    # pause let the lease expire). This is fail-closed: do not
+                    # synthesize or persist a result another worker may own.
+                    logger.warning("Lost ownership of operation %s during heartbeat; aborting research.", op_id)
+                    lease_lost = True
+                    research_task.cancel()
+                    break
                 mem = get_memory_usage_mb()
                 if mem > 0.80 * max_memory:
                     logger.warning("Memory threshold exceeded: %.1fMB / %dMB limit. Triggering early synthesis.", mem, max_memory)
@@ -631,7 +811,7 @@ async def _run_research(env_manager, callbacks, reporter, op_id, query, mode, pr
             await callbacks.on_planning(f"Starting research loop (budget: {max_duration}s)...")
 
             async def run_loop():
-                await callbacks.on_search(query, 1, max(1, max_searches))
+                await callbacks.on_search(display_query, 1, max(1, max_searches))
                 await researcher.conduct_research()
                 raw_urls = researcher.get_source_urls() or []
                 await callbacks.on_read(
@@ -654,6 +834,12 @@ async def _run_research(env_manager, callbacks, reporter, op_id, query, mode, pr
             report_text, status = await bounded_synthesis("duration limit")
 
         except asyncio.CancelledError:
+            if lease_lost:
+                # Fail closed: another worker may own this operation now, so do
+                # not synthesize or persist a competing result.
+                raise _LeaseLostError(
+                    "Operation ownership lease was lost; aborting without writing a result."
+                )
             if memory_cancelled:
                 logger.warning("Research operation %s cancelled due to memory pressure limit.", op_id)
                 await reporter.report("synthesizing", "Memory limit exceeded. Synthesizing partial report.")
@@ -664,8 +850,16 @@ async def _run_research(env_manager, callbacks, reporter, op_id, query, mode, pr
                 raise
 
         except Exception as e:
-            logger.error("Error during research loop execution: %s", e, exc_info=True)
-            raise
+            if search_budget_exhausted():
+                # The run stopped because it used its outbound search allowance.
+                # That is a bounded stop, not an execution fault: synthesize the
+                # partial report the same way duration/memory limits do.
+                logger.warning("Research operation %s exhausted its search budget; synthesizing partial results.", op_id)
+                await reporter.report("synthesizing", "Search budget exhausted. Synthesizing partial results...")
+                report_text, status = await bounded_synthesis("search budget limit")
+            else:
+                logger.error("Error during research loop execution: %s", e, exc_info=True)
+                raise
         finally:
             monitor_task.cancel()
             try:
@@ -689,13 +883,21 @@ async def _run_research(env_manager, callbacks, reporter, op_id, query, mode, pr
 
         # Verify SSRF on each retrieved source before presenting in final result
         safe_sources = []
-        for i, url in enumerate(raw_sources):
-            if i >= max_sources:
+        for url in raw_sources:
+            # Collect up to max_sources *usable* sources: apply the cap after
+            # filtering, otherwise provider/unsafe URLs earlier in the list can
+            # consume the whole budget and strip valid provenance.
+            if len(safe_sources) >= max_sources:
                 break
+            if is_provider_host(url):
+                # A research result must not cite the service's own model/search
+                # provider endpoints as web sources.
+                logger.warning("Redacting a provider endpoint from final result sources.")
+                continue
             if is_safe_url(url, profile):
                 safe_sources.append(url)
             else:
-                logger.warning(f"Source URL {url} flagged by SSRF filter in final result. Redacting.")
+                logger.warning("A source URL was flagged by the SSRF filter in the final result. Redacting.")
 
         source_metadata = collect_source_metadata(researcher, search_results)
 
@@ -736,11 +938,15 @@ async def _run_research(env_manager, callbacks, reporter, op_id, query, mode, pr
             )
 
         passage_records = collect_passage_records(researcher, safe_sources)
+        inferred_fallback = False
         if sources and passage_records:
             evidence, claims, citations = build_structured_findings_from_passages(op_id, passage_records, sources)
             claims = verify_claims_against_evidence(op_id, report_text, evidence, citations)
         elif sources:
+            # No passage text: emit inferred, unattributed claims rather than
+            # fabricating source attribution. Flag the result as degraded.
             evidence, claims, citations = build_structured_findings(op_id, report_text, sources)
+            inferred_fallback = True
         elif require_claim_verification:
             claims = [
                 {
@@ -761,6 +967,32 @@ async def _run_research(env_manager, callbacks, reporter, op_id, query, mode, pr
             for citation in citations:
                 citation["claimIds"] = []
             claims = verify_claims_against_evidence(op_id, report_text, evidence, citations) or claims
+            # Local evidence is now in play. If any final claim is linked to
+            # real evidence (supported, partially-supported, or conflicting),
+            # the earlier "no passage text / unattributed" web fallback no
+            # longer describes the final result, so recompute it after the
+            # post-input verification pass instead of relying on the pre-input
+            # state or on only the highest support score.
+            if inferred_fallback and any(claim.get("evidenceIds") for claim in claims):
+                inferred_fallback = False
+
+        degraded_reasons = []
+        if search_budget_exhausted():
+            degraded_reasons.append("Research stopped at the maximumSearches search-provider budget.")
+        if inferred_fallback:
+            degraded_reasons.append(
+                "No source passage text was available, so claims are report-derived and unattributed rather than source-backed."
+            )
+        if not sources and not evidence:
+            # Neither web sources nor local-input evidence back this report, so
+            # it is degraded even though a report was produced. Evaluated after
+            # local inputs are appended so input-only evidence is not
+            # falsely flagged.
+            degraded_reasons.append(
+                "No source-backed evidence was available; the report is not supported by any source passage."
+            )
+        if getattr(storage_module.storage, "degraded", False):
+            degraded_reasons.append("Durable storage is degraded; results may not survive a restart.")
 
         duration_ms = int((time.time() - start_time) * 1000)
 
@@ -788,9 +1020,11 @@ async def _run_research(env_manager, callbacks, reporter, op_id, query, mode, pr
             "citations": citations,
             "searchesPerformed": [res.get("query", "") for res in search_results if isinstance(res, dict)],
             "metrics": metrics,
+            "degraded": bool(degraded_reasons),
+            "degradedReasons": degraded_reasons or None,
             "limitations": budget_reasons + input_limitations + [
                 "Claims are verified by a separate passage-matching pass over extracted evidence.",
-                "If GPT Researcher exposes no source text for a safe URL, the adapter falls back to report-derived inferred claims for that source."
+                "When GPT Researcher exposes no source passage text, claims are report-derived and left unattributed rather than linked to a source they may not support."
             ]
         }
 

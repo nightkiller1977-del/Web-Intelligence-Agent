@@ -21,3 +21,7 @@ This repository is `Web-Intelligence-Agent`: bounded browser/research service th
 - Treat Tailscale as private transport, not authorization. Current operational uses are Job Agent noVNC re-auth and supported Code Review Agent Ollama tunnels; the wider Coordinator/worker mesh is not complete until verified.
 - Reuse Desktop/Coordinator/OpenRouter/Brain Memory/Model Intelligence/metrics authorities rather than recreating them in this repo.
 - Verify implemented versus planned behavior from current source, tests, deployment configuration, and runtime evidence.
+
+## Pull request reviews
+
+Follow the pull request review policy in `AGENTS.md`. OpenHands and Code-Review-Agent are the only automatic AI reviewers. Claude and other named reviewers require Anthony's explicit request for one independent review of the named PR's current head SHA; later commits require a new request.

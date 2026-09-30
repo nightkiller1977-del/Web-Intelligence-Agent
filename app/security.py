@@ -61,6 +61,22 @@ SEARCH_PROVIDER_HOSTS = {
     "api.search.brave.com"
 }
 
+# Model and search provider endpoints the service itself must reach. Kept as a
+# union so callers (e.g. result redaction) can recognize provider URLs without
+# importing both sets.
+PROVIDER_HOSTS = PROVIDER_API_HOSTS | SEARCH_PROVIDER_HOSTS
+
+
+class SearchBudgetExhausted(PermissionError):
+    """Raised when a research run exhausts its outbound search-provider budget.
+
+    Subclasses PermissionError so the SSRF egress guards that already catch
+    PermissionError keep working, but is distinguishable so the research loop
+    can degrade to a bounded "partial" result instead of surfacing a search
+    budget stop as an unhandled execution failure.
+    """
+
+
 def _match_domain(host: str, candidates) -> bool:
     return any(host == cand or host.endswith(f".{cand}") for cand in candidates)
 
@@ -211,9 +227,61 @@ def _active_search_budget() -> dict | None:
         logger.error("SSRF egress guard found overlapping search budgets; failing closed")
         return {"remaining": 0}
 
+# Path prefixes that mark a provider-owned API surface rather than a public
+# page. Some providers publish documentation and other public content on the
+# same domain as their API, so the host alone is not enough to decide redaction.
+_PROVIDER_API_PATH_PREFIXES = ("/v1/", "/v1beta/", "/v1internal/", "/api/v1/")
+
+# Per-provider machine endpoints on mixed content domains. SerpApi's search API
+# lives at /search.json, which the generic versioned-API prefixes above do not
+# match, so list it explicitly rather than falling back to the public page rule.
+_MIXED_PROVIDER_API_PATHS = {
+    "serpapi.com": ("/search", "/account", "/locations"),
+}
+
+
 def _is_provider_api_url(url: str) -> bool:
+    """True when url targets a model provider's API host the service itself calls.
+
+    Used for outbound egress/DNS decisions, where any request to a provider host
+    is treated as the provider API.
+    """
     hostname = _hostname_from_url(str(url))
     return bool(hostname and _match_domain(hostname, PROVIDER_API_HOSTS))
+
+
+# Provider domains that also serve public web content (docs, blogs, marketing
+# pages). On these, only API paths are the service's own endpoints; other pages
+# are legitimate public sources and must not be redacted.
+_MIXED_PROVIDER_DOMAINS = ("openrouter.ai", "serpapi.com")
+
+
+def is_provider_host(url: str) -> bool:
+    """True when url is one of the service's own provider API endpoints and must
+    not be cited as a public web source.
+
+    A public page hosted on a provider domain (for example a docs page on
+    ``openrouter.ai`` or a help article on ``serpapi.com``) is not an API
+    endpoint and is not redacted; only the machine API surfaces are.
+    """
+    hostname = _hostname_from_url(str(url))
+    if not hostname or not _match_domain(hostname, PROVIDER_HOSTS):
+        return False
+    if _match_domain(hostname, _MIXED_PROVIDER_DOMAINS):
+        path = urlparse(str(url)).path or ""
+        if any(path.startswith(prefix) for prefix in _PROVIDER_API_PATH_PREFIXES):
+            return True
+        for domain, extra_prefixes in _MIXED_PROVIDER_API_PATHS.items():
+            if _match_domain(hostname, (domain,)) and any(path.startswith(pfx) for pfx in extra_prefixes):
+                return True
+        return False
+    return True
+
+
+def search_budget_exhausted() -> bool:
+    """True when the active research run has exhausted its search-provider budget."""
+    budget = _active_search_budget()
+    return bool(budget and budget.get("exhausted"))
 
 def _is_search_provider_url(url: str) -> bool:
     hostname = _hostname_from_url(str(url))
@@ -230,8 +298,13 @@ def _consume_search_budget(url: str):
     with _protection_lock:
         remaining = int(budget.get("remaining", 0))
         if remaining <= 0:
-            logger.error("Search provider budget exhausted before request to %s", url)
-            raise PermissionError(f"Search budget exhausted before outbound request: {url}")
+            # Record exhaustion on the shared budget object before raising. The
+            # HTTP client wrappers translate PermissionError into their own
+            # connection errors, so the research loop detects a budget stop by
+            # observing this flag rather than by catching the exception type.
+            budget["exhausted"] = True
+            logger.error("Search provider budget exhausted before an outbound request.")
+            raise SearchBudgetExhausted("Search budget exhausted before outbound request.")
         budget["remaining"] = remaining - 1
 
 def _ensure_safe_url(url: str):
@@ -244,7 +317,10 @@ def _ensure_safe_url(url: str):
         else is_safe_egress_url(str(url))
     )
     if not is_safe:
-        logger.error("SSRF egress guard denied request to %s", url)
+        # Log only the scheme+host, not the full URL: query strings can carry
+        # provider credentials or sensitive parameters.
+        parsed = urlparse(str(url))
+        logger.error("SSRF egress guard denied request to %s://%s", parsed.scheme, parsed.hostname)
         raise PermissionError(f"SSRF blocked outbound request: {url}")
     _consume_search_budget(str(url))
 

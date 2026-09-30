@@ -324,6 +324,10 @@ paths:
                           type: string
                         url:
                           type: string
+                          description: HTTP(S) URL; empty for local-input sources whose only locator is `uri`.
+                        uri:
+                          type: string
+                          description: Underlying locator when it is not an HTTP(S) URL (for example a `file://` URI for a local input).
                         title:
                           type: string
                         publisher:
@@ -377,6 +381,21 @@ paths:
                     type: array
                     items:
                       type: object
+                  degraded:
+                    type: boolean
+                    description: True when the result is backed by weaker-than-expected provenance (for example unattributed or source-less claims).
+                  degradedReasons:
+                    type: array
+                    nullable: true
+                    items:
+                      type: string
+                  requiresReconciliation:
+                    type: boolean
+                    description: True for failed/cancelled results whose side effects or spend may need operator reconciliation before retrying.
+                  limitations:
+                    type: array
+                    items:
+                      type: string
   /v1/research/{operationId}/cancel:
     post:
       summary: Request active research operation cancellation

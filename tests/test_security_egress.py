@@ -7,6 +7,22 @@ import app.security as security
 from app.security import enforce_egress_protection
 
 
+def test_search_budget_exhaustion_is_observable_and_distinguishable():
+    with enforce_egress_protection(maximum_searches=1):
+        security._consume_search_budget("https://api.tavily.com/search")
+        assert security.search_budget_exhausted() is False
+
+        with pytest.raises(security.SearchBudgetExhausted):
+            security._consume_search_budget("https://api.tavily.com/search")
+
+        # The flag lives on the shared budget object so the research loop can
+        # detect the stop even when a client wrapper masks the exception type.
+        assert security.search_budget_exhausted() is True
+
+    # Scoped to the run: the next operation starts with a fresh budget.
+    assert security.search_budget_exhausted() is False
+
+
 def test_requests_private_url_blocked_when_egress_guard_enabled():
     with enforce_egress_protection():
         with pytest.raises(requests.exceptions.ConnectionError):
@@ -135,3 +151,16 @@ def test_direct_socket_connect_private_ip_still_blocked_under_profiled_egress():
                 sock.connect(("10.0.0.1", 80))
         finally:
             sock.close()
+
+
+def test_provider_redaction_allows_public_pages_on_provider_domains():
+    from app.security import is_provider_host
+
+    # Public documentation pages are not API endpoints and must not be redacted.
+    assert is_provider_host("https://openrouter.ai/docs/quickstart") is False
+    assert is_provider_host("https://serpapi.com/blog/how-it-works") is False
+    # Machine API endpoints on the same domains/machine hosts are redacted.
+    assert is_provider_host("https://api.openai.com/v1/chat/completions") is True
+    assert is_provider_host("https://openrouter.ai/api/v1/models") is True
+    assert is_provider_host("https://api.tavily.com/search") is True
+    assert is_provider_host("https://google.serper.dev/search") is True

@@ -98,6 +98,8 @@ STORAGE_BACKEND=local
 
 Do not commit your `.env` file.
 
+Optional Brain Memory integration is off by default. To enable verified research-outcome ingestion, set the complete `BRAIN_MEMORY_URL`, `BRAIN_MEMORY_KEY_ID`, and `BRAIN_MEMORY_SECRET` credential group together with `BRAIN_MEMORY_ENABLED=true`. Historical recall additionally requires `BRAIN_MEMORY_CONTEXT_ENABLED=true`; recalled text is bounded, provenance-labelled, and explicitly treated as untrusted background rather than instructions or current-state authority. Recall is skipped whenever the effective source allowlist is narrower than the profile permits (an explicit `sourcePolicy.allowedDomains`, or a profile with its own allowlist), because the Brain contract has no per-domain provenance filter to enforce that restriction on recalled evidence. Outcome ingestion is scheduled only after the research result is durably stored.
+
 ### 3. Start the API
 
 ```bash
@@ -187,6 +189,26 @@ A completed result can include:
 - execution metrics;
 - degraded-mode reasons, warnings, or limitations.
 
+### Reading provenance honestly
+
+The result carries explicit signals about how much its own content can be trusted:
+
+- `claims[].verificationStatus` is `inferred` when a claim could not be tied to
+  a source passage. In that case `evidenceIds` is empty and no evidence is
+  invented; treat the claim as unverified.
+- `degraded` (with `degradedReasons`) is set when the run completed under a
+  bounded stop — for example the search allowance was exhausted or no passage
+  text was available — so the answer may be partial even though `status` is
+  `completed` or `partial`.
+- `requiresReconciliation` is set when an operation ended `failed` or
+  `cancelled`. Its side effects are not guaranteed to have settled, so callers
+  must reconcile before retrying rather than assume a clean stop.
+- Local `documents`/`repositories` inputs are carried on the source `uri` field
+  (for example `file:///path`); `url` stays empty because it is the HTTP(S)
+  contract field.
+- `limitations` states when declared local inputs could not be read (for example
+  a path outside `LOCAL_INPUT_ROOTS`) instead of silently ignoring them.
+
 ## Cancel a job
 
 ```bash
@@ -240,9 +262,14 @@ These limits are part of the API contract, not just documentation recommendation
 
 Local mode defaults to local storage and is intended for development or a trusted local controller. Raw provider credential headers are only permitted in local deployment mode.
 
+Document and repository inputs are read only from roots listed in `LOCAL_INPUT_ROOTS` (os.pathsep-separated). With the setting empty, local file inputs are disabled; a declared input that cannot be read is reported in `limitations` rather than ignored.
+
 ### Remote mode
 
 Remote deployments should set an explicit `WEB_INTELLIGENCE_AUTH_TOKEN` and normally use Redis-backed storage. If authentication is not configured in remote mode, protected requests fail closed.
+
+Brain Memory credentials must be provisioned as a dedicated least-privilege group through `aicc-secrets`; do not reuse another agent's credential or add partial values. A Brain outage, invalid configuration, or rejected ingest does not rerun research or alter the completed research result.
+Redis-backed deployments should set `REDIS_REQUIRED=true` so the service fails closed at startup when the backend is unreachable, instead of silently degrading to process-local memory. Concurrency slots and operation ownership are shared through Redis so the limit is service-wide across instances; `CONCURRENCY_LEASE_TTL_SECONDS` bounds how long a lease is held without a heartbeat.
 
 The included `render.yaml` configures a Docker-based service plus Redis and illustrates the remote deployment shape.
 
