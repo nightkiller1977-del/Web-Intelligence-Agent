@@ -1,7 +1,7 @@
 """
 tests/test_remote_mode.py
 
-Integration tests for remote mode deployment (Render.com).
+Integration tests for remote container deployments.
 Tests health checks, Redis connectivity, idempotency, concurrency limits,
 and end-to-end research workflow.
 """
@@ -519,12 +519,11 @@ class TestSSRFProtection:
             assert result, f"URL {url} should be allowed by SSRF protection"
 
 
-class TestRenderEnvironmentVariables:
-    """Test that Render environment variable injection works correctly."""
+class TestDeploymentEnvironmentVariables:
+    """Test remote deployment environment configuration."""
 
     def test_auth_token_from_environment(self):
-        """AUTH_TOKEN should be loadable from environment (as Render provides)."""
-        # In remote mode, WEB_INTELLIGENCE_AUTH_TOKEN is set by Render
+        """AUTH_TOKEN should be loadable from the deployment environment."""
         assert settings.AUTH_TOKEN is not None
         assert len(settings.AUTH_TOKEN) > 0
 
@@ -539,7 +538,7 @@ class TestRenderEnvironmentVariables:
         assert settings.DEPLOYMENT_MODE == "remote"
 
 
-class TestRenderContainerRecycle:
+class TestContainerRecycle:
     """Test recovery behavior after container recycle (stateless transition)."""
 
     @pytest.mark.anyio
@@ -556,33 +555,33 @@ class TestRenderContainerRecycle:
         assert hasattr(storage, 'redis') or hasattr(storage, 'get_redis_connection')
 
 
-# Integration test to run locally against a live Render deployment
+# Integration tests for the deployed service.
 @pytest.mark.integration
-class TestLiveRenderDeployment:
-    """Tests against a live Render deployment (requires RENDER_SERVICE_URL env var)."""
+class TestLiveDeployment:
+    """Tests against a live deployment (requires LIVE_SERVICE_URL)."""
 
     @pytest.fixture(autouse=True)
-    def render_url(self):
-        """Get Render service URL from environment or skip test."""
-        url = os.getenv('RENDER_SERVICE_URL')
+    def service_url(self):
+        """Get the service URL from the environment or skip the live tests."""
+        url = os.getenv('LIVE_SERVICE_URL')
         if not url:
-            pytest.skip("RENDER_SERVICE_URL not set; skipping live Render tests")
+            pytest.skip("LIVE_SERVICE_URL not set; skipping live deployment tests")
         return url.rstrip('/')
 
     @pytest.mark.anyio
-    async def test_live_health_check(self, render_url):
-        """Test health endpoints on live Render deployment."""
+    async def test_live_health_check(self, service_url):
+        """Test health endpoints on the live deployment."""
         async with httpx.AsyncClient() as client:
-            response = await client.get(f"{render_url}/health/live")
+            response = await client.get(f"{service_url}/health/live")
             assert response.status_code == 200
             assert response.json()["status"] == "ok"
 
     @pytest.mark.anyio
-    async def test_live_research_workflow(self, render_url):
+    async def test_live_research_workflow(self, service_url):
         """Test end-to-end research workflow on live deployment."""
         import time
         async with httpx.AsyncClient(timeout=30.0) as client:
-            # 1. Get auth token (in practice, this comes from Render env vars)
+            # 1. Get the deployment's test credential.
             token = os.getenv('WEB_INTELLIGENCE_AUTH_TOKEN')
             if not token:
                 raise ValueError("WEB_INTELLIGENCE_AUTH_TOKEN not configured for test")
@@ -605,14 +604,14 @@ class TestLiveRenderDeployment:
             }
 
             response = await client.post(
-                f"{render_url}/v1/research",
+                f"{service_url}/v1/research",
                 json=payload,
                 headers=headers
             )
             assert response.status_code in [200, 201, 202]
 
             # 3. Check capabilities
-            response = await client.get(f"{render_url}/capabilities")
+            response = await client.get(f"{service_url}/capabilities")
             assert response.status_code == 200
             assert response.json()["capabilities"]["ssrf_egress_blocking"] is True
 
