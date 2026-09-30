@@ -118,6 +118,8 @@ jobs:
     concurrency:
       group: deploy-web-intelligence-agent
       cancel-in-progress: false
+    outputs:
+      live_service_url: ${{ steps.smoke.outputs.live_service_url }}
     env:
       RESOURCE_GROUP: rg-aicc-fleet
       APP_NAME: web-intelligence-agent
@@ -197,6 +199,7 @@ jobs:
       # but that cannot actually serve /health/live still fails the deploy
       # (replacement for the retired Render job's public-ingress coverage).
       - name: Smoke-test public ingress on the new revision
+        id: smoke
         run: |
           set -euo pipefail
           REVISION_NAME="${APP_NAME}--${REVISION_SUFFIX}"
@@ -209,7 +212,7 @@ jobs:
             exit 1
           fi
           LIVE_SERVICE_URL="https://$FQDN"
-          echo "LIVE_SERVICE_URL=$LIVE_SERVICE_URL" >> "$GITHUB_ENV"
+          echo "live_service_url=$LIVE_SERVICE_URL" >> "$GITHUB_OUTPUT"
           echo "Smoke-testing $LIVE_SERVICE_URL/health/live"
           for i in $(seq 1 12); do
             if curl -sf --max-time 5 "$LIVE_SERVICE_URL/health/live"; then
@@ -222,6 +225,17 @@ jobs:
           done
           echo "Public ingress did not serve /health/live."
           exit 1
+
+  live-integration:
+    name: Live Azure integration tests
+    runs-on: ubuntu-latest
+    needs: deploy
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Set up Python 3.12 for live integration tests
         uses: actions/setup-python@v5
@@ -239,5 +253,6 @@ jobs:
         run: pytest tests/test_remote_mode.py::TestLiveDeployment -v --tb=short
         timeout-minutes: 5
         env:
+          LIVE_SERVICE_URL: ${{ needs.deploy.outputs.live_service_url }}
           LIVE_TEST_RUN_ID: ${{ github.run_id }}
           WEB_INTELLIGENCE_AUTH_TOKEN: ${{ secrets.WEB_INTELLIGENCE_AUTH_TOKEN }}

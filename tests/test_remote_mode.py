@@ -549,12 +549,28 @@ class TestDeploymentEnvironmentVariables:
         ).read_text()
         smoke_step = workflow.split(
             "- name: Smoke-test public ingress on the new revision", 1
-        )[1].split("- name: Set up Python", 1)[0]
+        )[1].split("\n  live-integration:", 1)[0]
 
         assert "az containerapp revision show" in smoke_step
         assert '--revision "$REVISION_NAME"' in smoke_step
         assert '--query "properties.fqdn"' in smoke_step
         assert "properties.configuration.ingress.fqdn" not in smoke_step
+
+    def test_live_tests_run_without_azure_deployment_credentials(self):
+        workflow = Path(__file__).parents[1].joinpath(
+            ".github/workflows/sidecar-tests.yml"
+        ).read_text()
+        deploy_job, live_job = workflow.split("\n  live-integration:", 1)
+
+        assert "id-token: write" in deploy_job
+        assert "Run live Azure integration tests" not in deploy_job
+        assert "needs: deploy" in live_job
+        assert "id-token: write" not in live_job
+        assert "Azure login (OIDC)" not in live_job
+        assert (
+            "LIVE_SERVICE_URL: ${{ needs.deploy.outputs.live_service_url }}"
+            in live_job
+        )
 
     def test_live_gate_reuses_the_workflow_run_id_for_retries(self):
         workflow = Path(__file__).parents[1].joinpath(
