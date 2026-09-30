@@ -193,17 +193,19 @@ jobs:
 
       # The revision-health wait above only reads Azure control-plane state; it
       # never exercises the deployed app's public ingress. This step hits the
-      # running revision's public FQDN so a container that Azure reports healthy
+      # named revision's public FQDN so a container that Azure reports healthy
       # but that cannot actually serve /health/live still fails the deploy
       # (replacement for the retired Render job's public-ingress coverage).
       - name: Smoke-test public ingress on the new revision
         run: |
           set -euo pipefail
-          FQDN=$(az containerapp show \
+          REVISION_NAME="${APP_NAME}--${REVISION_SUFFIX}"
+          FQDN=$(az containerapp revision show \
             --name "$APP_NAME" --resource-group "$RESOURCE_GROUP" \
-            --query "properties.configuration.ingress.fqdn" -o tsv)
+            --revision "$REVISION_NAME" \
+            --query "properties.fqdn" -o tsv)
           if [ -z "$FQDN" ] || [ "$FQDN" = "None" ]; then
-            echo "Container App has no public ingress FQDN; cannot smoke-test."
+            echo "Revision $REVISION_NAME has no public ingress FQDN; cannot smoke-test."
             exit 1
           fi
           LIVE_SERVICE_URL="https://$FQDN"
