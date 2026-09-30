@@ -99,16 +99,9 @@ jobs:
   # booting. Deleting it rather than leaving it skipped because a permanently
   # red check trains people to ignore main's status.
   #
-  # Coverage that is RETIRED with this job, not merely relocated: the live
-  # Render job supplied RENDER_SERVICE_URL and a bearer token to
-  # tests/test_remote_mode.py::TestLiveRenderDeployment, which asserted the
-  # public ingress, bearer authentication, /v1/research, and /capabilities on
-  # a running deployment. The replacement below covers live public health on
-  # the Azure surface only; the authenticated research-workflow assertions
-  # have no configured target or credential and are retired pending an Azure
-  # test credential (follow-up ticket, not restored here). The test class is
-  # left in place and self-skips when RENDER_SERVICE_URL is unset, so it can
-  # be pointed at a future target without restoring this job.
+  # The same live integration suite now runs against Azure after the new
+  # revision becomes healthy, preserving public ingress, authentication,
+  # /v1/research, and /capabilities coverage without a second implementation.
 
   # ACES-453: deploy the built image to Azure Container Apps after CI passes
   # on main. OIDC federated auth (no stored client secret) via a service
@@ -213,9 +206,11 @@ jobs:
             echo "Container App has no public ingress FQDN; cannot smoke-test."
             exit 1
           fi
-          echo "Smoke-testing https://$FQDN/health/live"
+          LIVE_SERVICE_URL="https://$FQDN"
+          echo "LIVE_SERVICE_URL=$LIVE_SERVICE_URL" >> "$GITHUB_ENV"
+          echo "Smoke-testing $LIVE_SERVICE_URL/health/live"
           for i in $(seq 1 12); do
-            if curl -sf --max-time 5 "https://$FQDN/health/live"; then
+            if curl -sf --max-time 5 "$LIVE_SERVICE_URL/health/live"; then
               echo
               echo "Public ingress is serving /health/live."
               exit 0
@@ -225,3 +220,21 @@ jobs:
           done
           echo "Public ingress did not serve /health/live."
           exit 1
+
+      - name: Set up Python 3.12 for live integration tests
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            requirements.lock
+            requirements-test.txt
+
+      - name: Install live integration test dependencies
+        run: pip install -r requirements.lock -r requirements-test.txt
+
+      - name: Run live Azure integration tests
+        run: pytest tests/test_remote_mode.py::TestLiveDeployment -v --tb=short
+        timeout-minutes: 5
+        env:
+          WEB_INTELLIGENCE_AUTH_TOKEN: ${{ secrets.WEB_INTELLIGENCE_AUTH_TOKEN }}
