@@ -10,6 +10,7 @@ import os
 import json
 import asyncio
 import secrets
+from pathlib import Path
 import pytest
 import httpx
 import sys
@@ -536,6 +537,19 @@ class TestDeploymentEnvironmentVariables:
     def test_deployment_mode_remote(self):
         """DEPLOYMENT_MODE should be 'remote' for this test suite."""
         assert settings.DEPLOYMENT_MODE == "remote"
+
+    def test_live_gate_targets_the_new_revision_fqdn(self):
+        workflow = Path(__file__).parents[1].joinpath(
+            ".github/workflows/sidecar-tests.yml"
+        ).read_text()
+        smoke_step = workflow.split(
+            "- name: Smoke-test public ingress on the new revision", 1
+        )[1].split("- name: Set up Python", 1)[0]
+
+        assert "az containerapp revision show" in smoke_step
+        assert '--revision "$REVISION_NAME"' in smoke_step
+        assert '--query "properties.fqdn"' in smoke_step
+        assert "properties.configuration.ingress.fqdn" not in smoke_step
 
 
 class TestContainerRecycle:
