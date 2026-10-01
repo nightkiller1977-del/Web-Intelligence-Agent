@@ -136,10 +136,11 @@ async def _rollback_admission(
 ) -> None:
     """Release admission state after a failed request.
 
-    The idempotency lease is authoritative: if another request reclaimed it,
-    this stale request must not release the winner's operation, slot, or budget
-    state. Once ownership is confirmed and released, the remaining cleanups are
-    isolated so one backend error cannot skip the others.
+    The idempotency lease is authoritative. A retry for the same operation
+    shares its slot and budget state, while a retry with a different operation
+    owns separate resources that this stale request can safely release. Once
+    that distinction is known, the remaining cleanups are isolated so one
+    backend error cannot skip the others.
     """
     async def _run(label: str, coro_factory):
         try:
@@ -149,13 +150,18 @@ async def _rollback_admission(
             return None
 
     if claimed_lookup_key:
-        released = await _run(
-            "release idempotency key",
-            lambda: storage.release_idempotency_key(
+        try:
+            remaining_owner = await storage.release_idempotency_key(
                 lookup_key, operation_id, admission_token
-            ),
-        )
-        if not released:
+            )
+        except Exception:
+            logger.warning(
+                "Failed to release idempotency key for operation %s during rollback.",
+                operation_id,
+                exc_info=True,
+            )
+            return
+        if remaining_owner == operation_id:
             return
     if operation_owned:
         await _run("release owner lease", lambda: storage.release_operation_lease(operation_id))
@@ -167,20 +173,19 @@ async def _rollback_admission(
         await _run("release spend hold", lambda: storage.release_daily_spend(spend_reserved, operation_id))
 
 
-async def _report_terminal(reporter: ProgressReporter, stage: str, message: str) -> None:
-    """Publish a terminal progress event on a best-effort basis.
+async def _report_progress_best_effort(
+    reporter: ProgressReporter, stage: str, message: str
+) -> None:
+    """Publish a progress event without changing durable operation state.
 
-    The terminal result is already persisted when this runs, so a transient
-    progress-stream failure must not be mistaken for an execution failure: that
-    would overwrite a completed result with ``failed`` (and skip spend
-    reconciliation) even though the model work succeeded. The SSE consumer waits
-    briefly for the terminal event, and a lost event degrades to the stream
-    closing on the persisted terminal state.
+    Callers persist the corresponding state first, so a transient event-stream
+    failure must not turn a successfully queued or completed operation into an
+    API or execution failure.
     """
     try:
         await reporter.report(stage, message)
     except Exception:
-        logger.warning("Failed to publish terminal progress event for stage %s.", stage, exc_info=True)
+        logger.warning("Failed to publish progress event for stage %s.", stage, exc_info=True)
 
 
 async def background_research_task(
@@ -221,7 +226,9 @@ async def background_research_task(
         # that was never stored. The stream waits (bounded) for the terminal
         # event after it sees this state, so the event is still delivered.
         await storage.save_operation(op_id, result)
-        await _report_terminal(reporter, result["status"], f"Research task {result['status']}.")
+        await _report_progress_best_effort(
+            reporter, result["status"], f"Research task {result['status']}."
+        )
         observe_research_result(result)
         # Reconcile the admission reservation to the observed cost in one
         # atomic step, so another replica cannot reserve the temporarily freed
@@ -271,7 +278,9 @@ async def background_research_task(
             "metrics": {"startedAt": "", "durationMs": 0, "searchesPerformed": 0, "pagesRead": 0, "sourcesConsidered": 0, "sourcesUsed": 0}
         }
         await storage.save_operation(op_id, cancelled_state)
-        await _report_terminal(reporter, "cancelled", "Research task cancelled.")
+        await _report_progress_best_effort(
+            reporter, "cancelled", "Research task cancelled."
+        )
         observe_research_result(cancelled_state)
     except _LeaseLostError:
         # Ownership was lost mid-run: skip persistence so this worker cannot
@@ -293,7 +302,11 @@ async def background_research_task(
             "error": client_safe_error()
         }
         await storage.save_operation(op_id, failed_state)
-        await _report_terminal(reporter, "failed", "Research task failed. Check server logs for redacted diagnostics.")
+        await _report_progress_best_effort(
+            reporter,
+            "failed",
+            "Research task failed. Check server logs for redacted diagnostics.",
+        )
         observe_research_result(failed_state)
 
     finally:
@@ -557,7 +570,9 @@ async def start_research(
         }
 
         reporter = ProgressReporter(op_id)
-        await reporter.report("planning", "Request received. Research task queued.")
+        await _report_progress_best_effort(
+            reporter, "planning", "Request received. Research task queued."
+        )
 
         # Spawn research execution task in background
         task = asyncio.create_task(background_research_task(
