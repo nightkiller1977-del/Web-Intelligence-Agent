@@ -367,18 +367,71 @@ def allowed_input_roots() -> list[Path]:
         roots.append(Path(raw).expanduser().resolve())
     return roots
 
-def path_within_allowed_roots(path: Path) -> bool:
-    resolved = path.resolve()
+def is_within_allowed_roots(path: Path) -> bool:
+    """True when path, once canonicalized, lies within a configured root.
+
+    This is a boolean guard, not a value-returning "give me the safe path"
+    helper: callers must check ``if not is_within_allowed_roots(path): return``
+    and then keep using that *same* ``path`` object (optionally transformed by
+    a non-filesystem-touching call such as ``.expanduser()``) for every
+    subsequent filesystem operation, rather than substituting a value this
+    function computed internally.
+
+    That distinction is what CodeQL's uncontrolled-path-expression sanitizer
+    recognizes: a guard on the same variable that later reaches a filesystem
+    sink clears it, but a helper that instead *returns* a freshly resolved
+    value is -- from a static data-flow point of view -- still returning data
+    derived from the same caller-supplied path, so a filesystem call on that
+    returned value downstream is flagged as unsanitized even though this
+    function already validated it. The real canonicalization
+    (``os.path.realpath``, which also resolves symlinks/``..``/``~``) still
+    happens here so an equivalent spelling of an allowed root is accepted and
+    a symlink escape is rejected; it is used only for the containment
+    decision, never returned.
+    """
+    resolved_str = os.path.realpath(os.path.expanduser(str(path)))
+    return _real_path_within_allowed_roots(resolved_str)
+
+def _real_path_within_allowed_roots(resolved_str: str) -> bool:
+    """Containment check on an already-canonicalized path string."""
     for root in allowed_input_roots():
-        if resolved == root or root in resolved.parents:
+        root_str = str(root)
+        # root_str already ends with os.sep when it is the filesystem root
+        # itself (e.g. "/"); appending another separator there would produce
+        # "//" and reject every child path, so only add one when it is not
+        # already present.
+        prefix = root_str if root_str.endswith(os.sep) else root_str + os.sep
+        if resolved_str == root_str or resolved_str.startswith(prefix):
             return True
     return False
+
+def _open_validated_file(path: Path):
+    """Open path for reading, closing the check-to-open symlink-retarget race.
+
+    is_within_allowed_roots() validates path's canonical target at check time,
+    but if path (or a directory in it) is a symlink another local process
+    could retarget it to point outside LOCAL_INPUT_ROOTS between that check
+    and a later open() call. Opening first and then verifying the path of the
+    *actual opened file descriptor* (via ``/dev/fd``, which reflects whatever
+    the open() syscall itself resolved to, atomically) closes that window:
+    there is no second, separately racy resolve-then-open step.
+    """
+    fd = os.open(str(path), os.O_RDONLY)
+    try:
+        real = os.path.realpath(f"/dev/fd/{fd}")
+        if not _real_path_within_allowed_roots(real):
+            raise PermissionError(
+                "Opened file resolved outside LOCAL_INPUT_ROOTS after the containment check."
+            )
+        return os.fdopen(fd, "rb")
+    except BaseException:
+        os.close(fd)
+        raise
 
 def input_text_from_file(path: Path) -> str:
     if settings.DEPLOYMENT_MODE != "local":
         return ""
-    path = path.resolve()
-    if not path_within_allowed_roots(path):
+    if not is_within_allowed_roots(path):
         # Caller-supplied absolute paths can disclose sensitive filenames and
         # carry newline/control characters, so log only a bounded digest.
         logger.warning(
@@ -386,13 +439,14 @@ def input_text_from_file(path: Path) -> str:
             hashlib.sha256(str(path).encode()).hexdigest()[:12],
         )
         return ""
+    path = path.expanduser()
     if not path.is_file() or path.suffix.lower() not in SUPPORTED_INPUT_EXTENSIONS:
         return ""
     try:
-        with path.open("rb") as input_file:
+        with _open_validated_file(path) as input_file:
             raw = input_file.read(MAX_INPUT_FILE_BYTES)
         return raw.decode("utf-8", errors="replace")
-    except OSError:
+    except (OSError, PermissionError):
         # Do not log the caller-supplied path: it can disclose sensitive
         # filenames and carry newline/control characters into the log.
         logger.warning("Unable to read a declared local input file (suffix %s).", path.suffix)
@@ -422,13 +476,19 @@ def collect_repository_context(repositories: list[dict], remaining_chunks: int =
             break
         if not isinstance(item, dict) or not item.get("path"):
             continue
+        # is_within_allowed_roots() canonicalizes internally (so an equivalent
+        # spelling -- trailing slash, ~, .., symlink -- of an allowed
+        # directory is still usable, and a symlink escape is still rejected)
+        # but is checked here as a boolean guard on `root` itself: every
+        # filesystem operation below uses this same validated `root` object,
+        # never a value resolve_within_allowed_roots computed separately. See
+        # is_within_allowed_roots()'s docstring for why that distinction
+        # matters for the uncontrolled-path-expression sanitizer.
         root = Path(str(item["path"])).expanduser()
-        if not root.is_dir():
-            continue
-        if not path_within_allowed_roots(root):
+        if not is_within_allowed_roots(root) or not root.is_dir():
             logger.warning(
-                "Refusing repository input outside LOCAL_INPUT_ROOTS (path hash %s)",
-                hashlib.sha256(str(root).encode()).hexdigest()[:12],
+                "Refusing repository input outside LOCAL_INPUT_ROOTS or not a directory (path hash %s)",
+                hashlib.sha256(str(item["path"]).encode()).hexdigest()[:12],
             )
             continue
         visited = 0
@@ -484,6 +544,17 @@ def collect_input_context(inputs: Dict[str, Any] | None) -> tuple[list[dict], bo
         bounded_chunks.append(chunk)
     return bounded_chunks, inputs.get("allowExternalUse") is True
 
+def _has_unread_declared_inputs(raw_inputs: Dict[str, Any] | None, input_chunks: list[dict]) -> bool:
+    if not isinstance(raw_inputs, dict):
+        return False
+    documents = raw_inputs.get("documents") or []
+    repositories = raw_inputs.get("repositories") or []
+    if not isinstance(documents, list) or not isinstance(repositories, list):
+        return False
+    read_documents = sum(1 for chunk in input_chunks if not chunk.get("repository"))
+    read_repositories = {chunk.get("repository") for chunk in input_chunks if chunk.get("repository")}
+    return len(documents) > read_documents or len(repositories) > len(read_repositories)
+
 def format_input_context_for_query(chunks: list[dict]) -> str:
     sections = []
     for chunk in chunks:
@@ -504,6 +575,11 @@ def build_effective_query(
         additions.append(f"Freshness constraint: {fresh}.")
     if input_chunks:
         limitations.append("Local document/repository inputs were processed as bounded first-party evidence.")
+        if _has_unread_declared_inputs(raw_inputs, input_chunks):
+            # Some declared inputs produced no readable chunk (unreadable path,
+            # unsupported extension, outside LOCAL_INPUT_ROOTS). Say so instead
+            # of implying every declared input was honored.
+            limitations.append("Some declared local inputs were not readable and were skipped.")
         if allow_external_inputs:
             additions.append("Use this explicitly provided local input context as first-party context:\n" + format_input_context_for_query(input_chunks))
             limitations.append("Local inputs were explicitly allowed for external research prompt context.")
@@ -822,7 +898,10 @@ async def _run_research(env_manager, callbacks, reporter, op_id, query, display_
                 )
                 await callbacks.on_synthesize("Synthesizing research report...")
                 report = await researcher.write_report()
-                await reporter.report("completed", "Research completed.", completed_units=100, total_units=100)
+                # No terminal event here: the caller persists the terminal result
+                # and then publishes the single final status, so an SSE consumer
+                # can never stop on an early terminal event for a result that was
+                # later downgraded (or never stored).
                 return report
 
             report_text = await asyncio.wait_for(run_loop(), timeout=float(max_duration))

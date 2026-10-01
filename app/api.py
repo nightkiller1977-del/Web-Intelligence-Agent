@@ -6,19 +6,28 @@ from fastapi import APIRouter, Header, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 from sse_starlette.sse import EventSourceResponse
 
-from app.config import raw_header_credentials_allowed, settings
+from app.config import (
+    LOCAL_MODEL_PROVIDERS,
+    external_openai_gateway_config,
+    local_model_endpoint,
+    raw_header_credentials_allowed,
+    settings,
+)
 from app.storage import storage
 from app.schemas import ResearchRequestInput, ResearchResultResponse, CapabilitiesInfo
 from app.cancellation import cancellation_manager
 from app.progress_adapter import ProgressReporter
 from app.researcher_adapter import conduct_web_research, _LeaseLostError, schedule_outcome_ingest
-from app.security import is_safe_url
-from app.metrics import observed_result_cost, observe_research_result, record_operation_spend
+from app.security import is_gateway_destination_allowed, is_safe_url
+from app.metrics import observe_research_result, record_operation_spend
 
 logger = logging.getLogger("web-intelligence")
 router = APIRouter()
 
-RAW_CREDENTIAL_HEADERS = ("X-LLM-Key", "X-Search-Key")
+# External model egress must go through the configured gateway, so a raw LLM
+# key header is never accepted. The search key remains a local-mode-only input.
+RAW_LLM_CREDENTIAL_HEADER = "X-LLM-Key"
+RAW_SEARCH_CREDENTIAL_HEADER = "X-Search-Key"
 TERMINAL_STATUSES = ("completed", "partial", "failed", "cancelled")
 
 def client_safe_error() -> dict:
@@ -35,7 +44,7 @@ async def health_live():
 
 @router.get("/health/ready")
 async def health_ready():
-    """Readiness check: verifies storage connectivity and authorization validation."""
+    """Readiness check for dependencies required to accept new work."""
     gpt_researcher_ready = True
     try:
         from gpt_researcher import GPTResearcher
@@ -54,14 +63,27 @@ async def health_ready():
 
     auth_ready = bool(settings.AUTH_TOKEN)
 
-    status = "ok" if (gpt_researcher_ready and storage_ready and auth_ready) else "degraded"
+    gateway_ready = True
+    inference_ready = local_model_endpoint() is not None
+    if settings.AI_OPENROUTER_ENABLED:
+        try:
+            gateway_ready = is_gateway_destination_allowed(
+                external_openai_gateway_config()
+            )
+        except ValueError:
+            gateway_ready = False
+        inference_ready = gateway_ready
 
-    return {
-        "status": status,
+    ready = gpt_researcher_ready and storage_ready and auth_ready and inference_ready
+
+    return JSONResponse(status_code=200 if ready else 503, content={
+        "status": "ok" if ready else "degraded",
         "gpt_researcher": gpt_researcher_ready,
         "storage": storage_ready,
-        "auth": auth_ready
-    }
+        "auth": auth_ready,
+        "gateway": gateway_ready,
+        "inference": inference_ready,
+    })
 
 @router.get("/version")
 async def version():
@@ -134,7 +156,29 @@ async def _rollback_admission(
         await _run("release spend hold", lambda: storage.release_daily_spend(spend_reserved, operation_id))
 
 
-async def background_research_task(req: ResearchRequestInput, reporter: ProgressReporter, headers: dict, spend_reserved: float = 0.0):
+async def _report_terminal(reporter: ProgressReporter, stage: str, message: str) -> None:
+    """Publish a terminal progress event on a best-effort basis.
+
+    The terminal result is already persisted when this runs, so a transient
+    progress-stream failure must not be mistaken for an execution failure: that
+    would overwrite a completed result with ``failed`` (and skip spend
+    reconciliation) even though the model work succeeded. The SSE consumer waits
+    briefly for the terminal event, and a lost event degrades to the stream
+    closing on the persisted terminal state.
+    """
+    try:
+        await reporter.report(stage, message)
+    except Exception:
+        logger.warning("Failed to publish terminal progress event for stage %s.", stage, exc_info=True)
+
+
+async def background_research_task(
+    req: ResearchRequestInput,
+    reporter: ProgressReporter,
+    headers: dict,
+    spend_reserved: float = 0.0,
+    accounting_delegated: bool = False,
+):
     op_id = req.operationId
     spend_reconciled = False
 
@@ -161,8 +205,12 @@ async def background_research_task(req: ResearchRequestInput, reporter: Progress
             headers=headers
         )
 
-        # Save output result
+        # Persist the terminal state first so a crash before the progress event
+        # cannot let an SSE consumer observe a terminal announcement for a result
+        # that was never stored. The stream waits (bounded) for the terminal
+        # event after it sees this state, so the event is still delivered.
         await storage.save_operation(op_id, result)
+        await _report_terminal(reporter, result["status"], f"Research task {result['status']}.")
         observe_research_result(result)
         # Reconcile the admission reservation to the observed cost in one
         # atomic step, so another replica cannot reserve the temporarily freed
@@ -170,10 +218,22 @@ async def background_research_task(req: ResearchRequestInput, reporter: Progress
         # accounting failure must not overwrite the completed result with a
         # failure, and the operation is left fail-closed (spend_reconciled stays
         # True) so the finally block does not release the hold and undercharge.
-        actual = observed_result_cost(result)
-        if spend_reserved:
+        # When AI-OpenRouter is authoritative, this service holds no reservation
+        # and records nothing, so it cannot keep a local running total that
+        # disagrees with the budget owner. When the work ran on a local model
+        # (accounting_delegated is False exactly in that case, given the two
+        # admission states in start_research), the reservation is reconciled
+        # down to zero rather than the provider-agnostic token-cost heuristic:
+        # local inference has no real external cost, so charging that estimate
+        # against DAILY_SPEND_LIMIT_USD would eventually exhaust it on
+        # credential-free local runs alone. estimatedModelCostUsd is still
+        # returned to the caller in the result for visibility; it is just not
+        # charged against this local guard.
+        if accounting_delegated:
+            spend_reconciled = True
+        elif spend_reserved:
             try:
-                await storage.reconcile_daily_spend(spend_reserved, actual, settings.DAILY_SPEND_LIMIT_USD, op_id)
+                await storage.reconcile_daily_spend(spend_reserved, 0.0, settings.DAILY_SPEND_LIMIT_USD, op_id)
                 spend_reconciled = True
             except Exception:
                 spend_reconciled = True
@@ -187,7 +247,6 @@ async def background_research_task(req: ResearchRequestInput, reporter: Progress
         # be scheduled; otherwise Brain could record a completed/partial outcome
         # for a result that was never stored.
         schedule_outcome_ingest(result, op_id, req.mode)
-        await reporter.report(result["status"], f"Research task {result['status']}.")
 
     except asyncio.CancelledError:
         logger.warning(f"Operation {op_id} was cancelled during execution.")
@@ -201,9 +260,8 @@ async def background_research_task(req: ResearchRequestInput, reporter: Progress
             "metrics": {"startedAt": "", "durationMs": 0, "searchesPerformed": 0, "pagesRead": 0, "sourcesConsidered": 0, "sourcesUsed": 0}
         }
         await storage.save_operation(op_id, cancelled_state)
+        await _report_terminal(reporter, "cancelled", "Research task cancelled.")
         observe_research_result(cancelled_state)
-        await reporter.report("cancelled", "Research task cancelled.")
-
     except _LeaseLostError:
         # Ownership was lost mid-run: skip persistence so this worker cannot
         # overwrite the terminal state reconciliation (or the new owner) wrote.
@@ -224,8 +282,8 @@ async def background_research_task(req: ResearchRequestInput, reporter: Progress
             "error": client_safe_error()
         }
         await storage.save_operation(op_id, failed_state)
+        await _report_terminal(reporter, "failed", "Research task failed. Check server logs for redacted diagnostics.")
         observe_research_result(failed_state)
-        await reporter.report("failed", "Research task failed. Check server logs for redacted diagnostics.")
 
     finally:
         # Cleanup steps are independent: a failure in one (for example a
@@ -274,25 +332,118 @@ async def start_research(
     slot_reserved = False
     operation_owned = False
     try:
-        # 1. Secure initial query validation (check secrets, SSRF URLs if query is an explicit URL)
+        # 1. Atomic idempotency check-and-reserve, before any other admission
+        # check. A retry of already-accepted work must resolve to its existing
+        # operation even when a later admission check (e.g. gateway
+        # configuration, changed by a rolling restart or a replica missing a
+        # secret) would now reject a *new* request — those checks only matter
+        # for new work, and applying them to a retry would turn an ambiguous
+        # submission into a spurious rejection instead of letting the client
+        # reconcile with its persisted operation.
+        existing_op_id = await storage.claim_idempotency_key(lookup_key, req.operationId)
+        if existing_op_id:
+            logger.info("Idempotency hit for key %s, returning existing operation: %s", lookup_key, existing_op_id)
+            op_state = await storage.get_operation(existing_op_id)
+            if not op_state:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Idempotency-key admission is pending; retry shortly.",
+                    headers={"Retry-After": "1"},
+                )
+            return {"operationId": existing_op_id, "status": op_state.get("status", "unknown")}
+        claimed_lookup_key = lookup_key
+
+        # 2. Secure initial query validation (check secrets, SSRF URLs if query is an explicit URL)
         query_str = req.query.strip()
         if query_str.lower().startswith(("http://", "https://")):
             if not is_safe_url(query_str, req.profile):
                 raise HTTPException(status_code=400, detail="SSRF Validation Error: Target query address is blocked.")
 
-        # 2. Reject raw credential headers outside local loopback mode.
-        if not raw_header_credentials_allowed():
-            if any(request.headers.get(header) for header in RAW_CREDENTIAL_HEADERS):
-                raise HTTPException(
-                    status_code=400,
-                    detail="Raw provider credentials are accepted only in local deployment mode."
-                )
+        # 2. External model egress is only permitted through AI-OpenRouter.
+        if request.headers.get(RAW_LLM_CREDENTIAL_HEADER):
+            raise HTTPException(
+                status_code=400,
+                detail="Raw LLM credentials are not accepted; use the configured AI-OpenRouter gateway."
+            )
+        # The search key is an independent credential path, not an external-model
+        # credential. Accept it only where request-scoped headers are honored, so
+        # a remote caller is never told its key was used when it was ignored.
+        if request.headers.get(RAW_SEARCH_CREDENTIAL_HEADER) and not raw_header_credentials_allowed():
+            raise HTTPException(
+                status_code=400,
+                detail="Raw search credentials are accepted only in local deployment mode."
+            )
 
         if bool(req.model_provider) != bool(req.model_name):
             raise HTTPException(
                 status_code=400,
                 detail="model_provider and model_name must be provided together."
             )
+        # External-model selection is only permitted through the gateway, and the
+        # gateway serves the OpenAI-compatible provider only. Local providers
+        # (e.g. ollama) need no external egress and are always allowed, so a
+        # broken cloud configuration must not disable local-first operation.
+        provider = (req.model_provider or "").lower()
+        if provider and provider != "openai" and provider not in LOCAL_MODEL_PROVIDERS:
+            raise HTTPException(
+                status_code=400,
+                detail="AI-OpenRouter supports the OpenAI-compatible model provider only."
+            )
+        external_gateway_selected = False
+        if provider and provider not in LOCAL_MODEL_PROVIDERS:
+            # Explicit external selection: the gateway is required and must be valid.
+            try:
+                gateway = external_openai_gateway_config()
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=503,
+                    detail="AI-OpenRouter gateway configuration is unavailable."
+                ) from exc
+            if not gateway:
+                raise HTTPException(
+                    status_code=503,
+                    detail="External model selection requires the configured AI-OpenRouter gateway."
+                )
+            if not is_gateway_destination_allowed(gateway):
+                raise HTTPException(
+                    status_code=503,
+                    detail="AI-OpenRouter gateway configuration is unavailable."
+                )
+            external_gateway_selected = True
+        elif provider:
+            # Explicit local provider: the configured endpoint must actually be
+            # local. A provider name alone does not establish locality, so an
+            # ``OLLAMA_BASE_URL`` pointed at a public host would otherwise be an
+            # unmetered external egress path that bypasses the gateway.
+            if local_model_endpoint() is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Local model endpoint is not configured as a local address."
+                )
+        else:
+            # No explicit selection: an enabled gateway serves the request, so a
+            # malformed config must fail closed here rather than mid-task. With no
+            # gateway the request defaults to the local model, which must be a
+            # validated local endpoint for the same reason as above.
+            try:
+                gateway = external_openai_gateway_config()
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=503,
+                    detail="AI-OpenRouter gateway configuration is unavailable."
+                ) from exc
+            if gateway:
+                if not is_gateway_destination_allowed(gateway):
+                    raise HTTPException(
+                        status_code=503,
+                        detail="AI-OpenRouter gateway configuration is unavailable."
+                    )
+                external_gateway_selected = True
+            elif local_model_endpoint() is None:
+                raise HTTPException(
+                    status_code=503,
+                    detail="No external gateway is configured and the local model endpoint is not local."
+                )
 
         unsupported_source_policy_keys = set((req.sourcePolicy or {}).keys()) - {"allowedDomains"}
         if unsupported_source_policy_keys:
@@ -305,31 +456,32 @@ async def start_research(
                 )
             )
 
-        # 3. Atomic idempotency check-and-reserve before new-work concurrency limiting.
-        existing_op_id = await storage.claim_idempotency_key(lookup_key, req.operationId)
-        if existing_op_id:
-            logger.info("Idempotency hit for key %s, returning existing operation: %s", lookup_key, existing_op_id)
-            op_state = await storage.get_operation(existing_op_id)
-            return {"operationId": existing_op_id, "status": op_state.get("status") if op_state else "unknown"}
-        claimed_lookup_key = lookup_key
-
-        # 3b. Atomically reserve budget for this new operation. The check-and-
-        # reserve happens in one step so concurrent replicas cannot all pass a
+        # 3. Atomically reserve budget for this new operation (the idempotency
+        # hit above already returned for a retry). The check-and-reserve
+        # happens in one step so concurrent replicas cannot all pass a
         # non-atomic read-then-admit and collectively exceed the ceiling. The
         # reservation is reconciled to the observed cost on completion, or
-        # released on cancel/failure. Placed after the idempotency-hit return
-        # so a retry of already-accepted work still resolves to its operation.
-        reserve_amount = (
-            req.limits.maximumModelCostUsd
-            if req.limits and req.limits.maximumModelCostUsd is not None
-            else settings.DEFAULT_OPERATION_COST_RESERVE_USD
-        )
-        if not await storage.reserve_daily_spend(reserve_amount, settings.DAILY_SPEND_LIMIT_USD, req.operationId):
-            raise HTTPException(
-                status_code=429,
-                detail="Daily spend limit reached. New research operations are paused until the limit resets."
+        # released on cancel/failure.
+        # The local spend ceiling guards externally-metered model work. When the
+        # request is served by AI-OpenRouter it is the budget authority, so this
+        # service must not also reject or throttle the operation against its own
+        # independent ceiling. Local-model work keeps the local ceiling: its
+        # reservation is minor and releasing the hold on completion keeps the
+        # running total a harmless (zero-cost) figure.
+        enforce_local_budget = not external_gateway_selected
+        spend_reserved = 0.0
+        if enforce_local_budget:
+            reserve_amount = (
+                req.limits.maximumModelCostUsd
+                if req.limits and req.limits.maximumModelCostUsd is not None
+                else settings.DEFAULT_OPERATION_COST_RESERVE_USD
             )
-        spend_reserved = reserve_amount
+            if not await storage.reserve_daily_spend(reserve_amount, settings.DAILY_SPEND_LIMIT_USD, req.operationId):
+                raise HTTPException(
+                    status_code=429,
+                    detail="Daily spend limit reached. New research operations are paused until the limit resets."
+                )
+            spend_reserved = reserve_amount
 
         operation_claimed = await storage.claim_operation_id(req.operationId, lookup_key)
         if not operation_claimed:
@@ -369,7 +521,7 @@ async def start_research(
 
     try:
         # Register operation shell
-        await storage.save_operation(op_id, {
+        operation_saved = await storage.save_admitted_operation(op_id, {
             "operationId": op_id,
             "idempotency_key": lookup_key,
             "attempt_id": req.attemptId,
@@ -377,7 +529,12 @@ async def start_research(
             "query": req.query,
             "mode": req.mode,
             "profile": req.profile
-        })
+        }, lookup_key)
+        if not operation_saved:
+            raise HTTPException(
+                status_code=409,
+                detail="Idempotency-key admission lease expired; retry the request."
+            )
 
         # Extract loopback credentials headers
         headers = {
@@ -389,7 +546,9 @@ async def start_research(
         await reporter.report("planning", "Request received. Research task queued.")
 
         # Spawn research execution task in background
-        task = asyncio.create_task(background_research_task(req, reporter, headers, spend_reserved))
+        task = asyncio.create_task(background_research_task(
+            req, reporter, headers, spend_reserved, accounting_delegated=not enforce_local_budget
+        ))
         cancellation_manager.register_task(op_id, task)
         task_started = True
     except Exception as e:
@@ -410,20 +569,37 @@ async def get_research_events(operation_id: str):
         raise HTTPException(status_code=404, detail="Research operation not found")
 
     async def event_generator():
-        last_idx = 0
+        cursor = None
+        # The terminal state is persisted before the terminal progress event is
+        # published, so a crash can never announce completion for an unstored
+        # result. That means observing a terminal status does not guarantee the
+        # final event is readable yet, so the stream waits briefly for it (or for
+        # any other residual event) before closing instead of closing early.
+        terminal_event_grace_seconds = 0.5
+        saw_terminal_event = False
         while True:
-            events = await storage.get_progress_events(operation_id)
-            if len(events) > last_idx:
-                for ev in events[last_idx:]:
-                    yield {"data": json.dumps(ev)}
-                last_idx = len(events)
+            entries = await storage.get_progress_events_after(operation_id, cursor)
+            for event_cursor, ev in entries:
+                yield {"data": json.dumps(ev)}
+                cursor = event_cursor
+                if ev.get("stage") in TERMINAL_STATUSES:
+                    saw_terminal_event = True
 
             op = await storage.get_operation(operation_id)
             if op and op.get("status") in TERMINAL_STATUSES:
-                # Yield any last residual events
-                events = await storage.get_progress_events(operation_id)
-                for ev in events[last_idx:]:
+                waited = 0.0
+                while not saw_terminal_event and waited < terminal_event_grace_seconds:
+                    await asyncio.sleep(0.1)
+                    waited += 0.1
+                    for event_cursor, ev in await storage.get_progress_events_after(operation_id, cursor):
+                        yield {"data": json.dumps(ev)}
+                        cursor = event_cursor
+                        if ev.get("stage") in TERMINAL_STATUSES:
+                            saw_terminal_event = True
+                # Flush anything else that landed after the last poll.
+                for event_cursor, ev in await storage.get_progress_events_after(operation_id, cursor):
                     yield {"data": json.dumps(ev)}
+                    cursor = event_cursor
                 break
 
             await asyncio.sleep(0.5)

@@ -7,6 +7,8 @@ import socket
 import threading
 from urllib.parse import urlparse
 
+from app.config import GatewayConfig, external_gateway_hosts, local_model_endpoint
+
 logger = logging.getLogger("web-intelligence")
 
 BLOCKED_NETWORKS = [
@@ -80,6 +82,61 @@ class SearchBudgetExhausted(PermissionError):
 def _match_domain(host: str, candidates) -> bool:
     return any(host == cand or host.endswith(f".{cand}") for cand in candidates)
 
+def _is_provider_api_host(host: str) -> bool:
+    """True when host is a provider API host, matching the configured gateway
+    exactly.
+
+    Static provider domains may match subdomains (``api.openai.com``), but the
+    operator-configured gateway is a single endpoint: suffix-matching it would
+    also exempt an attacker-controlled subdomain of the gateway (for example
+    ``attacker.gateway.example.com``) from profile allowlists.
+    """
+    if _match_domain(host, PROVIDER_API_HOSTS):
+        return True
+    return host.lower().rstrip(".") in external_gateway_hosts()
+
+# Path prefixes that mark the local model server's own inference API surface.
+# Ollama exposes its native API under /api/* and an OpenAI-compatible surface
+# under /v1/*; nothing else at that host/port is inference traffic.
+_LOCAL_MODEL_API_PATH_PREFIXES = ("/api/", "/v1/")
+
+def _is_local_model_endpoint(host: str, port: int | None = None, path: str | None = None) -> bool:
+    """True when host/port is the validated local model endpoint.
+
+    Only the exact operator-configured local model endpoint is exempted, so
+    model inference can reach a loopback/private Ollama while every other
+    private-address request stays blocked. The port is enforced when known so a
+    different service on the same local host is not exposed.
+
+    When ``path`` is given (the URL-level checks in ``is_safe_url``/
+    ``is_safe_egress_url``), the exemption is further scoped to the model
+    server's own inference API paths. Without this, any URL-shaped request —
+    including a webpage fetched during research whose content happens to link
+    to this loopback host/port — would be exempted from the profile allowlist
+    and SSRF checks, turning a narrow inference-client exception into a general
+    SSRF pivot against the local model service. ``path`` is intentionally
+    omitted by the socket-level host checks (``_ensure_safe_host`` and
+    resolved-address validation): those run only after the URL-level check
+    already gated on path for HTTP-client traffic, so they stay permissive for
+    the same already-authorized host/port.
+    """
+    endpoint = local_model_endpoint()
+    if not endpoint:
+        return False
+    endpoint_host, endpoint_port = endpoint
+    if port is not None and port != endpoint_port:
+        return False
+    if path is not None and not any(path.startswith(prefix) for prefix in _LOCAL_MODEL_API_PATH_PREFIXES):
+        return False
+    candidate = host.lower().rstrip(".")
+    if candidate == endpoint_host:
+        return True
+    # ``localhost`` resolves to either loopback family; accept both spellings so
+    # the socket-level guard (which sees the resolved IP) still recognizes it.
+    if endpoint_host == "localhost" and candidate in ("127.0.0.1", "::1"):
+        return True
+    return False
+
 def _hostname_from_url(url: str) -> str | None:
     try:
         parsed = urlparse(url)
@@ -131,7 +188,7 @@ def resolve_and_verify_host(hostname: str) -> bool:
         logger.error(f"Failed to resolve host {hostname} during SSRF validation: {e}")
         return False
 
-def is_safe_url(url: str, profile: str = "general") -> bool:
+def is_safe_url(url: str, profile: str = "general", *, allow_local_model_endpoint: bool = False) -> bool:
     if not url:
         return False
 
@@ -145,6 +202,19 @@ def is_safe_url(url: str, profile: str = "general") -> bool:
         hostname = parsed.hostname.lower().rstrip(".") if parsed.hostname else None
         if not hostname:
             return False
+
+        # The operator-configured local model endpoint is a service-owned loopback
+        # target, not a public web request; allow it without weakening the profile
+        # allowlist for every other private address -- but only for the model
+        # client's own transport (see _ensure_safe_url's `model_client` flag).
+        # Callers outside the egress guard (citation/source-list filtering,
+        # validating a caller-supplied query string) must never treat the
+        # internal model endpoint as a legitimate web target, so this
+        # exemption defaults off and is scoped to the endpoint's own inference
+        # API path even when enabled, so it cannot become a general SSRF pivot
+        # for arbitrary webpage-fetch traffic aimed at that host/port.
+        if allow_local_model_endpoint and _is_local_model_endpoint(hostname, parsed.port, parsed.path):
+            return True
 
         # Enforce domain allowlist/denylist by profile
         profile_rules = PROFILE_DOMAINS.get(profile)
@@ -166,7 +236,7 @@ def is_safe_url(url: str, profile: str = "general") -> bool:
         logger.error(f"Error during SSRF check for URL {url}: {e}")
         return False
 
-def is_safe_egress_url(url: str) -> bool:
+def is_safe_egress_url(url: str, *, allow_local_model_endpoint: bool = False) -> bool:
     if not url:
         return False
 
@@ -180,10 +250,23 @@ def is_safe_egress_url(url: str) -> bool:
         if not hostname:
             return False
 
+        # See is_safe_url()'s matching comment: defaults off so non-model-client
+        # callers (Brain Memory, Grafana observability, and this guard's own
+        # provider-API branch for non-local providers) never get the local
+        # model exemption; only the model client's own transport enables it.
+        if allow_local_model_endpoint and _is_local_model_endpoint(hostname, parsed.port, parsed.path):
+            return True
+
         return resolve_and_verify_host(hostname)
     except Exception as e:
         logger.error(f"Error during SSRF egress check for URL {url}: {e}")
         return False
+
+
+def is_gateway_destination_allowed(gateway: GatewayConfig | None) -> bool:
+    """Whether a validated gateway config can pass the service egress policy."""
+    return bool(gateway and is_safe_egress_url(gateway.base_url))
+
 
 active_profile: contextvars.ContextVar[str] = contextvars.ContextVar("active_profile", default="general")
 egress_protection_enabled: contextvars.ContextVar[bool] = contextvars.ContextVar("egress_protection_enabled", default=False)
@@ -247,7 +330,7 @@ def _is_provider_api_url(url: str) -> bool:
     is treated as the provider API.
     """
     hostname = _hostname_from_url(str(url))
-    return bool(hostname and _match_domain(hostname, PROVIDER_API_HOSTS))
+    return bool(hostname and _is_provider_api_host(hostname))
 
 
 # Provider domains that also serve public web content (docs, blogs, marketing
@@ -265,9 +348,13 @@ def is_provider_host(url: str) -> bool:
     endpoint and is not redacted; only the machine API surfaces are.
     """
     hostname = _hostname_from_url(str(url))
-    if not hostname or not _match_domain(hostname, PROVIDER_HOSTS):
+    if not hostname:
         return False
-    if _match_domain(hostname, _MIXED_PROVIDER_DOMAINS):
+    configured_gateway = hostname in external_gateway_hosts()
+    static_provider = _match_domain(hostname, PROVIDER_HOSTS)
+    if not configured_gateway and not static_provider:
+        return False
+    if static_provider and _match_domain(hostname, _MIXED_PROVIDER_DOMAINS):
         path = urlparse(str(url)).path or ""
         if any(path.startswith(prefix) for prefix in _PROVIDER_API_PATH_PREFIXES):
             return True
@@ -307,14 +394,24 @@ def _consume_search_budget(url: str):
             raise SearchBudgetExhausted("Search budget exhausted before outbound request.")
         budget["remaining"] = remaining - 1
 
-def _ensure_safe_url(url: str):
+def _ensure_safe_url(url: str, *, model_client: bool = False):
+    """Validate an outbound URL under the active egress guard.
+
+    ``model_client`` must be True only when the caller is the patched httpx
+    transport (openai/ollama SDKs use httpx exclusively in this stack, while
+    GPT Researcher's own page scraping and search retrievers use requests, and
+    aiohttp is otherwise unused for model traffic here). Only that transport
+    may benefit from the local-model-endpoint exemption, so a webpage fetched
+    over requests/aiohttp during profiled research cannot use a link back to
+    the loopback model host/port as an SSRF pivot.
+    """
     if not _egress_protection_active():
         return
     profile = _active_egress_profile()
     is_safe = False if profile == _DENY_ALL_PROFILE else (
-        is_safe_egress_url(str(url)) if _is_provider_api_url(str(url))
-        else is_safe_url(str(url), profile) if profile != "general"
-        else is_safe_egress_url(str(url))
+        is_safe_egress_url(str(url), allow_local_model_endpoint=model_client) if _is_provider_api_url(str(url))
+        else is_safe_url(str(url), profile, allow_local_model_endpoint=model_client) if profile != "general"
+        else is_safe_egress_url(str(url), allow_local_model_endpoint=model_client)
     )
     if not is_safe:
         # Log only the scheme+host, not the full URL: query strings can carry
@@ -324,7 +421,7 @@ def _ensure_safe_url(url: str):
         raise PermissionError(f"SSRF blocked outbound request: {url}")
     _consume_search_budget(str(url))
 
-def _ensure_safe_host(host: str):
+def _ensure_safe_host(host: str, port: int | None = None):
     if not _egress_protection_active() or not host:
         return
 
@@ -336,6 +433,8 @@ def _ensure_safe_host(host: str):
     clean_host = host.split('%')[0]  # strip IPv6 zone index before parsing
     try:
         ipaddress.ip_address(clean_host)
+        if _is_local_model_endpoint(clean_host, port):
+            return
         if not is_safe_ip(clean_host):
             logger.error("SSRF egress guard denied connection to private/reserved IP %s", host)
             raise PermissionError(f"SSRF blocked private IP connection: {host}")
@@ -344,17 +443,24 @@ def _ensure_safe_host(host: str):
         pass  # not an IP address — fall through to hostname checks
 
     profile = _active_egress_profile()
-    # Mirror the provider bypass from _ensure_safe_url so profiled research can reach model/search APIs.
-    is_safe = False if profile == _DENY_ALL_PROFILE else (
-        resolve_and_verify_host(str(host)) if _match_domain(host, PROVIDER_API_HOSTS)
-        else is_safe_url(f"https://{host}", profile) if profile != "general"
-        else resolve_and_verify_host(str(host))
-    )
+    # Mirror the provider bypass from _ensure_safe_url so profiled research can
+    # reach model/search APIs, and exempt the validated local model endpoint so
+    # local inference is not mistaken for a public-address violation.
+    if profile == _DENY_ALL_PROFILE:
+        is_safe = False
+    elif _is_local_model_endpoint(str(host), port):
+        is_safe = True
+    elif _is_provider_api_host(str(host)):
+        is_safe = resolve_and_verify_host(str(host))
+    elif profile != "general":
+        is_safe = is_safe_url(f"https://{host}", profile)
+    else:
+        is_safe = resolve_and_verify_host(str(host))
     if not is_safe:
         logger.error("SSRF egress guard denied connection to host %s", host)
         raise PermissionError(f"SSRF blocked outbound host: {host}")
 
-def _validate_resolved_hosts(host: str, resolved_hosts):
+def _validate_resolved_hosts(host: str, resolved_hosts, port: int | None = None):
     if not _egress_protection_active():
         return
 
@@ -371,7 +477,7 @@ def _validate_resolved_hosts(host: str, resolved_hosts):
         clean_host = str(resolved_host).split("%")[0]
         try:
             ipaddress.ip_address(clean_host)
-            is_safe = is_safe_ip(clean_host)
+            is_safe = _is_local_model_endpoint(host, port) or is_safe_ip(clean_host)
         except ValueError:
             is_safe = resolve_and_verify_host(clean_host)
 
@@ -439,7 +545,7 @@ if aiohttp:
 
     async def patched_aiohttp_resolve_host(self, host, port, *args, **kwargs):
         try:
-            _ensure_safe_host(host)
+            _ensure_safe_host(host, port)
         except PermissionError as exc:
             raise aiohttp.ClientConnectorError(
                 connection_key=None,
@@ -447,7 +553,7 @@ if aiohttp:
             )
         resolved_hosts = await _original_aiohttp_resolve_host(self, host, port, *args, **kwargs)
         try:
-            _validate_resolved_hosts(host, resolved_hosts)
+            _validate_resolved_hosts(host, resolved_hosts, port)
         except PermissionError as exc:
             raise aiohttp.ClientConnectorError(
                 connection_key=None,
@@ -488,14 +594,18 @@ if httpx:
 
     def patched_httpx_client_send(self, request, *args, **kwargs):
         try:
-            _ensure_safe_url(str(request.url))
+            # httpx is exclusively the transport openai/ollama SDKs use in
+            # this stack (GPT Researcher's own page scraping and search
+            # retrievers use requests), so it is the model client's transport
+            # and may benefit from the local-model-endpoint exemption.
+            _ensure_safe_url(str(request.url), model_client=True)
         except PermissionError as exc:
             raise httpx.ConnectError(str(exc), request=request) from exc
         return _original_httpx_client_send(self, request, *args, **kwargs)
 
     async def patched_httpx_async_client_send(self, request, *args, **kwargs):
         try:
-            _ensure_safe_url(str(request.url))
+            _ensure_safe_url(str(request.url), model_client=True)
         except PermissionError as exc:
             raise httpx.ConnectError(str(exc), request=request) from exc
         return await _original_httpx_async_client_send(self, request, *args, **kwargs)
@@ -509,12 +619,14 @@ _original_socket_connect = socket.socket.connect
 
 def patched_socket_create_connection(address, timeout=None, source_address=None, *args, **kwargs):
     host = address[0] if isinstance(address, tuple) and address else None
-    _ensure_safe_host(host)
+    port = address[1] if isinstance(address, tuple) and len(address) > 1 else None
+    _ensure_safe_host(host, port)
     return _original_socket_create_connection(address, timeout, source_address, *args, **kwargs)
 
 def patched_socket_connect(self, address):
     host = address[0] if isinstance(address, tuple) and address else None
-    _ensure_safe_host(host)
+    port = address[1] if isinstance(address, tuple) and len(address) > 1 else None
+    _ensure_safe_host(host, port)
     return _original_socket_connect(self, address)
 
 socket.create_connection = patched_socket_create_connection

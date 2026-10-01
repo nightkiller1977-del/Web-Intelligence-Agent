@@ -164,3 +164,140 @@ def test_provider_redaction_allows_public_pages_on_provider_domains():
     assert is_provider_host("https://openrouter.ai/api/v1/models") is True
     assert is_provider_host("https://api.tavily.com/search") is True
     assert is_provider_host("https://google.serper.dev/search") is True
+
+
+def test_gateway_destination_rejects_private_addresses():
+    from app.config import GatewayConfig
+
+    gateway = GatewayConfig("https://127.0.0.1", "test-key")
+
+    assert security.is_gateway_destination_allowed(gateway) is False
+
+
+def test_provider_redaction_includes_the_configured_gateway(monkeypatch):
+    monkeypatch.setattr(
+        security,
+        "external_gateway_hosts",
+        lambda: ("gateway.example", "openrouter.ai"),
+    )
+
+    assert security.is_provider_host("https://gateway.example/v1/chat/completions") is True
+    assert security.is_provider_host("https://attacker.gateway.example/v1/chat/completions") is False
+    assert security.is_provider_host("https://openrouter.ai/docs/quickstart") is False
+
+
+def test_profile_policy_allows_configured_gateway_host(monkeypatch):
+    """A configured AI-OpenRouter gateway must be treated as a provider host.
+
+    Regression test: the gateway is not in the static provider list, so profiled
+    research applied the public-domain allowlist and refused the configured
+    gateway before inference could run.
+    """
+    monkeypatch.setattr(security, "resolve_and_verify_host", lambda _host: True)
+    monkeypatch.setattr(security, "external_gateway_hosts", lambda: ("gateway.example",))
+
+    with enforce_egress_protection("technical"):
+        security._ensure_safe_url("https://gateway.example/v1/chat/completions")
+
+
+def test_profile_policy_still_blocks_unconfigured_hosts(monkeypatch):
+    monkeypatch.setattr(security, "resolve_and_verify_host", lambda _host: True)
+    monkeypatch.setattr(security, "external_gateway_hosts", lambda: ("gateway.example",))
+
+    with enforce_egress_protection("technical"):
+        with pytest.raises(requests.exceptions.ConnectionError):
+            requests.get("https://not-the-gateway.example/v1/chat/completions", timeout=0.1)
+
+
+def test_profile_policy_blocks_subdomains_of_the_configured_gateway(monkeypatch):
+    """The configured gateway is a single endpoint, not a domain wildcard.
+
+    Regression test: suffix-matching the configured gateway would exempt an
+    attacker-controlled subdomain (``attacker.gateway.example``) from the
+    profile allowlist, leaving only the public-IP check.
+    """
+    monkeypatch.setattr(security, "resolve_and_verify_host", lambda _host: True)
+    monkeypatch.setattr(security, "external_gateway_hosts", lambda: ("gateway.example",))
+
+    assert security._is_provider_api_host("gateway.example") is True
+    assert security._is_provider_api_host("attacker.gateway.example") is False
+
+    with enforce_egress_protection("technical"):
+        with pytest.raises(requests.exceptions.ConnectionError):
+            requests.get("https://attacker.gateway.example/v1/chat/completions", timeout=0.1)
+
+
+def test_local_model_endpoint_is_allowed_under_profiled_egress(monkeypatch):
+    """Default local inference must not be blocked by the egress guard.
+
+    Regression test: the no-gateway default points every model tier at Ollama on
+    a loopback address, which the private-address check rejected, so local
+    research failed before inference. The exemption is scoped to the model
+    client's own transport (``model_client=True``, which the patched httpx
+    send functions pass automatically) -- see
+    test_local_model_endpoint_url_exemption_requires_model_client_transport
+    for why a non-model-client caller must not get it.
+    """
+    monkeypatch.setattr(security, "local_model_endpoint", lambda: ("127.0.0.1", 11434))
+
+    with enforce_egress_protection("technical"):
+        security._ensure_safe_url("http://127.0.0.1:11434/api/chat", model_client=True)
+        security._ensure_safe_host("127.0.0.1", 11434)
+
+
+def test_local_model_endpoint_exemption_is_scoped_to_the_configured_endpoint(monkeypatch):
+    """Only the configured local endpoint is exempt; other private hosts stay blocked."""
+    monkeypatch.setattr(security, "local_model_endpoint", lambda: ("127.0.0.1", 11434))
+
+    with enforce_egress_protection("technical"):
+        with pytest.raises(requests.exceptions.ConnectionError):
+            requests.get("http://127.0.0.1:6379/", timeout=0.1)
+        with pytest.raises(PermissionError):
+            security._ensure_safe_host("10.0.0.1", 11434)
+
+
+def test_local_model_endpoint_url_exemption_is_scoped_to_inference_api_paths(monkeypatch):
+    """The URL-level exemption must not become a general SSRF pivot.
+
+    Regression test: an earlier fix exempted the configured local model
+    host/port unconditionally in is_safe_url/is_safe_egress_url, so any
+    URL-shaped request to that host/port -- including a webpage fetched during
+    research whose content links back to it -- was let through the profile
+    allowlist and SSRF checks. The exemption must be scoped to the model
+    server's own inference API paths (/api/*, /v1/*), and (see the next test)
+    to the model-client transport itself.
+    """
+    monkeypatch.setattr(security, "local_model_endpoint", lambda: ("127.0.0.1", 11434))
+
+    assert security.is_safe_url("http://127.0.0.1:11434/api/chat", "technical", allow_local_model_endpoint=True) is True
+    assert security.is_safe_url("http://127.0.0.1:11434/v1/chat/completions", "technical", allow_local_model_endpoint=True) is True
+    assert security.is_safe_egress_url("http://127.0.0.1:11434/api/generate", allow_local_model_endpoint=True) is True
+
+    # A non-API path at the same host/port (e.g. a page a scraper was tricked
+    # into fetching) is not inference traffic and must not be exempted.
+    assert security.is_safe_url("http://127.0.0.1:11434/", "technical", allow_local_model_endpoint=True) is False
+    assert security.is_safe_egress_url("http://127.0.0.1:11434/", allow_local_model_endpoint=True) is False
+
+
+def test_local_model_endpoint_url_exemption_requires_model_client_transport(monkeypatch):
+    """The exemption defaults off; only an explicit model-client caller gets it.
+
+    Regression test: is_safe_url()/is_safe_egress_url() must never exempt the
+    local model host/port for a caller that did not explicitly ask for the
+    model-client exemption -- citation/source-list filtering, a caller-supplied
+    query URL check, or a webpage fetched over requests/aiohttp during
+    research must all see this host/port as an ordinary private address, not
+    as the service's own inference endpoint.
+    """
+    monkeypatch.setattr(security, "local_model_endpoint", lambda: ("127.0.0.1", 11434))
+
+    assert security.is_safe_url("http://127.0.0.1:11434/api/chat", "technical") is False
+    assert security.is_safe_egress_url("http://127.0.0.1:11434/api/chat") is False
+
+    # The egress guard itself defaults to no model-client exemption, matching
+    # what the requests/aiohttp transport patches pass (they never set
+    # model_client=True -- only the httpx patches do, since httpx is the
+    # model SDKs' exclusive transport in this stack).
+    with enforce_egress_protection("technical"):
+        with pytest.raises(requests.exceptions.ConnectionError):
+            requests.get("http://127.0.0.1:11434/api/chat", timeout=0.1)

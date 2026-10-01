@@ -82,4 +82,4 @@ def observe_research_result(result: dict):
 
     output_tokens = estimate_tokens(result.get("answer") or "")
     if output_tokens:
-        track_operation_cost(profile, output_tokens)
+        research_cost_tokens.labels(agent_profile=profile, token_type="output").inc(output_tokens)

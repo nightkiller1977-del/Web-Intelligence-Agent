@@ -1,7 +1,10 @@
 # app/config.py
 import os
+import ipaddress
 import secrets
 import logging
+from dataclasses import dataclass
+from urllib.parse import urlsplit
 from pydantic import AliasChoices, Field, model_validator
 from pydantic_settings import BaseSettings
 from pydantic_settings import SettingsConfigDict
@@ -34,7 +37,11 @@ class Settings(BaseSettings):
     # 'local' (in-memory/SQLite) vs. 'redis' (production queues on Render)
     STORAGE_BACKEND: str = os.getenv("STORAGE_BACKEND", "local")
     REDIS_URL: str = os.getenv("REDIS_URL", "")
-    # Concurrency and Budgets
+    # Concurrency and resource limits. The daily spend ceiling below is a local
+    # guard: it is enforced only for externally-metered work this service itself
+    # cannot delegate. When AI-OpenRouter serves the request it is the budget
+    # authority, and local models have no external cost, so admission neither
+    # reserves nor reconciles spend for those paths.
     MAX_CONCURRENT_OPS: int = int(os.getenv("MAX_CONCURRENT_OPS", 3))
     MAX_MEMORY_MB: int = int(os.getenv("MAX_MEMORY_MB", 512))
     DAILY_SPEND_LIMIT_USD: float = float(os.getenv("DAILY_SPEND_LIMIT_USD", 50.0))
@@ -116,6 +123,21 @@ class Settings(BaseSettings):
     BRAIN_MEMORY_URL: str = ""
     BRAIN_MEMORY_KEY_ID: str = ""
     BRAIN_MEMORY_SECRET: str = ""
+    AI_OPENROUTER_ENABLED: bool = False
+    AI_OPENROUTER_BASE_URL: str = ""
+    AI_OPENROUTER_API_KEY: str = ""
+    # OpenAI-compatible model the gateway serves when a request selects no model.
+    AI_OPENROUTER_DEFAULT_MODEL: str = os.getenv("AI_OPENROUTER_DEFAULT_MODEL", "gpt-4o-mini")
+    # OpenAI embedding model name used when embeddings run through the gateway.
+    OPENAI_EMBEDDING_MODEL: str = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
+    # Local model used when no gateway is configured and the request selects no
+    # model. Keeps default inference local instead of an ambient external default.
+    LOCAL_DEFAULT_MODEL: str = os.getenv("LOCAL_DEFAULT_MODEL", "llama3")
+    # Local embedding model used for local inference. GPT Researcher's EMBEDDING
+    # default is an OpenAI embedding, which would otherwise fail (or egress) when
+    # credentials are masked in local mode.
+    LOCAL_EMBEDDING_MODEL: str = os.getenv("LOCAL_EMBEDDING_MODEL", "nomic-embed-text")
+    OLLAMA_BASE_URL: str = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
 
 settings = Settings()
 
@@ -133,6 +155,118 @@ def raw_header_credentials_allowed() -> bool:
 
 def unauthenticated_docs_allowed() -> bool:
     return settings.DEPLOYMENT_MODE == "local" and settings.ALLOW_UNAUTHENTICATED_DOCS
+
+# Providers that run locally and therefore never need external-model egress.
+LOCAL_MODEL_PROVIDERS = frozenset({"ollama"})
+
+# Credentials for external inference providers. When no gateway is configured
+# these must be masked inside the request context: an ambient key combined with
+# an ambient model tier would otherwise let GPT Researcher reach a provider
+# directly, outside the single approved egress path.
+EXTERNAL_PROVIDER_CREDENTIALS = frozenset({
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "AZURE_OPENAI_API_KEY",
+    "COHERE_API_KEY",
+    "GOOGLE_API_KEY",
+    "GEMINI_API_KEY",
+    "FIREWORKS_API_KEY",
+    "TOGETHER_API_KEY",
+    "MISTRAL_API_KEY",
+    "GROQ_API_KEY",
+    "DASHSCOPE_API_KEY",
+    "DEEPSEEK_API_KEY",
+    "XAI_API_KEY",
+    "OPENROUTER_API_KEY",
+    "AIMLAPI_API_KEY",
+    "VLLM_OPENAI_API_KEY",
+    "FORGE_API_KEY",
+    "MODELSLAB_API_KEY",
+    "HF_TOKEN",
+    "HUGGINGFACEHUB_API_TOKEN",
+})
+
+@dataclass(frozen=True)
+class GatewayConfig:
+    base_url: str
+    api_key: str
+
+
+def _validated_url_port(parsed, default: int | None = None) -> int | None:
+    """Return a usable parsed port, rejecting malformed values and port zero."""
+    port = parsed.port
+    if port == 0:
+        raise ValueError("URL port must be between 1 and 65535")
+    return default if port is None else port
+
+
+def external_openai_gateway_config() -> GatewayConfig | None:
+    if not settings.AI_OPENROUTER_ENABLED:
+        return None
+    base_url = settings.AI_OPENROUTER_BASE_URL.strip().rstrip("/")
+    parsed = urlsplit(base_url)
+    try:
+        # Force lazy port parsing and reject explicit port zero before work is
+        # admitted; both would otherwise fail only in the HTTP client.
+        _validated_url_port(parsed)
+    except ValueError as exc:
+        raise ValueError("AI-OpenRouter gateway configuration is incomplete or invalid") from exc
+    if not settings.AI_OPENROUTER_API_KEY.strip() or not (parsed.scheme == "https" and parsed.hostname and not parsed.username and not parsed.password and not parsed.query and not parsed.fragment):
+        raise ValueError("AI-OpenRouter gateway configuration is incomplete or invalid")
+    return GatewayConfig(base_url, settings.AI_OPENROUTER_API_KEY.strip())
+
+def external_gateway_hosts() -> tuple[str, ...]:
+    """Validated gateway hostname(s) that the egress guard must treat as a provider.
+
+    The gateway is a service-owned inference endpoint, so it needs the same
+    provider exemption as the static provider hosts; otherwise profiled research
+    would apply a public-domain allowlist and refuse the configured gateway.
+    Only the validated hostname is returned, never the credential.
+    """
+    try:
+        gateway = external_openai_gateway_config()
+    except ValueError:
+        return ()
+    if not gateway:
+        return ()
+    hostname = urlsplit(gateway.base_url).hostname
+    return (hostname.lower().rstrip("."),) if hostname else ()
+
+
+def local_model_endpoint() -> tuple[str, int] | None:
+    """Host/port of the configured local model endpoint, or None if not local.
+
+    A provider name alone does not establish locality: ``OLLAMA_BASE_URL`` can be
+    pointed at a public host. Only a loopback or private-address endpoint is
+    accepted as local, so a "local" model selection can never become an unmetered
+    external egress path or bypass the shared gateway.
+    """
+    parsed = urlsplit(settings.OLLAMA_BASE_URL.strip())
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        return None
+    host = parsed.hostname.lower().rstrip(".")
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        if host != "localhost":
+            return None
+        address = ipaddress.ip_address("127.0.0.1")
+    if (
+        address.is_link_local
+        or address.is_multicast
+        or address.is_reserved
+        or address.is_unspecified
+    ):
+        return None
+    if not (address.is_loopback or address.is_private):
+        return None
+    try:
+        port = _validated_url_port(
+            parsed, 443 if parsed.scheme == "https" else 80
+        )
+    except ValueError:
+        return None
+    return host, port
 
 
 def brain_memory_client():

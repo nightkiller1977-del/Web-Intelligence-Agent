@@ -40,7 +40,7 @@ class ResearchRequestInput(BaseModel):
     requireClaimVerification: Optional[bool] = Field(False, description="Return source/context passage-backed claim verification records")
     
     # Model preferences
-    model_provider: Optional[str] = Field(None, description="GPT Researcher LLM provider, for example openai")
+    model_provider: Optional[str] = Field(None, description="GPT Researcher LLM provider; only the OpenAI-compatible gateway provider (openai) or a local provider (ollama) is supported")
     model_name: Optional[str] = Field(None, description="GPT Researcher LLM model name")
 
     @field_validator("mode")

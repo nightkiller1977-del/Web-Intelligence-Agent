@@ -33,6 +33,11 @@ def _auth_headers():
     return {"Authorization": f"Bearer {settings.AUTH_TOKEN}"}
 
 
+def _allow_test_gateway(monkeypatch):
+    """Keep tests for unrelated gateway behavior independent of DNS."""
+    monkeypatch.setattr(api, "is_gateway_destination_allowed", lambda _gateway: True)
+
+
 @pytest.fixture(autouse=True)
 def reset_storage_state():
     for attr in ("operations", "events", "idempotency_keys", "operation_claims", "operation_owners"):
@@ -247,6 +252,75 @@ def test_research_submission_reuses_idempotency_key(monkeypatch):
     assert second.json()["operationId"] == operation_id
 
 
+def test_idempotency_retry_does_not_report_unpersisted_admission_as_accepted():
+    lookup_key = "pending-admission-key"
+    operation_id = "op-pending-admission"
+    asyncio.run(api.storage.claim_idempotency_key(lookup_key, operation_id))
+
+    with TestClient(app) as client:
+        retry = client.post(
+            "/v1/research",
+            json=_payload("different-op-id", lookup_key),
+            headers=_auth_headers(),
+        )
+
+    assert retry.status_code == 409
+    assert retry.headers["retry-after"] == "1"
+    assert "pending" in retry.json()["detail"].lower()
+
+
+def test_idempotency_retry_resolves_before_gateway_admission_checks(monkeypatch):
+    # A retry of already-accepted work must resolve to its existing operation
+    # even when a later admission check (here, gateway configuration that
+    # became invalid after the first request -- e.g. a rolling restart or a
+    # replica missing its secret) would now reject a *new* request. Those
+    # checks only matter for new work; applying them to a retry would turn an
+    # ambiguous submission into a spurious rejection instead of letting the
+    # client reconcile with its persisted operation.
+    async def fake_conduct_web_research(**kwargs):
+        return {
+            "operationId": kwargs["op_id"],
+            "status": "completed",
+            "mode": kwargs["mode"],
+            "profile": kwargs["profile"],
+            "answer": "Mock answer",
+            "sources": [], "evidence": [], "claims": [], "citations": [], "searchesPerformed": [],
+            "metrics": {
+                "startedAt": "2026-01-01T00:00:00+00:00",
+                "completedAt": "2026-01-01T00:00:01+00:00",
+                "durationMs": 1,
+                "searchesPerformed": 0, "pagesRead": 0, "sourcesConsidered": 0, "sourcesUsed": 0,
+            },
+        }
+
+    monkeypatch.setattr(api, "conduct_web_research", fake_conduct_web_research)
+    monkeypatch.setattr(settings, "AI_OPENROUTER_ENABLED", True)
+    monkeypatch.setattr(settings, "AI_OPENROUTER_BASE_URL", "https://gateway.example")
+    monkeypatch.setattr(settings, "AI_OPENROUTER_API_KEY", "test-gateway-key")
+    _allow_test_gateway(monkeypatch)
+
+    operation_id = "op-idem-retry-gateway"
+    payload = _payload(operation_id, "same-retry-key")
+    payload["model_provider"] = "openai"
+    payload["model_name"] = "gpt-4o-mini"
+
+    with TestClient(app) as client:
+        first = client.post("/v1/research", json=payload, headers=_auth_headers())
+        assert first.status_code == 202
+
+        # Simulate the gateway secret becoming unavailable (e.g. a rolling
+        # restart hit a replica missing it) before the client retries.
+        monkeypatch.setattr(settings, "AI_OPENROUTER_API_KEY", "")
+
+        retry_payload = _payload("different-op-id", "same-retry-key")
+        retry_payload["model_provider"] = "openai"
+        retry_payload["model_name"] = "gpt-4o-mini"
+        retry = client.post("/v1/research", json=retry_payload, headers=_auth_headers())
+
+    assert retry.status_code == 202
+    assert retry.json()["operationId"] == operation_id
+
+
 def test_source_policy_allowed_domains_is_passed_to_adapter(monkeypatch):
     observed_source_policy = None
 
@@ -416,6 +490,10 @@ def test_model_preferences_are_passed_to_adapter(monkeypatch):
         }
 
     monkeypatch.setattr(api, "conduct_web_research", fake_conduct_web_research)
+    monkeypatch.setattr(settings, "AI_OPENROUTER_ENABLED", True)
+    monkeypatch.setattr(settings, "AI_OPENROUTER_BASE_URL", "https://gateway.example")
+    monkeypatch.setattr(settings, "AI_OPENROUTER_API_KEY", "test-gateway-key")
+    _allow_test_gateway(monkeypatch)
     payload = _payload("op-model-preferences")
     payload["model_provider"] = "openai"
     payload["model_name"] = "gpt-4o-mini"
@@ -438,6 +516,74 @@ def test_incomplete_model_preferences_are_rejected():
 
     assert response.status_code == 400
     assert "must be provided together" in response.json()["detail"]
+
+
+def test_external_model_selection_requires_the_shared_gateway(monkeypatch):
+    monkeypatch.setattr(settings, "AI_OPENROUTER_ENABLED", False)
+    payload = _payload("op-external-model-without-gateway")
+    payload["model_provider"] = "openai"
+    payload["model_name"] = "gpt-4o-mini"
+
+    with TestClient(app) as client:
+        response = client.post("/v1/research", json=payload, headers=_auth_headers())
+
+    assert response.status_code == 503
+    assert "AI-OpenRouter" in response.json()["detail"]
+
+
+def test_raw_llm_credentials_are_rejected_even_in_local_mode(monkeypatch):
+    monkeypatch.setattr(settings, "DEPLOYMENT_MODE", "local")
+    payload = _payload("op-raw-llm-credential")
+    headers = _auth_headers() | {"X-LLM-Key": "direct-provider-key"}
+
+    with TestClient(app) as client:
+        response = client.post("/v1/research", json=payload, headers=headers)
+
+    assert response.status_code == 400
+    assert "AI-OpenRouter" in response.json()["detail"]
+
+
+def test_invalid_gateway_configuration_fails_closed(monkeypatch):
+    monkeypatch.setattr(settings, "AI_OPENROUTER_ENABLED", True)
+    monkeypatch.setattr(settings, "AI_OPENROUTER_BASE_URL", "http://gateway.example")
+    monkeypatch.setattr(settings, "AI_OPENROUTER_API_KEY", "test-gateway-key")
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        response = client.post("/v1/research", json=_payload("op-invalid-gateway"), headers=_auth_headers())
+
+    assert response.status_code == 503
+    assert "AI-OpenRouter" in response.json()["detail"]
+
+
+def test_gateway_destination_blocked_by_egress_policy_fails_closed(monkeypatch):
+    monkeypatch.setattr(settings, "AI_OPENROUTER_ENABLED", True)
+    monkeypatch.setattr(settings, "AI_OPENROUTER_BASE_URL", "https://127.0.0.1")
+    monkeypatch.setattr(settings, "AI_OPENROUTER_API_KEY", "test-gateway-key")
+    payload = _payload("op-blocked-gateway")
+    payload["model_provider"] = "openai"
+    payload["model_name"] = "gpt-4o-mini"
+
+    with TestClient(app) as client:
+        response = client.post("/v1/research", json=payload, headers=_auth_headers())
+
+    assert response.status_code == 503
+    assert "AI-OpenRouter" in response.json()["detail"]
+
+
+def test_invalid_gateway_configuration_does_not_block_local_requests(monkeypatch):
+    # A broken cloud gateway config must not disable local-first operation: a
+    # local model provider needs no external egress, so it must still be admitted.
+    monkeypatch.setattr(settings, "AI_OPENROUTER_ENABLED", True)
+    monkeypatch.setattr(settings, "AI_OPENROUTER_BASE_URL", "http://gateway.example")
+    monkeypatch.setattr(settings, "AI_OPENROUTER_API_KEY", "test-gateway-key")
+    payload = _payload("op-invalid-gateway-local-model")
+    payload["model_provider"] = "ollama"
+    payload["model_name"] = "llama3"
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        response = client.post("/v1/research", json=payload, headers=_auth_headers())
+
+    assert response.status_code == 202
 
 
 def test_cancel_unknown_operation_returns_not_found():
@@ -506,10 +652,10 @@ async def test_sse_stream_closes_after_terminal_status():
 
 @pytest.mark.anyio
 async def test_sse_stream_flushes_residual_events_before_close(monkeypatch):
-    """Exercises the generator's second get_progress_events() call - the one
+    """Exercises the generator's post-terminal-status event fetch - the one
     made *after* it observes a terminal status, specifically to flush any
     event that landed in the gap between the loop's first fetch and its
-    terminal-status check. A fake storage.get_progress_events with a
+    terminal-status check. A fake storage.get_progress_events_after with a
     call-counting side effect deterministically reproduces that gap instead
     of relying on a real timing race."""
     operation_id = "op-sse-residual"
@@ -519,11 +665,12 @@ async def test_sse_stream_flushes_residual_events_before_close(monkeypatch):
     residual_batch = first_batch + [{"stage": "completed", "message": "residual"}]
     call_count = {"n": 0}
 
-    async def fake_get_progress_events(op_id):
+    async def fake_get_progress_events_after(op_id, cursor):
         call_count["n"] += 1
-        return first_batch if call_count["n"] == 1 else residual_batch
+        events = first_batch if call_count["n"] == 1 else residual_batch
+        return [(str(index), event) for index, event in enumerate(events, 1) if cursor is None or index > int(cursor)]
 
-    monkeypatch.setattr(api.storage, "get_progress_events", fake_get_progress_events)
+    monkeypatch.setattr(api.storage, "get_progress_events_after", fake_get_progress_events_after)
 
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
@@ -533,7 +680,7 @@ async def test_sse_stream_flushes_residual_events_before_close(monkeypatch):
         )
 
     assert [e["message"] for e in events] == ["first", "residual"]
-    assert call_count["n"] == 2, "the terminal-status branch must re-fetch events to flush residual ones"
+    assert call_count["n"] >= 2, "the terminal-status branch must re-fetch events to flush residual ones"
 
 
 @pytest.mark.anyio
@@ -746,3 +893,180 @@ def test_failed_operation_still_reports_input_limitations(monkeypatch):
     assert result["status"] == "failed"
     assert any("Local inputs" in item for item in result["limitations"])
 
+
+
+@pytest.mark.parametrize(
+    ("gateway_enabled", "gateway_url"),
+    [
+        (False, ""),
+        (True, "http://gateway.example"),
+        (True, "https://gateway.example"),
+    ],
+)
+def test_unsupported_model_provider_is_rejected_before_gateway_validation(
+    monkeypatch, gateway_enabled, gateway_url
+):
+    monkeypatch.setattr(settings, "AI_OPENROUTER_ENABLED", gateway_enabled)
+    monkeypatch.setattr(settings, "AI_OPENROUTER_BASE_URL", gateway_url)
+    monkeypatch.setattr(settings, "AI_OPENROUTER_API_KEY", "test-gateway-key")
+    payload = _payload("op-gateway-provider")
+    payload["model_provider"] = "anthropic"
+    payload["model_name"] = "claude-3"
+
+    with TestClient(app) as client:
+        response = client.post("/v1/research", json=payload, headers=_auth_headers())
+
+    assert response.status_code == 400
+    assert "OpenAI-compatible" in response.json()["detail"]
+
+
+def test_search_credentials_are_rejected_in_remote_mode(monkeypatch):
+    # A remote caller must not be told its X-Search-Key was honored when remote
+    # mode silently ignores request-scoped credentials.
+    monkeypatch.setattr(settings, "DEPLOYMENT_MODE", "remote")
+    monkeypatch.setattr(settings, "AUTH_TOKEN", "test-token")
+    headers = _auth_headers() | {"X-Search-Key": "tavily-key"}
+    payload = _payload("op-remote-search-key")
+
+    with TestClient(app) as client:
+        response = client.post("/v1/research", json=payload, headers=headers)
+
+    assert response.status_code == 400
+    assert "local deployment mode" in response.json()["detail"]
+
+
+def test_search_credentials_are_accepted_in_local_mode_with_gateway_enabled(monkeypatch):
+    # Enabling the model gateway must not disable the independent local search
+    # credential path; the request should be admitted.
+    monkeypatch.setattr(settings, "DEPLOYMENT_MODE", "local")
+    monkeypatch.setattr(settings, "AI_OPENROUTER_ENABLED", True)
+    monkeypatch.setattr(settings, "AI_OPENROUTER_BASE_URL", "https://gateway.example")
+    monkeypatch.setattr(settings, "AI_OPENROUTER_API_KEY", "test-gateway-key")
+    _allow_test_gateway(monkeypatch)
+    headers = _auth_headers() | {"X-Search-Key": "tavily-key"}
+    payload = _payload("op-local-search-key-gateway")
+
+    with TestClient(app) as client:
+        response = client.post("/v1/research", json=payload, headers=headers)
+
+    assert response.status_code == 202
+
+
+def test_gateway_mode_allows_local_model_provider(monkeypatch):
+    # A local provider needs no external egress, so the gateway's OpenAI-only
+    # restriction must not reject it.
+    monkeypatch.setattr(settings, "AI_OPENROUTER_ENABLED", True)
+    monkeypatch.setattr(settings, "AI_OPENROUTER_BASE_URL", "https://gateway.example")
+    monkeypatch.setattr(settings, "AI_OPENROUTER_API_KEY", "test-gateway-key")
+    payload = _payload("op-gateway-ollama")
+    payload["model_provider"] = "ollama"
+    payload["model_name"] = "llama3"
+
+    with TestClient(app) as client:
+        response = client.post("/v1/research", json=payload, headers=_auth_headers())
+
+    # Accepted for processing (a local provider is admitted, not rejected).
+    assert response.status_code == 202
+
+
+def test_gateway_request_does_not_reserve_local_budget(monkeypatch):
+    # AI-OpenRouter is the budget authority for gateway-served work, so this
+    # service must not apply its own daily ceiling (which could independently
+    # reject work the gateway would allow).
+    async def ok_research(**kwargs):
+        return _completed_result(kwargs["op_id"])
+
+    monkeypatch.setattr(api, "conduct_web_research", ok_research)
+    # A ceiling below the per-operation reserve would normally reject admission.
+    monkeypatch.setattr(settings, "DAILY_SPEND_LIMIT_USD", 0.01)
+    monkeypatch.setattr(settings, "AI_OPENROUTER_ENABLED", True)
+    monkeypatch.setattr(settings, "AI_OPENROUTER_BASE_URL", "https://gateway.example")
+    monkeypatch.setattr(settings, "AI_OPENROUTER_API_KEY", "test-gateway-key")
+    _allow_test_gateway(monkeypatch)
+    payload = _payload("op-gateway-budget")
+    payload["model_provider"] = "openai"
+    payload["model_name"] = "gpt-4o-mini"
+
+    with TestClient(app) as client:
+        response = client.post("/v1/research", json=payload, headers=_auth_headers())
+        assert response.status_code == 202
+        result = _wait_for_terminal_result(client, "op-gateway-budget")
+
+    assert result["status"] == "completed"
+
+
+def test_local_request_still_enforces_local_spend_ceiling(monkeypatch):
+    # The local ceiling remains an independent guard for local-model work (the
+    # gateway is not authoritative for it), so it is still enforced.
+    async def ok_research(**kwargs):
+        return _completed_result(kwargs["op_id"])
+
+    monkeypatch.setattr(api, "conduct_web_research", ok_research)
+    monkeypatch.setattr(settings, "DAILY_SPEND_LIMIT_USD", 0.01)
+    monkeypatch.setattr(settings, "AI_OPENROUTER_ENABLED", False)
+    monkeypatch.setattr(settings, "OLLAMA_BASE_URL", "http://127.0.0.1:11434")
+    payload = _payload("op-local-budget")
+    payload["model_provider"] = "ollama"
+    payload["model_name"] = "llama3"
+
+    with TestClient(app) as client:
+        response = client.post("/v1/research", json=payload, headers=_auth_headers())
+
+    assert response.status_code == 429
+    assert "spend limit" in response.json()["detail"].lower()
+
+
+def test_local_requests_do_not_exhaust_daily_budget_on_repeated_runs(monkeypatch):
+    # Local-model work has no real external cost: the admission reservation
+    # must be reconciled down to zero on completion, not to the
+    # provider-agnostic token-cost heuristic reported in estimatedModelCostUsd,
+    # or repeated credential-free local runs would eventually exhaust
+    # DAILY_SPEND_LIMIT_USD on their own.
+    async def ok_research(**kwargs):
+        result = _completed_result(kwargs["op_id"])
+        result["metrics"]["estimatedModelCostUsd"] = 0.2
+        return result
+
+    monkeypatch.setattr(api, "conduct_web_research", ok_research)
+    # Larger than one admission reserve (0.25 default) but smaller than two
+    # reserves plus the heuristic cost, so a second run only succeeds if the
+    # first run's reservation was released back to zero, not to 0.2.
+    monkeypatch.setattr(settings, "DAILY_SPEND_LIMIT_USD", 0.3)
+    monkeypatch.setattr(settings, "AI_OPENROUTER_ENABLED", False)
+    monkeypatch.setattr(settings, "OLLAMA_BASE_URL", "http://127.0.0.1:11434")
+
+    with TestClient(app) as client:
+        for i in range(3):
+            payload = _payload(f"op-local-repeat-{i}", f"idem-local-repeat-{i}")
+            payload["model_provider"] = "ollama"
+            payload["model_name"] = "llama3"
+            response = client.post("/v1/research", json=payload, headers=_auth_headers())
+            assert response.status_code == 202, f"run {i} was rejected: {response.json()}"
+            result = _wait_for_terminal_result(client, f"op-local-repeat-{i}")
+            assert result["status"] == "completed"
+
+
+def test_public_local_model_endpoint_is_rejected(monkeypatch):
+    # A provider name alone does not establish locality: a public OLLAMA_BASE_URL
+    # must not be admitted as a local-only request.
+    monkeypatch.setattr(settings, "OLLAMA_BASE_URL", "https://ollama.example.com")
+    payload = _payload("op-public-ollama")
+    payload["model_provider"] = "ollama"
+    payload["model_name"] = "llama3"
+
+    with TestClient(app) as client:
+        response = client.post("/v1/research", json=payload, headers=_auth_headers())
+
+    assert response.status_code == 400
+    assert "local address" in response.json()["detail"]
+
+
+def test_no_gateway_with_public_local_endpoint_is_rejected(monkeypatch):
+    monkeypatch.setattr(settings, "AI_OPENROUTER_ENABLED", False)
+    monkeypatch.setattr(settings, "OLLAMA_BASE_URL", "https://ollama.example.com")
+
+    with TestClient(app) as client:
+        response = client.post("/v1/research", json=_payload("op-no-gateway-public-ollama"), headers=_auth_headers())
+
+    assert response.status_code == 503
+    assert "local model endpoint" in response.json()["detail"]

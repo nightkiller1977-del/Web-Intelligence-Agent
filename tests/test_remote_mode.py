@@ -67,6 +67,43 @@ class TestHealthEndpoints:
         assert "storage" in data
         assert "auth" in data
 
+    def test_health_ready_rejects_invalid_enabled_gateway(self, monkeypatch):
+        monkeypatch.setattr(settings, "AI_OPENROUTER_ENABLED", True)
+        monkeypatch.setattr(settings, "AI_OPENROUTER_BASE_URL", "http://gateway.example")
+        monkeypatch.setattr(settings, "AI_OPENROUTER_API_KEY", "test-key")
+
+        with TestClient(app) as client:
+            response = client.get("/health/ready")
+
+        assert response.status_code == 503
+        assert response.json()["gateway"] is False
+
+    def test_health_ready_rejects_gateway_blocked_by_egress_policy(self, monkeypatch):
+        monkeypatch.setattr(settings, "AI_OPENROUTER_ENABLED", True)
+        monkeypatch.setattr(settings, "AI_OPENROUTER_BASE_URL", "https://127.0.0.1")
+        monkeypatch.setattr(settings, "AI_OPENROUTER_API_KEY", "test-key")
+
+        with TestClient(app) as client:
+            response = client.get("/health/ready")
+
+        assert response.status_code == 503
+        assert response.json()["gateway"] is False
+
+    def test_health_ready_rejects_an_invalid_local_default(self, monkeypatch):
+        monkeypatch.setattr(settings, "AI_OPENROUTER_ENABLED", False)
+        monkeypatch.setattr(settings, "OLLAMA_BASE_URL", "https://ollama.example")
+
+        with TestClient(app) as client:
+            response = client.get("/health/ready")
+
+        assert response.status_code == 503
+        assert response.json()["inference"] is False
+
+    def test_render_uses_readiness_probe(self):
+        render_config = Path(__file__).parents[1].joinpath("render.yaml").read_text()
+
+        assert "healthCheckPath: /health/ready" in render_config
+
     def test_version_endpoint(self):
         """GET /version should return service and engine versions."""
         client = TestClient(app)
