@@ -273,8 +273,36 @@ def test_idempotency_retry_does_not_report_unpersisted_admission_as_accepted():
     assert "pending" in retry.json()["detail"].lower()
 
 
+def test_submission_survives_initial_progress_event_failure(monkeypatch):
+    async def unavailable_progress_stream(*_args, **_kwargs):
+        raise RuntimeError("progress stream unavailable")
+
+    monkeypatch.setattr(api.ProgressReporter, "report", unavailable_progress_stream)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/research",
+            json=_payload("op-progress-unavailable", "idem-progress-unavailable"),
+            headers=_auth_headers(),
+        )
+
+    assert response.status_code == 202
+
+
 @pytest.mark.anyio
-async def test_rollback_stops_after_admission_lease_ownership_is_lost(monkeypatch):
+@pytest.mark.parametrize(
+    ("remaining_owner", "expected_calls"),
+    [
+        ("op-stale", ["idempotency"]),
+        (
+            "op-winner",
+            ["idempotency", "owner", "operation", "slot", "spend"],
+        ),
+    ],
+)
+async def test_rollback_cleans_only_resources_not_owned_by_the_key_winner(
+    monkeypatch, remaining_owner, expected_calls
+):
     calls = []
 
     def recorded(name, result=None):
@@ -287,7 +315,7 @@ async def test_rollback_stops_after_admission_lease_ownership_is_lost(monkeypatc
     monkeypatch.setattr(
         api.storage,
         "release_idempotency_key",
-        recorded("idempotency", False),
+        recorded("idempotency", remaining_owner),
     )
     monkeypatch.setattr(
         api.storage, "release_operation_lease", recorded("owner")
@@ -303,7 +331,7 @@ async def test_rollback_stops_after_admission_lease_ownership_is_lost(monkeypatc
     )
 
     await api._rollback_admission(
-        "op-reclaimed",
+        "op-stale",
         "idem-reclaimed",
         "stale-admission-token",
         True,
@@ -313,7 +341,7 @@ async def test_rollback_stops_after_admission_lease_ownership_is_lost(monkeypatc
         0.25,
     )
 
-    assert calls == ["idempotency"]
+    assert calls == expected_calls
 
 
 def test_idempotency_retry_resolves_before_gateway_admission_checks(monkeypatch):

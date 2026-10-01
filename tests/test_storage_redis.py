@@ -162,6 +162,9 @@ async def test_save_admitted_operation_rejects_a_lost_admission_lease(redis_stor
 
     assert saved is False
     assert await redis_storage.get_operation("op-first") is None
+    assert await redis_storage.release_idempotency_key(
+        key, "op-first", "admission-first"
+    ) == "op-retry"
 
 
 @pytest.mark.anyio
@@ -191,7 +194,7 @@ async def test_same_operation_retry_owns_reclaimed_admission_with_a_new_token(
     ) is False
     assert await redis_storage.release_idempotency_key(
         key, op_id, first_token
-    ) is False
+    ) == op_id
     assert await redis_storage.redis.get(f"research:idempotency:{key}") == op_id
     assert await redis_storage.redis.get(
         f"research:idempotency_pending:{key}"
