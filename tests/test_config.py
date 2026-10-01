@@ -39,6 +39,16 @@ def test_local_model_endpoint_still_accepts_rfc1918(monkeypatch):
     assert local_model_endpoint() == ("10.0.0.2", 11434)
 
 
+def test_local_model_endpoint_rejects_a_non_root_base_path(monkeypatch):
+    monkeypatch.setattr(
+        settings,
+        "OLLAMA_BASE_URL",
+        "http://127.0.0.1:11434/proxy",
+    )
+
+    assert local_model_endpoint() is None
+
+
 def test_gateway_config_rejects_malformed_port(monkeypatch):
     # urlsplit().port is a lazily-parsed property: a nonnumeric or
     # out-of-range port is not raised by urlsplit() itself and .hostname

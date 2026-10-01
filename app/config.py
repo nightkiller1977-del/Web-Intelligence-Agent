@@ -242,7 +242,11 @@ def local_model_endpoint() -> tuple[str, int] | None:
     external egress path or bypass the shared gateway.
     """
     parsed = urlsplit(settings.OLLAMA_BASE_URL.strip())
-    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+    if (
+        parsed.scheme not in ("http", "https")
+        or not parsed.hostname
+        or parsed.path not in ("", "/")
+    ):
         return None
     host = parsed.hostname.lower().rstrip(".")
     try:
