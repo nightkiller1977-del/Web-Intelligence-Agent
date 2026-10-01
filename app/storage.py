@@ -44,7 +44,7 @@ return ''
 _RELEASE_IDEMPOTENCY_LUA = """
 local existing = redis.call('GET', KEYS[1])
 if not existing then
-  return ARGV[1]
+  return ''
 end
 if existing ~= ARGV[1] then
   return existing
@@ -483,7 +483,7 @@ class InMemoryStorage(BaseStorage):
     ) -> Optional[str]:
         existing = self.idempotency_keys.get(key)
         if not existing:
-            return op_id
+            return None
         if existing != op_id:
             return existing
         self.idempotency_keys.pop(key, None)

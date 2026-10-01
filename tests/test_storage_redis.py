@@ -206,6 +206,20 @@ async def test_same_operation_retry_owns_reclaimed_admission_with_a_new_token(
 
 
 @pytest.mark.anyio
+async def test_release_idempotency_key_reports_no_current_owner(redis_storage):
+    key = "idem-owner-gone"
+    op_id = "op-owner-gone"
+    token = "admission-owner-gone"
+    assert await redis_storage.claim_idempotency_key(key, op_id, token) is None
+    await redis_storage.redis.delete(
+        f"research:idempotency:{key}",
+        f"research:idempotency_pending:{key}",
+    )
+
+    assert await redis_storage.release_idempotency_key(key, op_id, token) is None
+
+
+@pytest.mark.anyio
 async def test_push_progress_event_uses_xadd_with_maxlen_cap(redis_storage):
     op_id = "op-stream"
     total_events = 1200  # deliberately > the hardcoded maxlen=1000 cap
