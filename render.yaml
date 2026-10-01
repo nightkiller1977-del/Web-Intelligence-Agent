@@ -10,7 +10,7 @@ services:
       metricsPolicy:
         - metric: cpu
           threshold: 80
-    healthCheckPath: /health/live
+    healthCheckPath: /health/ready
     numInstances: 1
     envVars:
       - key: STORAGE_BACKEND
@@ -29,8 +29,17 @@ services:
       - key: WEB_INTELLIGENCE_AUTH_TOKEN
         generateValue: true
         sync: false
-      - key: OPENAI_API_KEY
+      # External model egress must go through AI-OpenRouter. Configure the
+      # service-scoped endpoint/credential via the authorized aicc-secrets
+      # mapping; no direct provider key (for example OPENAI_API_KEY) is used.
+      - key: AI_OPENROUTER_ENABLED
+        value: "true"
+      - key: AI_OPENROUTER_BASE_URL
         sync: false
+      - key: AI_OPENROUTER_API_KEY
+        sync: false
+      - key: AI_OPENROUTER_DEFAULT_MODEL
+        value: gpt-4o-mini
       - key: TAVILY_API_KEY
         sync: false
       - key: DEPLOYMENT_MODE

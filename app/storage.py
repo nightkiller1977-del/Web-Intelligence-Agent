@@ -19,6 +19,39 @@ OPERATION_CACHE_LIMIT = 500
 # retry of old work be accepted as new (and paid for again). Kept as a bounded
 # FIFO tombstone independent of the operation payload cache.
 IDEMPOTENCY_RESERVATION_LIMIT = 10000
+IDEMPOTENCY_KEY_TTL_SECONDS = 86400
+IDEMPOTENCY_ADMISSION_TTL_SECONDS = 30
+
+# Claim a durable idempotency key together with a short admission lease. A
+# process that exits before persisting the operation leaves no permanent
+# tombstone: once the short lease expires, a retry can atomically reclaim it.
+# A persisted operation always wins, even after the admission lease is gone.
+_CLAIM_IDEMPOTENCY_LUA = """
+local existing = redis.call('GET', KEYS[1])
+if existing then
+  if redis.call('HGET', KEYS[3], existing) then
+    return existing
+  end
+  if redis.call('GET', KEYS[2]) == existing then
+    return existing
+  end
+end
+redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[2])
+redis.call('SET', KEYS[2], ARGV[1], 'EX', ARGV[3])
+return ''
+"""
+
+_RELEASE_IDEMPOTENCY_LUA = """
+local existing = redis.call('GET', KEYS[1])
+if not existing then
+  return 0
+end
+if ARGV[1] ~= '' and existing ~= ARGV[1] then
+  return 0
+end
+redis.call('DEL', KEYS[1], KEYS[2])
+return 1
+"""
 
 # Atomic acquire of a concurrency slot. Expired slots are reclaimed first, so a
 # crashed instance's slot frees itself instead of pinning the counter forever,
@@ -43,6 +76,18 @@ if ARGV[3] == '1' then
   redis.call('SADD', KEYS[2], ARGV[1])
 else
   redis.call('SREM', KEYS[2], ARGV[1])
+end
+return 1
+"""
+
+_SAVE_ADMITTED_OPERATION_LUA = """
+if redis.call('GET', KEYS[3]) ~= ARGV[1] then
+  return 0
+end
+redis.call('HSET', KEYS[1], ARGV[1], ARGV[2])
+redis.call('SADD', KEYS[2], ARGV[1])
+if redis.call('GET', KEYS[4]) == ARGV[1] then
+  redis.call('DEL', KEYS[4])
 end
 return 1
 """
@@ -243,6 +288,12 @@ class BaseStorage:
     async def save_operation(self, op_id: str, data: Dict[str, Any]):
         raise NotImplementedError()
 
+    async def save_admitted_operation(
+        self, op_id: str, data: Dict[str, Any], idempotency_key: str
+    ) -> bool:
+        """Persist initial queued state only while admission still owns its key."""
+        raise NotImplementedError()
+
     async def get_operation(self, op_id: str) -> Optional[Dict[str, Any]]:
         raise NotImplementedError()
 
@@ -274,6 +325,9 @@ class BaseStorage:
         raise NotImplementedError()
 
     async def get_progress_events(self, op_id: str) -> List[Dict[str, Any]]:
+        raise NotImplementedError()
+
+    async def get_progress_events_after(self, op_id: str, cursor: str | None):
         raise NotImplementedError()
 
     async def mark_stale_operations(self):
@@ -381,6 +435,14 @@ class InMemoryStorage(BaseStorage):
         self.operations.move_to_end(op_id)
         self._evict_if_needed()
 
+    async def save_admitted_operation(
+        self, op_id: str, data: Dict[str, Any], idempotency_key: str
+    ) -> bool:
+        if self.idempotency_keys.get(idempotency_key) != op_id:
+            return False
+        await self.save_operation(op_id, data)
+        return True
+
     async def get_operation(self, op_id: str) -> Optional[Dict[str, Any]]:
         return self.operations.get(op_id)
 
@@ -444,6 +506,11 @@ class InMemoryStorage(BaseStorage):
 
     async def get_progress_events(self, op_id: str) -> List[Dict[str, Any]]:
         return self.events.get(op_id, [])
+
+    async def get_progress_events_after(self, op_id: str, cursor: str | None):
+        events = self.events.get(op_id, [])
+        start = int(cursor or "0")
+        return [(str(index + 1), event) for index, event in enumerate(events[start:], start)]
 
     async def mark_stale_operations(self):
         # Single-process backend: every queued/running operation belongs to this
@@ -580,6 +647,25 @@ class RedisStorage(BaseStorage):
             is_active,
         )
 
+    async def save_admitted_operation(
+        self, op_id: str, data: Dict[str, Any], idempotency_key: str
+    ) -> bool:
+        if self.degraded:
+            return await self.fallback.save_admitted_operation(
+                op_id, data, idempotency_key
+            )
+        saved = await self.redis.eval(
+            _SAVE_ADMITTED_OPERATION_LUA,
+            4,
+            "research:operations",
+            "research:active_ops",
+            f"research:idempotency:{idempotency_key}",
+            f"research:idempotency_pending:{idempotency_key}",
+            op_id,
+            json.dumps(data),
+        )
+        return bool(saved)
+
     async def get_operation(self, op_id: str) -> Optional[Dict[str, Any]]:
         if self.degraded:
             return await self.fallback.get_operation(op_id)
@@ -605,20 +691,31 @@ class RedisStorage(BaseStorage):
         if self.degraded:
             return await self.fallback.claim_idempotency_key(key, op_id)
         idem_key = f"research:idempotency:{key}"
-        was_set = await self.redis.set(idem_key, op_id, nx=True, ex=86400)
-        if was_set:
-            return None
-        return await self.redis.get(idem_key)
+        pending_key = f"research:idempotency_pending:{key}"
+        existing = await self.redis.eval(
+            _CLAIM_IDEMPOTENCY_LUA,
+            3,
+            idem_key,
+            pending_key,
+            "research:operations",
+            op_id,
+            IDEMPOTENCY_KEY_TTL_SECONDS,
+            IDEMPOTENCY_ADMISSION_TTL_SECONDS,
+        )
+        return existing or None
 
     async def release_idempotency_key(self, key: str, op_id: Optional[str] = None) -> bool:
         if self.degraded:
             return await self.fallback.release_idempotency_key(key, op_id)
         idem_key = f"research:idempotency:{key}"
-        if op_id is not None:
-            existing = await self.redis.get(idem_key)
-            if existing != op_id:
-                return False
-        deleted = await self.redis.delete(idem_key)
+        pending_key = f"research:idempotency_pending:{key}"
+        deleted = await self.redis.eval(
+            _RELEASE_IDEMPOTENCY_LUA,
+            2,
+            idem_key,
+            pending_key,
+            op_id or "",
+        )
         return bool(deleted)
 
     async def claim_operation_id(self, op_id: str, idempotency_key: str) -> bool:
@@ -877,6 +974,16 @@ class RedisStorage(BaseStorage):
                 if "event" in fields:
                     events.append(json.loads(fields["event"]))
             return events
+        except Exception:
+            return []
+
+    async def get_progress_events_after(self, op_id: str, cursor: str | None):
+        if self.degraded:
+            return await self.fallback.get_progress_events_after(op_id, cursor)
+        minimum = f"({cursor}" if cursor else "-"
+        try:
+            entries = await self.redis.xrange(f"research:events:{op_id}", min=minimum)
+            return [(entry_id, json.loads(fields["event"])) for entry_id, fields in entries if "event" in fields]
         except Exception:
             return []
 

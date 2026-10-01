@@ -7,6 +7,8 @@ from unittest.mock import AsyncMock, MagicMock
 from app.model_adapter import RequestEnvironmentManager
 import app.model_adapter as model_adapter
 import app.researcher_adapter as researcher_adapter
+import app.security as security
+from app.config import local_model_endpoint, settings
 from app.researcher_adapter import (
     build_structured_findings_from_passages,
     build_structured_findings,
@@ -315,6 +317,22 @@ def test_collect_repository_context_short_circuits_large_trees(monkeypatch, tmp_
     assert len(chunks) == 12
 
 
+def test_collect_repository_context_rejects_path_outside_allowed_roots(monkeypatch, tmp_path):
+    import app.researcher_adapter as adapter
+    monkeypatch.setattr(adapter.settings, "DEPLOYMENT_MODE", "local")
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+    monkeypatch.setattr(adapter.settings, "LOCAL_INPUT_ROOTS", str(allowed))
+
+    outside_repository = tmp_path / "outside"
+    outside_repository.mkdir()
+    (outside_repository / "secret.md").write_text("not allowed", encoding="utf-8")
+
+    chunks, _ = collect_input_context({"repositories": [{"path": str(outside_repository)}]})
+
+    assert chunks == []
+
+
 def test_trim_to_token_budget_truncates_long_text():
     text = " ".join(f"word{i}" for i in range(100))
 
@@ -355,7 +373,156 @@ def test_model_preferences_apply_when_raw_headers_are_disallowed(monkeypatch):
         model_name="gpt-4o-mini"
     ).apply_keys():
         assert os.environ["FAST_LLM"] == "openai:gpt-4o-mini"
-        assert "OPENAI_API_KEY" not in os.environ
+        assert os.environ["OPENAI_API_KEY"] == ""
+
+
+def test_request_environment_masks_ambient_openai_key_without_gateway(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "ambient-direct-provider-key")
+    monkeypatch.setattr(model_adapter, "external_openai_gateway_config", lambda: None)
+
+    with RequestEnvironmentManager({}).apply_keys():
+        assert os.environ["OPENAI_API_KEY"] == ""
+
+
+def test_gateway_mode_forces_ambient_model_selection_through_the_gateway(monkeypatch):
+    # Regression test: with the gateway enabled but no request model, an ambient
+    # FAST_LLM/SMART_LLM naming another provider would otherwise be used and call
+    # that provider directly with an ambient credential, bypassing the gateway.
+    gateway = model_adapter.external_openai_gateway_config.__globals__["GatewayConfig"](
+        "https://gateway.example", "gateway-key"
+    )
+    monkeypatch.setattr(model_adapter, "external_openai_gateway_config", lambda: gateway)
+    monkeypatch.setenv("FAST_LLM", "anthropic:claude-3")
+    monkeypatch.setenv("SMART_LLM", "anthropic:claude-3")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "ambient-anthropic-key")
+
+    with RequestEnvironmentManager({}).apply_keys():
+        assert os.environ["FAST_LLM"].startswith("openai:")
+        assert os.environ["SMART_LLM"].startswith("openai:")
+        assert os.environ["OPENAI_BASE_URL"] == "https://gateway.example"
+        assert os.environ["OPENAI_API_KEY"] == "gateway-key"
+
+    assert os.environ["FAST_LLM"] == "anthropic:claude-3"
+
+
+def test_gateway_mode_keeps_request_model_on_the_gateway_provider(monkeypatch):
+    gateway = model_adapter.external_openai_gateway_config.__globals__["GatewayConfig"](
+        "https://gateway.example", "gateway-key"
+    )
+    monkeypatch.setattr(model_adapter, "external_openai_gateway_config", lambda: gateway)
+
+    with RequestEnvironmentManager({}, model_provider="openai", model_name="gpt-4o").apply_keys():
+        assert os.environ["FAST_LLM"] == "openai:gpt-4o"
+        assert os.environ["OPENAI_BASE_URL"] == "https://gateway.example"
+
+
+def test_gateway_mode_pins_strategic_tier_and_masks_provider_credentials(monkeypatch):
+    # Regression: an ambient STRATEGIC_LLM plus its provider key could still be
+    # used for strategic-tier modes even though the request was pinned to the
+    # gateway for the fast/smart tiers.
+    gateway = model_adapter.external_openai_gateway_config.__globals__["GatewayConfig"](
+        "https://gateway.example", "gateway-key"
+    )
+    monkeypatch.setattr(model_adapter, "external_openai_gateway_config", lambda: gateway)
+    monkeypatch.setenv("STRATEGIC_LLM", "anthropic:claude-3")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "ambient-anthropic-key")
+
+    with RequestEnvironmentManager({}).apply_keys():
+        assert os.environ["STRATEGIC_LLM"].startswith("openai:")
+        assert os.environ["ANTHROPIC_API_KEY"] == ""
+
+
+def test_local_request_pins_strategic_tier_and_masks_external_credentials(monkeypatch):
+    # An explicit local selection must not leave an ambient external tier usable.
+    monkeypatch.setattr(model_adapter, "external_openai_gateway_config", lambda: None)
+    monkeypatch.setenv("STRATEGIC_LLM", "anthropic:claude-3")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "ambient-anthropic-key")
+
+    with RequestEnvironmentManager({}, model_provider="ollama", model_name="llama3").apply_keys():
+        assert os.environ["FAST_LLM"] == "ollama:llama3"
+        assert os.environ["SMART_LLM"] == "ollama:llama3"
+        assert os.environ["STRATEGIC_LLM"] == "ollama:llama3"
+        assert os.environ["ANTHROPIC_API_KEY"] == ""
+
+
+def test_no_gateway_and_no_request_model_defaults_to_local(monkeypatch):
+    # Regression: with no gateway and no explicit selection, an ambient
+    # FAST_LLM/SMART_LLM naming an external provider used to be inherited.
+    monkeypatch.setattr(model_adapter, "external_openai_gateway_config", lambda: None)
+    monkeypatch.setenv("FAST_LLM", "anthropic:claude-3")
+    monkeypatch.setenv("SMART_LLM", "anthropic:claude-3")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "ambient-anthropic-key")
+
+    with RequestEnvironmentManager({}).apply_keys():
+        assert os.environ["FAST_LLM"].startswith("ollama:")
+        assert os.environ["SMART_LLM"].startswith("ollama:")
+        assert os.environ["STRATEGIC_LLM"].startswith("ollama:")
+        assert os.environ["ANTHROPIC_API_KEY"] == ""
+        assert os.environ["OPENAI_API_KEY"] == ""
+
+
+def test_local_search_header_is_honored_even_when_gateway_is_enabled(monkeypatch):
+    # Regression: enabling the model gateway must not disable the independent
+    # local search-credential path (X-Search-Key -> TAVILY_API_KEY).
+    gateway = model_adapter.external_openai_gateway_config.__globals__["GatewayConfig"](
+        "https://gateway.example", "gateway-key"
+    )
+    monkeypatch.setattr(model_adapter, "external_openai_gateway_config", lambda: gateway)
+    monkeypatch.setattr(model_adapter, "raw_header_credentials_allowed", lambda: True)
+    monkeypatch.delenv("TAVILY_API_KEY", raising=False)
+
+    with RequestEnvironmentManager({"X-Search-Key": "local-tavily-key"}).apply_keys():
+        assert os.environ["TAVILY_API_KEY"] == "local-tavily-key"
+        assert os.environ["OPENAI_API_KEY"] == "gateway-key"
+
+
+def test_local_default_pins_embedding_to_the_local_endpoint(monkeypatch):
+    # Regression: GPT Researcher's EMBEDDING default is an OpenAI embedding, so a
+    # documented local (credential-free) run would fail once credentials are masked.
+    monkeypatch.setattr(model_adapter, "external_openai_gateway_config", lambda: None)
+
+    with RequestEnvironmentManager({}).apply_keys():
+        assert os.environ["EMBEDDING"].startswith("ollama:")
+        # EMBEDDING_PROVIDER, when set, overrides EMBEDDING; it must pin the same
+        # local provider or an ambient external embedding could win. The model
+        # name must also be pinned so the deprecated ollama path resolves locally.
+        assert os.environ["EMBEDDING_PROVIDER"] == "ollama"
+        assert os.environ["OLLAMA_EMBEDDING_MODEL"] == settings.LOCAL_EMBEDDING_MODEL
+
+
+def test_gateway_mode_pins_embedding_to_the_gateway_provider(monkeypatch):
+    gateway = model_adapter.external_openai_gateway_config.__globals__["GatewayConfig"](
+        "https://gateway.example", "gateway-key"
+    )
+    monkeypatch.setattr(model_adapter, "external_openai_gateway_config", lambda: gateway)
+
+    with RequestEnvironmentManager({}).apply_keys():
+        assert os.environ["EMBEDDING"].startswith("openai:")
+        assert os.environ["EMBEDDING_PROVIDER"] == "openai"
+
+
+def test_explicit_local_provider_is_normalized_before_use(monkeypatch):
+    # Regression: admission lowercases the provider, but the original casing was
+    # written into GPT Researcher's provider string, whose lookup is
+    # case-sensitive, so an accepted "OLLAMA" request failed in the background.
+    monkeypatch.setattr(model_adapter, "external_openai_gateway_config", lambda: None)
+
+    with RequestEnvironmentManager({}, model_provider="OLLAMA", model_name="llama3").apply_keys():
+        assert os.environ["FAST_LLM"] == "ollama:llama3"
+        assert os.environ["SMART_LLM"] == "ollama:llama3"
+        assert os.environ["STRATEGIC_LLM"] == "ollama:llama3"
+
+
+def test_public_ollama_endpoint_is_not_treated_as_local(monkeypatch):
+    # A provider name alone must not establish locality: a public OLLAMA_BASE_URL
+    # would otherwise be an unmetered external egress path bypassing the gateway.
+    monkeypatch.setattr(settings, "OLLAMA_BASE_URL", "https://ollama.example.com")
+    monkeypatch.setattr(model_adapter, "external_openai_gateway_config", lambda: None)
+
+    assert local_model_endpoint() is None
+    with RequestEnvironmentManager({}, model_provider="ollama", model_name="llama3").apply_keys():
+        assert os.environ["FAST_LLM"].startswith("ollama:")
+        assert "OLLAMA_BASE_URL" not in model_adapter.request_env.get()
 
 
 @pytest.mark.anyio
@@ -396,6 +563,15 @@ async def test_conduct_web_research_completes_without_crashing_on_metrics(monkey
 
     assert result["status"] == "completed"
     assert result["metrics"]["durationMs"] >= 0
+    # The adapter must not announce a terminal stage itself: the caller persists
+    # the terminal result and then emits the single final status. An early
+    # "completed" here would let an SSE consumer stop before a post-processing
+    # downgrade to "partial" is persisted.
+    reported_stages = [call.args[0] for call in reporter.report.await_args_list]
+    assert "completed" not in reported_stages
+    assert "partial" not in reported_stages
+    assert "failed" not in reported_stages
+    assert "cancelled" not in reported_stages
 
 
 @pytest.mark.anyio
@@ -629,6 +805,25 @@ def test_build_effective_query_keeps_limitations_without_reading_files(monkeypat
     assert "Local inputs were not sent to external research providers" in " ".join(limitations)
 
 
+def test_build_effective_query_reports_partially_unread_declared_inputs(monkeypatch, tmp_path):
+    import app.researcher_adapter as adapter
+    monkeypatch.setattr(adapter.settings, "DEPLOYMENT_MODE", "local")
+    monkeypatch.setattr(adapter.settings, "LOCAL_INPUT_ROOTS", str(tmp_path))
+
+    readable = tmp_path / "notes.md"
+    readable.write_text("readable content", encoding="utf-8")
+    missing = tmp_path / "missing.md"
+
+    raw_inputs = {"documents": [{"path": str(readable)}, {"path": str(missing)}]}
+    chunks, allow_external = collect_input_context(raw_inputs)
+    query, limitations = build_effective_query("Summarize", None, chunks, allow_external, raw_inputs)
+
+    # One document was read, so the request proceeds, but the caller must be told
+    # the other declared document was skipped rather than silently dropped.
+    assert len(chunks) == 1
+    assert "Some declared local inputs were not readable" in " ".join(limitations)
+
+
 def test_input_text_from_file_refuses_paths_outside_allowed_roots(monkeypatch, tmp_path):
     import app.researcher_adapter as adapter
     monkeypatch.setattr(adapter.settings, "DEPLOYMENT_MODE", "local")
@@ -646,6 +841,85 @@ def test_input_text_from_file_refuses_paths_outside_allowed_roots(monkeypatch, t
     assert input_text_from_file(inside) == "allowed content"
 
 
+def test_input_text_from_file_accepts_equivalent_spellings_of_allowed_root(monkeypatch, tmp_path):
+    import app.researcher_adapter as adapter
+    monkeypatch.setattr(adapter.settings, "DEPLOYMENT_MODE", "local")
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+    monkeypatch.setattr(adapter.settings, "LOCAL_INPUT_ROOTS", str(allowed))
+
+    inside = allowed / "notes.md"
+    inside.write_text("allowed content", encoding="utf-8")
+
+    # A trailing slash and an embedded "../<same dir>" both lexically and
+    # (after resolve()) actually target the same authorized file, so both
+    # must be accepted rather than silently skipped.
+    from pathlib import Path
+    trailing_slash_path = Path(str(allowed) + os.sep + os.sep + "notes.md")
+    assert input_text_from_file(trailing_slash_path) == "allowed content"
+
+    dotdot_path = allowed / ".." / "allowed" / "notes.md"
+    assert input_text_from_file(dotdot_path) == "allowed content"
+
+
+def test_input_text_from_file_rejects_symlink_escaping_allowed_root(monkeypatch, tmp_path):
+    import app.researcher_adapter as adapter
+    monkeypatch.setattr(adapter.settings, "DEPLOYMENT_MODE", "local")
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+    monkeypatch.setattr(adapter.settings, "LOCAL_INPUT_ROOTS", str(allowed))
+
+    outside = tmp_path / "secret.md"
+    outside.write_text("secret-content", encoding="utf-8")
+
+    symlink = allowed / "escape.md"
+    try:
+        symlink.symlink_to(outside)
+    except OSError:
+        pytest.skip("symlinks not supported in this environment")
+
+    # The raw spelling lexically looks like it is inside the allowed root,
+    # but it resolves outside it, so it must still be rejected.
+    assert input_text_from_file(symlink) == ""
+
+
+def test_input_text_from_file_rejects_symlink_retargeted_after_the_check(monkeypatch, tmp_path):
+    """Closes the check-to-open race: a symlink retargeted to escape
+    LOCAL_INPUT_ROOTS between is_within_allowed_roots() and the file open
+    must still be rejected, not just a symlink that already pointed outside
+    at check time."""
+    import app.researcher_adapter as adapter
+    monkeypatch.setattr(adapter.settings, "DEPLOYMENT_MODE", "local")
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+    monkeypatch.setattr(adapter.settings, "LOCAL_INPUT_ROOTS", str(allowed))
+
+    inside = allowed / "notes.md"
+    inside.write_text("allowed content", encoding="utf-8")
+    outside = tmp_path / "secret.md"
+    outside.write_text("secret-content", encoding="utf-8")
+
+    symlink = allowed / "swap.md"
+    try:
+        symlink.symlink_to(inside)
+    except OSError:
+        pytest.skip("symlinks not supported in this environment")
+
+    # Simulate a racing process retargeting the symlink to point outside the
+    # allowed root right after is_within_allowed_roots() validated it (which
+    # ran inside input_text_from_file, before the open call this patches).
+    original_open = adapter._open_validated_file
+
+    def retarget_then_open(path):
+        symlink.unlink()
+        symlink.symlink_to(outside)
+        return original_open(path)
+
+    monkeypatch.setattr(adapter, "_open_validated_file", retarget_then_open)
+
+    assert input_text_from_file(symlink) == ""
+
+
 def test_input_text_from_file_refuses_everything_when_no_roots_configured(monkeypatch, tmp_path):
     import app.researcher_adapter as adapter
     monkeypatch.setattr(adapter.settings, "DEPLOYMENT_MODE", "local")
@@ -655,6 +929,22 @@ def test_input_text_from_file_refuses_everything_when_no_roots_configured(monkey
     document.write_text("should not be read", encoding="utf-8")
 
     assert input_text_from_file(document) == ""
+
+
+def test_input_text_from_file_allows_children_when_allowed_root_is_filesystem_root(monkeypatch, tmp_path):
+    # Regression test: when LOCAL_INPUT_ROOTS is configured as the filesystem
+    # root ("/"), the root string already ends with os.sep, so naively
+    # appending another separator before the containment prefix check
+    # produces "//" and rejects every child path even though it is inside the
+    # authorized (if extremely permissive) root.
+    import app.researcher_adapter as adapter
+    monkeypatch.setattr(adapter.settings, "DEPLOYMENT_MODE", "local")
+    monkeypatch.setattr(adapter.settings, "LOCAL_INPUT_ROOTS", "/")
+
+    document = tmp_path / "notes.md"
+    document.write_text("root-allowed content", encoding="utf-8")
+
+    assert input_text_from_file(document) == "root-allowed content"
 
 
 def test_collect_repository_context_refuses_roots_outside_allowed_roots(monkeypatch, tmp_path):
@@ -691,10 +981,15 @@ def test_append_input_sources_uses_uri_not_file_url():
 async def test_conduct_web_research_redacts_provider_endpoint_sources(monkeypatch):
     class ProviderSourceResearcher(FakeCompletedGPTResearcher):
         def get_source_urls(self):
-            return ["https://api.tavily.com/search", "https://example.com/real"]
+            return [
+                "https://api.tavily.com/search",
+                "https://gateway.example/v1/chat/completions",
+                "https://example.com/real",
+            ]
 
     monkeypatch.setattr(researcher_adapter, "GPTResearcher", ProviderSourceResearcher)
     monkeypatch.setattr(researcher_adapter, "is_safe_url", lambda url, profile: True)
+    monkeypatch.setattr(security, "external_gateway_hosts", lambda: ("gateway.example",))
 
     reporter = MagicMock()
     reporter.report = AsyncMock()
@@ -717,6 +1012,7 @@ async def test_conduct_web_research_redacts_provider_endpoint_sources(monkeypatc
 
     urls = [source["url"] for source in result["sources"]]
     assert "https://api.tavily.com/search" not in urls
+    assert "https://gateway.example/v1/chat/completions" not in urls
     assert "https://example.com/real" in urls
 
 

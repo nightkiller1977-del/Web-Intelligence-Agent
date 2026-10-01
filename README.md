@@ -86,14 +86,17 @@ pip install -r requirements.lock
 cp .env.example .env
 ```
 
-At minimum, configure an explicit API token for manual local use and the provider/search credentials required by your selected research engine:
+At minimum, configure an explicit API token for manual local use and the provider/search credentials required by your selected research engine. Local mode defaults to a local Ollama model and needs no external credential; external model inference requires the AI-OpenRouter gateway:
 
 ```env
 DEPLOYMENT_MODE=local
 WEB_INTELLIGENCE_AUTH_TOKEN=replace-with-a-long-random-token
-OPENAI_API_KEY=...
 TAVILY_API_KEY=...
 STORAGE_BACKEND=local
+# Optional: enable the shared external-model gateway (required for external models).
+AI_OPENROUTER_ENABLED=true
+AI_OPENROUTER_BASE_URL=https://ai-openrouter.example
+AI_OPENROUTER_API_KEY=replace-with-shared-gateway-credential
 ```
 
 Do not commit your `.env` file.

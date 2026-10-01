@@ -100,6 +100,54 @@ async def test_claim_idempotency_key_uses_atomic_set_nx(redis_storage):
 
 
 @pytest.mark.anyio
+async def test_claim_idempotency_key_reclaims_an_expired_admission(redis_storage):
+    key = "idem-orphan"
+    assert await redis_storage.claim_idempotency_key(key, "op-orphan") is None
+
+    pending_key = f"research:idempotency_pending:{key}"
+    pending_ttl = await redis_storage.redis.ttl(pending_key)
+    assert 0 < pending_ttl <= 30
+
+    # Simulate the admission worker exiting before it persisted an operation:
+    # the short pending lease expires while the durable key remains.
+    await redis_storage.redis.delete(pending_key)
+
+    assert await redis_storage.claim_idempotency_key(key, "op-retry") is None
+    assert await redis_storage.redis.get(f"research:idempotency:{key}") == "op-retry"
+
+
+@pytest.mark.anyio
+async def test_claim_idempotency_key_keeps_a_persisted_operation(redis_storage):
+    key = "idem-persisted"
+    assert await redis_storage.claim_idempotency_key(key, "op-existing") is None
+    assert await redis_storage.save_admitted_operation("op-existing", {
+        "operationId": "op-existing",
+        "idempotency_key": key,
+        "status": "queued",
+    }, key) is True
+    assert await redis_storage.redis.exists(f"research:idempotency_pending:{key}") == 0
+
+    assert await redis_storage.claim_idempotency_key(key, "op-new") == "op-existing"
+
+
+@pytest.mark.anyio
+async def test_save_admitted_operation_rejects_a_lost_admission_lease(redis_storage):
+    key = "idem-raced"
+    assert await redis_storage.claim_idempotency_key(key, "op-first") is None
+    await redis_storage.redis.delete(f"research:idempotency_pending:{key}")
+    assert await redis_storage.claim_idempotency_key(key, "op-retry") is None
+
+    saved = await redis_storage.save_admitted_operation("op-first", {
+        "operationId": "op-first",
+        "idempotency_key": key,
+        "status": "queued",
+    }, key)
+
+    assert saved is False
+    assert await redis_storage.get_operation("op-first") is None
+
+
+@pytest.mark.anyio
 async def test_push_progress_event_uses_xadd_with_maxlen_cap(redis_storage):
     op_id = "op-stream"
     total_events = 1200  # deliberately > the hardcoded maxlen=1000 cap
@@ -469,3 +517,44 @@ async def test_redis_stale_scan_backfills_preindex_active_operations(redis_stora
     await redis_storage.mark_stale_operations()
 
     assert (await redis_storage.get_operation("op-legacy"))["status"] == "failed"
+
+
+@pytest.mark.anyio
+async def test_get_progress_events_after_cursor_survives_stream_trimming(redis_storage):
+    """Cursor-based reads must keep returning later events after MAXLEN trims.
+
+    The index-based reader lost events once XADD MAXLEN evicted the front of the
+    stream (the cursor pointed at a position that no longer existed). The
+    Redis-stream-ID cursor must instead return every retained event after the
+    cursor exactly once and in order.
+    """
+    op_id = "op-cursor-trim"
+
+    # Read a cursor after the first events, then append far more than the 1000
+    # cap so the original cursor position is trimmed out of the stream.
+    for i in range(3):
+        await redis_storage.push_progress_event(op_id, {"message": f"early-{i}"})
+    first_batch = await redis_storage.get_progress_events_after(op_id, None)
+    assert [event["message"] for _, event in first_batch] == ["early-0", "early-1", "early-2"]
+    cursor = first_batch[-1][0]
+
+    for i in range(1200):
+        await redis_storage.push_progress_event(op_id, {"message": f"late-{i}"})
+
+    stream_key = f"research:events:{op_id}"
+    assert await redis_storage.redis.xlen(stream_key) == 1000
+
+    after = await redis_storage.get_progress_events_after(op_id, cursor)
+    # Only retained events are returned, none of the already-read early events.
+    assert after, "cursor read must still return retained events after trimming"
+    assert all(not event["message"].startswith("early-") for _, event in after)
+    ids = [entry_id for entry_id, _ in after]
+    assert ids == sorted(ids, key=lambda value: tuple(int(part) for part in value.split("-")))
+    assert len(ids) == len(set(ids)), "each event must be returned exactly once"
+
+    # Re-reading from the same cursor is idempotent.
+    again = await redis_storage.get_progress_events_after(op_id, cursor)
+    assert again == after
+
+    # Advancing to the last cursor yields nothing new.
+    assert await redis_storage.get_progress_events_after(op_id, ids[-1]) == []

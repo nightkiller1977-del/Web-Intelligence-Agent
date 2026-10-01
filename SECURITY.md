@@ -29,9 +29,13 @@ If you discover a security vulnerability in Web Intelligence Agent, please email
 - In remote mode, tokens must be explicitly configured via environment variables.
 
 ### API Keys
-- Never commit OpenAI API keys, Tavily API keys, or other external API credentials.
+- Never commit provider API keys, Tavily API keys, or other external API credentials.
 - All API keys must be provided via environment variables.
-- Use the `OPENAI_API_KEY` and `TAVILY_API_KEY` environment variables (see `.env.example`).
+- External model inference must egress through the configured AI-OpenRouter gateway
+  (`AI_OPENROUTER_*`). Do not set a direct provider key such as `OPENAI_API_KEY`:
+  ambient external-provider credentials are masked inside each request context, and
+  a raw `X-LLM-Key` header is rejected. The gateway is the only approved external-model path.
+- Use the `TAVILY_API_KEY` environment variable for search (see `.env.example`).
 - Rotate API keys regularly.
 
 ### Testing

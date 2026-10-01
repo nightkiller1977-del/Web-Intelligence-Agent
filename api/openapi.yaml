@@ -211,7 +211,17 @@ paths:
                   description: Return claim records verified by a separate passage-matching pass over available evidence.
                 model_provider:
                   type: string
-                  description: GPT Researcher LLM provider, for example openai. Must be provided with model_name.
+                  description: >-
+                    GPT Researcher LLM provider. Must be provided with model_name.
+                    External inference is only permitted through the configured
+                    AI-OpenRouter gateway, so the only supported external value is
+                    `openai` (OpenAI-compatible); `ollama` is accepted only when the
+                    configured local endpoint is a loopback/private address. Any
+                    other provider is rejected with 400, and an external provider is
+                    rejected with 503 when the gateway is not configured or invalid.
+                  enum:
+                    - openai
+                    - ollama
                 model_name:
                   type: string
                   description: GPT Researcher LLM model. Must be provided with model_provider.
@@ -270,11 +280,21 @@ paths:
                     type: string
                     example: queued
         '400':
-          description: Unsupported adapter field or blocked target URL
+          description: >-
+            Unsupported adapter field or blocked target URL. Also returned when an
+            unsupported model_provider is requested, or when a local provider is
+            requested but the configured local endpoint is not a local address.
         '409':
           description: operationId is already associated with a different idempotency key
         '422':
           description: Request validation failed
+        '429':
+          description: Daily spend limit or concurrency limit reached
+        '503':
+          description: >-
+            External model selection requires a configured, valid AI-OpenRouter
+            gateway, or no gateway is configured and the local model endpoint is not
+            a local address.
   /v1/research/{operationId}/events:
     get:
       summary: Subscribe to research progress events
