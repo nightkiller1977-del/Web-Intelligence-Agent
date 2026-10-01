@@ -2,6 +2,7 @@
 import asyncio
 import json
 import logging
+import secrets
 from fastapi import APIRouter, Header, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 from sse_starlette.sse import EventSourceResponse
@@ -126,6 +127,7 @@ async def capabilities():
 async def _rollback_admission(
     operation_id: str,
     lookup_key: str,
+    admission_token: str,
     claimed_lookup_key: bool,
     claimed_operation_id: bool,
     slot_reserved: bool,
@@ -134,22 +136,31 @@ async def _rollback_admission(
 ) -> None:
     """Release admission state after a failed request.
 
-    Each release is isolated so one transient backend error cannot skip the
-    others and pin a concurrency slot, owner lease, idempotency claim, or budget
-    hold for the full lease/window TTL.
+    The idempotency lease is authoritative: if another request reclaimed it,
+    this stale request must not release the winner's operation, slot, or budget
+    state. Once ownership is confirmed and released, the remaining cleanups are
+    isolated so one backend error cannot skip the others.
     """
     async def _run(label: str, coro_factory):
         try:
-            await coro_factory()
+            return await coro_factory()
         except Exception:
             logger.warning("Failed to %s for operation %s during rollback.", label, operation_id, exc_info=True)
+            return None
 
+    if claimed_lookup_key:
+        released = await _run(
+            "release idempotency key",
+            lambda: storage.release_idempotency_key(
+                lookup_key, operation_id, admission_token
+            ),
+        )
+        if not released:
+            return
     if operation_owned:
         await _run("release owner lease", lambda: storage.release_operation_lease(operation_id))
     if claimed_operation_id:
         await _run("release operation claim", lambda: storage.release_operation_id(operation_id, lookup_key))
-    if claimed_lookup_key:
-        await _run("release idempotency key", lambda: storage.release_idempotency_key(lookup_key, operation_id))
     if slot_reserved:
         await _run("release concurrency slot", lambda: storage.release_concurrency_slot(operation_id))
     if spend_reserved:
@@ -326,6 +337,7 @@ async def start_research(
             status_code=400,
             detail="Idempotency-Key header or idempotencyKey body field is required."
         )
+    admission_token = secrets.token_hex(16)
 
     claimed_lookup_key = None
     claimed_operation_id = False
@@ -340,7 +352,9 @@ async def start_research(
         # for new work, and applying them to a retry would turn an ambiguous
         # submission into a spurious rejection instead of letting the client
         # reconcile with its persisted operation.
-        existing_op_id = await storage.claim_idempotency_key(lookup_key, req.operationId)
+        existing_op_id = await storage.claim_idempotency_key(
+            lookup_key, req.operationId, admission_token
+        )
         if existing_op_id:
             logger.info("Idempotency hit for key %s, returning existing operation: %s", lookup_key, existing_op_id)
             op_state = await storage.get_operation(existing_op_id)
@@ -511,7 +525,7 @@ async def start_research(
     except Exception as e:
         # Rollback reserved slot if validation fails
         await _rollback_admission(
-            req.operationId, lookup_key, claimed_lookup_key,
+            req.operationId, lookup_key, admission_token, claimed_lookup_key,
             claimed_operation_id, slot_reserved, operation_owned, spend_reserved,
         )
         raise e
@@ -529,7 +543,7 @@ async def start_research(
             "query": req.query,
             "mode": req.mode,
             "profile": req.profile
-        }, lookup_key)
+        }, lookup_key, admission_token)
         if not operation_saved:
             raise HTTPException(
                 status_code=409,
@@ -554,7 +568,7 @@ async def start_research(
     except Exception as e:
         if not task_started:
             await _rollback_admission(
-                req.operationId, lookup_key, claimed_lookup_key,
+                req.operationId, lookup_key, admission_token, claimed_lookup_key,
                 claimed_operation_id, slot_reserved, operation_owned, spend_reserved,
             )
         raise e

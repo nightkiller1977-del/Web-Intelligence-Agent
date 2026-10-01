@@ -87,11 +87,15 @@ async def test_claim_operation_id_is_reentrant_for_same_key(redis_storage):
 @pytest.mark.anyio
 async def test_claim_idempotency_key_uses_atomic_set_nx(redis_storage):
     # First claim wins and signals success via a None return.
-    assert await redis_storage.claim_idempotency_key("idem-key-1", "op-a") is None
+    assert await redis_storage.claim_idempotency_key(
+        "idem-key-1", "op-a", "admission-a"
+    ) is None
 
     # A second claim for the same key from a different operation must not
     # overwrite the winner - this is exactly what SET ... NX guarantees.
-    assert await redis_storage.claim_idempotency_key("idem-key-1", "op-b") == "op-a"
+    assert await redis_storage.claim_idempotency_key(
+        "idem-key-1", "op-b", "admission-b"
+    ) == "op-a"
 
     idem_key = "research:idempotency:idem-key-1"
     assert await redis_storage.redis.get(idem_key) == "op-a"
@@ -102,7 +106,9 @@ async def test_claim_idempotency_key_uses_atomic_set_nx(redis_storage):
 @pytest.mark.anyio
 async def test_claim_idempotency_key_reclaims_an_expired_admission(redis_storage):
     key = "idem-orphan"
-    assert await redis_storage.claim_idempotency_key(key, "op-orphan") is None
+    assert await redis_storage.claim_idempotency_key(
+        key, "op-orphan", "admission-orphan"
+    ) is None
 
     pending_key = f"research:idempotency_pending:{key}"
     pending_ttl = await redis_storage.redis.ttl(pending_key)
@@ -112,39 +118,88 @@ async def test_claim_idempotency_key_reclaims_an_expired_admission(redis_storage
     # the short pending lease expires while the durable key remains.
     await redis_storage.redis.delete(pending_key)
 
-    assert await redis_storage.claim_idempotency_key(key, "op-retry") is None
+    assert await redis_storage.claim_idempotency_key(
+        key, "op-retry", "admission-retry"
+    ) is None
     assert await redis_storage.redis.get(f"research:idempotency:{key}") == "op-retry"
 
 
 @pytest.mark.anyio
 async def test_claim_idempotency_key_keeps_a_persisted_operation(redis_storage):
     key = "idem-persisted"
-    assert await redis_storage.claim_idempotency_key(key, "op-existing") is None
+    admission_token = "admission-existing"
+    assert await redis_storage.claim_idempotency_key(
+        key, "op-existing", admission_token
+    ) is None
     assert await redis_storage.save_admitted_operation("op-existing", {
         "operationId": "op-existing",
         "idempotency_key": key,
         "status": "queued",
-    }, key) is True
+    }, key, admission_token) is True
     assert await redis_storage.redis.exists(f"research:idempotency_pending:{key}") == 0
 
-    assert await redis_storage.claim_idempotency_key(key, "op-new") == "op-existing"
+    assert await redis_storage.claim_idempotency_key(
+        key, "op-new", "admission-new"
+    ) == "op-existing"
 
 
 @pytest.mark.anyio
 async def test_save_admitted_operation_rejects_a_lost_admission_lease(redis_storage):
     key = "idem-raced"
-    assert await redis_storage.claim_idempotency_key(key, "op-first") is None
+    assert await redis_storage.claim_idempotency_key(
+        key, "op-first", "admission-first"
+    ) is None
     await redis_storage.redis.delete(f"research:idempotency_pending:{key}")
-    assert await redis_storage.claim_idempotency_key(key, "op-retry") is None
+    assert await redis_storage.claim_idempotency_key(
+        key, "op-retry", "admission-retry"
+    ) is None
 
     saved = await redis_storage.save_admitted_operation("op-first", {
         "operationId": "op-first",
         "idempotency_key": key,
         "status": "queued",
-    }, key)
+    }, key, "admission-first")
 
     assert saved is False
     assert await redis_storage.get_operation("op-first") is None
+
+
+@pytest.mark.anyio
+async def test_same_operation_retry_owns_reclaimed_admission_with_a_new_token(
+    redis_storage,
+):
+    key = "idem-same-operation-race"
+    op_id = "op-shared"
+    first_token = "admission-first"
+    retry_token = "admission-retry"
+
+    assert await redis_storage.claim_idempotency_key(
+        key, op_id, first_token
+    ) is None
+    await redis_storage.redis.delete(f"research:idempotency_pending:{key}")
+    assert await redis_storage.claim_idempotency_key(
+        key, op_id, retry_token
+    ) is None
+
+    operation = {
+        "operationId": op_id,
+        "idempotency_key": key,
+        "status": "queued",
+    }
+    assert await redis_storage.save_admitted_operation(
+        op_id, operation, key, first_token
+    ) is False
+    assert await redis_storage.release_idempotency_key(
+        key, op_id, first_token
+    ) is False
+    assert await redis_storage.redis.get(f"research:idempotency:{key}") == op_id
+    assert await redis_storage.redis.get(
+        f"research:idempotency_pending:{key}"
+    ) == retry_token
+
+    assert await redis_storage.save_admitted_operation(
+        op_id, operation, key, retry_token
+    ) is True
 
 
 @pytest.mark.anyio
