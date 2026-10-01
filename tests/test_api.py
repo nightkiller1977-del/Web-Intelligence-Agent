@@ -298,6 +298,7 @@ def test_submission_survives_initial_progress_event_failure(monkeypatch):
             "op-winner",
             ["idempotency", "owner", "operation", "slot", "spend"],
         ),
+        (None, ["idempotency", "owner", "operation", "slot", "spend"]),
     ],
 )
 async def test_rollback_cleans_only_resources_not_owned_by_the_key_winner(
