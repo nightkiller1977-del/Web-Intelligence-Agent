@@ -159,6 +159,18 @@ def unauthenticated_docs_allowed() -> bool:
 # Providers that run locally and therefore never need external-model egress.
 LOCAL_MODEL_PROVIDERS = frozenset({"ollama"})
 
+_LOCAL_MODEL_NETWORKS = tuple(
+    ipaddress.ip_network(cidr)
+    for cidr in (
+        "127.0.0.0/8",
+        "10.0.0.0/8",
+        "172.16.0.0/12",
+        "192.168.0.0/16",
+        "::1/128",
+        "fc00::/7",
+    )
+)
+
 # Credentials for external inference providers. When no gateway is configured
 # these must be masked inside the request context: an ambient key combined with
 # an ambient model tier would otherwise let GPT Researcher reach a provider
@@ -237,9 +249,9 @@ def local_model_endpoint() -> tuple[str, int] | None:
     """Host/port of the configured local model endpoint, or None if not local.
 
     A provider name alone does not establish locality: ``OLLAMA_BASE_URL`` can be
-    pointed at a public host. Only a loopback or private-address endpoint is
-    accepted as local, so a "local" model selection can never become an unmetered
-    external egress path or bypass the shared gateway.
+    pointed at a public host. Only loopback, RFC 1918, or IPv6 ULA endpoints are
+    accepted as local, so a "local" model selection can never become an
+    unmetered external egress path or bypass the shared gateway.
     """
     parsed = urlsplit(settings.OLLAMA_BASE_URL.strip())
     if (
@@ -255,14 +267,7 @@ def local_model_endpoint() -> tuple[str, int] | None:
         if host != "localhost":
             return None
         address = ipaddress.ip_address("127.0.0.1")
-    if (
-        address.is_link_local
-        or address.is_multicast
-        or address.is_reserved
-        or address.is_unspecified
-    ):
-        return None
-    if not (address.is_loopback or address.is_private):
+    if not any(address in network for network in _LOCAL_MODEL_NETWORKS):
         return None
     try:
         port = _validated_url_port(
