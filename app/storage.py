@@ -32,21 +32,18 @@ if existing then
   if redis.call('HGET', KEYS[3], existing) then
     return existing
   end
-  if redis.call('GET', KEYS[2]) == existing then
+  if redis.call('GET', KEYS[2]) then
     return existing
   end
 end
 redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[2])
-redis.call('SET', KEYS[2], ARGV[1], 'EX', ARGV[3])
+redis.call('SET', KEYS[2], ARGV[4], 'EX', ARGV[3])
 return ''
 """
 
 _RELEASE_IDEMPOTENCY_LUA = """
-local existing = redis.call('GET', KEYS[1])
-if not existing then
-  return 0
-end
-if ARGV[1] ~= '' and existing ~= ARGV[1] then
+if redis.call('GET', KEYS[1]) ~= ARGV[1]
+  or redis.call('GET', KEYS[2]) ~= ARGV[2] then
   return 0
 end
 redis.call('DEL', KEYS[1], KEYS[2])
@@ -81,14 +78,13 @@ return 1
 """
 
 _SAVE_ADMITTED_OPERATION_LUA = """
-if redis.call('GET', KEYS[3]) ~= ARGV[1] then
+if redis.call('GET', KEYS[3]) ~= ARGV[1]
+  or redis.call('GET', KEYS[4]) ~= ARGV[3] then
   return 0
 end
 redis.call('HSET', KEYS[1], ARGV[1], ARGV[2])
 redis.call('SADD', KEYS[2], ARGV[1])
-if redis.call('GET', KEYS[4]) == ARGV[1] then
-  redis.call('DEL', KEYS[4])
-end
+redis.call('DEL', KEYS[4])
 return 1
 """
 
@@ -289,7 +285,8 @@ class BaseStorage:
         raise NotImplementedError()
 
     async def save_admitted_operation(
-        self, op_id: str, data: Dict[str, Any], idempotency_key: str
+        self, op_id: str, data: Dict[str, Any], idempotency_key: str,
+        admission_token: str,
     ) -> bool:
         """Persist initial queued state only while admission still owns its key."""
         raise NotImplementedError()
@@ -303,14 +300,17 @@ class BaseStorage:
     async def delete_operation(self, op_id: str):
         raise NotImplementedError()
 
-    async def claim_idempotency_key(self, key: str, op_id: str) -> Optional[str]:
+    async def claim_idempotency_key(
+        self, key: str, op_id: str, admission_token: str
+    ) -> Optional[str]:
         """Atomically claim an idempotency key for op_id.
         Returns None on success, or the existing op_id if already claimed."""
         raise NotImplementedError()
 
-    async def release_idempotency_key(self, key: str, op_id: Optional[str] = None) -> bool:
-        """Release a previously claimed idempotency key.
-        When op_id is provided, only releases keys still mapped to that operation."""
+    async def release_idempotency_key(
+        self, key: str, op_id: str, admission_token: str
+    ) -> bool:
+        """Release a claim only while this admission still owns its lease."""
         raise NotImplementedError()
 
     async def claim_operation_id(self, op_id: str, idempotency_key: str) -> bool:
@@ -436,7 +436,8 @@ class InMemoryStorage(BaseStorage):
         self._evict_if_needed()
 
     async def save_admitted_operation(
-        self, op_id: str, data: Dict[str, Any], idempotency_key: str
+        self, op_id: str, data: Dict[str, Any], idempotency_key: str,
+        admission_token: str,
     ) -> bool:
         if self.idempotency_keys.get(idempotency_key) != op_id:
             return False
@@ -460,7 +461,9 @@ class InMemoryStorage(BaseStorage):
             if existing_op_id == op_id:
                 self.idempotency_keys.pop(key, None)
 
-    async def claim_idempotency_key(self, key: str, op_id: str) -> Optional[str]:
+    async def claim_idempotency_key(
+        self, key: str, op_id: str, admission_token: str
+    ) -> Optional[str]:
         existing = self.idempotency_keys.get(key)
         if existing:
             return existing
@@ -469,9 +472,11 @@ class InMemoryStorage(BaseStorage):
         self._evict_idempotency_if_needed()
         return None
 
-    async def release_idempotency_key(self, key: str, op_id: Optional[str] = None) -> bool:
+    async def release_idempotency_key(
+        self, key: str, op_id: str, admission_token: str
+    ) -> bool:
         existing = self.idempotency_keys.get(key)
-        if not existing or (op_id is not None and existing != op_id):
+        if not existing or existing != op_id:
             return False
         self.idempotency_keys.pop(key, None)
         return True
@@ -648,11 +653,12 @@ class RedisStorage(BaseStorage):
         )
 
     async def save_admitted_operation(
-        self, op_id: str, data: Dict[str, Any], idempotency_key: str
+        self, op_id: str, data: Dict[str, Any], idempotency_key: str,
+        admission_token: str,
     ) -> bool:
         if self.degraded:
             return await self.fallback.save_admitted_operation(
-                op_id, data, idempotency_key
+                op_id, data, idempotency_key, admission_token
             )
         saved = await self.redis.eval(
             _SAVE_ADMITTED_OPERATION_LUA,
@@ -663,6 +669,7 @@ class RedisStorage(BaseStorage):
             f"research:idempotency_pending:{idempotency_key}",
             op_id,
             json.dumps(data),
+            admission_token,
         )
         return bool(saved)
 
@@ -687,9 +694,13 @@ class RedisStorage(BaseStorage):
         await self.redis.delete(f"research:operation_claims:{op_id}")
         await self.redis.delete(f"research:owners:{op_id}")
 
-    async def claim_idempotency_key(self, key: str, op_id: str) -> Optional[str]:
+    async def claim_idempotency_key(
+        self, key: str, op_id: str, admission_token: str
+    ) -> Optional[str]:
         if self.degraded:
-            return await self.fallback.claim_idempotency_key(key, op_id)
+            return await self.fallback.claim_idempotency_key(
+                key, op_id, admission_token
+            )
         idem_key = f"research:idempotency:{key}"
         pending_key = f"research:idempotency_pending:{key}"
         existing = await self.redis.eval(
@@ -701,12 +712,17 @@ class RedisStorage(BaseStorage):
             op_id,
             IDEMPOTENCY_KEY_TTL_SECONDS,
             IDEMPOTENCY_ADMISSION_TTL_SECONDS,
+            admission_token,
         )
         return existing or None
 
-    async def release_idempotency_key(self, key: str, op_id: Optional[str] = None) -> bool:
+    async def release_idempotency_key(
+        self, key: str, op_id: str, admission_token: str
+    ) -> bool:
         if self.degraded:
-            return await self.fallback.release_idempotency_key(key, op_id)
+            return await self.fallback.release_idempotency_key(
+                key, op_id, admission_token
+            )
         idem_key = f"research:idempotency:{key}"
         pending_key = f"research:idempotency_pending:{key}"
         deleted = await self.redis.eval(
@@ -714,7 +730,8 @@ class RedisStorage(BaseStorage):
             2,
             idem_key,
             pending_key,
-            op_id or "",
+            op_id,
+            admission_token,
         )
         return bool(deleted)
 

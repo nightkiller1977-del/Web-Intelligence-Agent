@@ -255,7 +255,11 @@ def test_research_submission_reuses_idempotency_key(monkeypatch):
 def test_idempotency_retry_does_not_report_unpersisted_admission_as_accepted():
     lookup_key = "pending-admission-key"
     operation_id = "op-pending-admission"
-    asyncio.run(api.storage.claim_idempotency_key(lookup_key, operation_id))
+    asyncio.run(
+        api.storage.claim_idempotency_key(
+            lookup_key, operation_id, "pending-admission"
+        )
+    )
 
     with TestClient(app) as client:
         retry = client.post(
@@ -267,6 +271,49 @@ def test_idempotency_retry_does_not_report_unpersisted_admission_as_accepted():
     assert retry.status_code == 409
     assert retry.headers["retry-after"] == "1"
     assert "pending" in retry.json()["detail"].lower()
+
+
+@pytest.mark.anyio
+async def test_rollback_stops_after_admission_lease_ownership_is_lost(monkeypatch):
+    calls = []
+
+    def recorded(name, result=None):
+        async def call(*_args):
+            calls.append(name)
+            return result
+
+        return call
+
+    monkeypatch.setattr(
+        api.storage,
+        "release_idempotency_key",
+        recorded("idempotency", False),
+    )
+    monkeypatch.setattr(
+        api.storage, "release_operation_lease", recorded("owner")
+    )
+    monkeypatch.setattr(
+        api.storage, "release_operation_id", recorded("operation")
+    )
+    monkeypatch.setattr(
+        api.storage, "release_concurrency_slot", recorded("slot")
+    )
+    monkeypatch.setattr(
+        api.storage, "release_daily_spend", recorded("spend")
+    )
+
+    await api._rollback_admission(
+        "op-reclaimed",
+        "idem-reclaimed",
+        "stale-admission-token",
+        True,
+        True,
+        True,
+        True,
+        0.25,
+    )
+
+    assert calls == ["idempotency"]
 
 
 def test_idempotency_retry_resolves_before_gateway_admission_checks(monkeypatch):

@@ -86,12 +86,16 @@ def test_begin_operation_then_release_lease():
 def test_eviction_keeps_idempotency_reservation():
     async def run():
         storage = InMemoryStorage()
-        await storage.claim_idempotency_key("key-1", "op-old")
+        await storage.claim_idempotency_key(
+            "key-1", "op-old", "admission-old"
+        )
         # Force the result payload out of the cache while the reservation stays.
         for i in range(storage_module.OPERATION_CACHE_LIMIT + 5):
             await storage.save_operation(f"op-{i}", {"status": "completed"})
         assert await storage.get_operation("op-old") is None
-        assert await storage.claim_idempotency_key("key-1", "op-new") == "op-old"
+        assert await storage.claim_idempotency_key(
+            "key-1", "op-new", "admission-new"
+        ) == "op-old"
 
     asyncio.run(run())
 
