@@ -25,6 +25,8 @@ def test_local_model_endpoint_treats_malformed_port_as_invalid(monkeypatch):
 @pytest.mark.parametrize("host", [
     "169.254.169.254",
     "0.0.0.0",
+    "192.0.2.1",
+    "198.18.0.1",
     "[fe80::1]",
 ])
 def test_local_model_endpoint_rejects_special_use_addresses(monkeypatch, host):
@@ -33,10 +35,24 @@ def test_local_model_endpoint_rejects_special_use_addresses(monkeypatch, host):
     assert local_model_endpoint() is None
 
 
-def test_local_model_endpoint_still_accepts_rfc1918(monkeypatch):
-    monkeypatch.setattr(settings, "OLLAMA_BASE_URL", "http://10.0.0.2:11434")
+@pytest.mark.parametrize(
+    ("configured_host", "expected_host"),
+    [
+        ("127.0.0.1", "127.0.0.1"),
+        ("10.0.0.2", "10.0.0.2"),
+        ("172.16.0.2", "172.16.0.2"),
+        ("192.168.0.2", "192.168.0.2"),
+        ("[fd00::1]", "fd00::1"),
+    ],
+)
+def test_local_model_endpoint_accepts_explicit_local_ranges(
+    monkeypatch, configured_host, expected_host
+):
+    monkeypatch.setattr(
+        settings, "OLLAMA_BASE_URL", f"http://{configured_host}:11434"
+    )
 
-    assert local_model_endpoint() == ("10.0.0.2", 11434)
+    assert local_model_endpoint() == (expected_host, 11434)
 
 
 def test_local_model_endpoint_rejects_a_non_root_base_path(monkeypatch):
