@@ -42,7 +42,7 @@ The project continues to harden restart behavior, resource limits, untrusted-con
 - **Bearer-token authentication** — protected API routes fail closed when remote authentication is not configured.
 - **SSRF-oriented protections** — explicit URL validation and restrictions around private/protected network destinations.
 - **Prometheus metrics** — `/metrics` is available for operational monitoring.
-- **Container deployment** — Docker and Render configuration are included.
+- **Container deployment** — Docker is the deployment unit; the service runs as an Azure Container Apps revision in `rg-aicc-fleet` (image built via `az acr build` to the `aiccfleetacr` registry), with a legacy Render blueprint (`render.yaml`) still present as a secondary instance against the same data store.
 
 ## Architecture
 
@@ -274,7 +274,7 @@ Remote deployments should set an explicit `WEB_INTELLIGENCE_AUTH_TOKEN` and norm
 Brain Memory credentials must be provisioned as a dedicated least-privilege group through `aicc-secrets`; do not reuse another agent's credential or add partial values. A Brain outage, invalid configuration, or rejected ingest does not rerun research or alter the completed research result.
 Redis-backed deployments should set `REDIS_REQUIRED=true` so the service fails closed at startup when the backend is unreachable, instead of silently degrading to process-local memory. Concurrency slots and operation ownership are shared through Redis so the limit is service-wide across instances; `CONCURRENCY_LEASE_TTL_SECONDS` bounds how long a lease is held without a heartbeat.
 
-The included `render.yaml` configures a Docker-based service plus Redis and illustrates the remote deployment shape.
+Primary deployment is Azure Container Apps: CI (`.github/workflows/sidecar-tests.yml`) builds the image with `az acr build` against the `aiccfleetacr` registry and rolls it out with `az containerapp update` to the `web-intelligence-agent` app in resource group `rg-aicc-fleet` (ACES-453). The included `render.yaml` is a legacy, secondary blueprint — not the primary deployment target — that configures a Docker-based service plus Redis against the same Redis-backed data store and still illustrates the remote deployment shape (storage, auth, concurrency env vars) for either platform.
 
 ## Docker
 

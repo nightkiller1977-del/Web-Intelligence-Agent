@@ -1,0 +1,11 @@
+# Pylint configuration for Web-Intelligence-Agent.
+#
+# `import-error` is disabled on purpose. Static analysis in CI and in the AI
+# Commander Code Review Agent runs pylint WITHOUT installing this project's
+# third-party dependencies, so every `import pydantic / httpx / fastapi /
+# app.*` is reported as a false-positive import-error that drowns out real
+# findings. Genuine missing-import regressions are still caught by the test
+# suite, which installs requirements.lock + requirements-test.txt before
+# running (see .github/workflows/sidecar-tests.yml).
+[MESSAGES CONTROL]
+disable=import-error

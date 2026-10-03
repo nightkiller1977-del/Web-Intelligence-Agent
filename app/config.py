@@ -20,10 +20,12 @@ class Settings(BaseSettings):
 
     # Process Bindings
     HOST: str = "127.0.0.1"
-    PORT: int = int(os.getenv("PORT", 8080))
+    PORT: int = int(os.getenv("PORT", "8080"))
 
     # Deployment Modes
-    # 'local' means managed locally by Electron. 'remote' means cloud-hosted (Render).
+    # 'local' means managed locally by Electron. 'remote' means cloud-hosted (primary:
+    # Azure Container Apps, see grafana_observability.py's CONTAINER_APP_NAME check and
+    # the deploy job in .github/workflows/sidecar-tests.yml; legacy/secondary: Render).
     DEPLOYMENT_MODE: str = os.getenv("DEPLOYMENT_MODE", "local")
 
     # Token Authentication
@@ -34,7 +36,8 @@ class Settings(BaseSettings):
     )
 
     # Storage and Durable Queuing
-    # 'local' (in-memory/SQLite) vs. 'redis' (production queues on Render)
+    # 'local' (in-memory/SQLite) vs. 'redis' (production queues; primary deployment is
+    # Azure Container Apps, with a legacy Render instance still running the same way)
     STORAGE_BACKEND: str = os.getenv("STORAGE_BACKEND", "local")
     REDIS_URL: str = os.getenv("REDIS_URL", "")
     # Concurrency and resource limits. The daily spend ceiling below is a local
@@ -42,15 +45,15 @@ class Settings(BaseSettings):
     # cannot delegate. When AI-OpenRouter serves the request it is the budget
     # authority, and local models have no external cost, so admission neither
     # reserves nor reconciles spend for those paths.
-    MAX_CONCURRENT_OPS: int = int(os.getenv("MAX_CONCURRENT_OPS", 3))
-    MAX_MEMORY_MB: int = int(os.getenv("MAX_MEMORY_MB", 512))
-    DAILY_SPEND_LIMIT_USD: float = float(os.getenv("DAILY_SPEND_LIMIT_USD", 50.0))
+    MAX_CONCURRENT_OPS: int = int(os.getenv("MAX_CONCURRENT_OPS", "3"))
+    MAX_MEMORY_MB: int = int(os.getenv("MAX_MEMORY_MB", "512"))
+    DAILY_SPEND_LIMIT_USD: float = float(os.getenv("DAILY_SPEND_LIMIT_USD", "50.0"))
     # Conservative per-operation budget reserved at admission, before the real
     # cost is known. Reservation makes the daily ceiling atomic across
     # replicas; it is released and reconciled to the observed cost on
     # completion, or released outright on cancel/failure.
     DEFAULT_OPERATION_COST_RESERVE_USD: float = float(
-        os.getenv("DEFAULT_OPERATION_COST_RESERVE_USD", 0.25)
+        os.getenv("DEFAULT_OPERATION_COST_RESERVE_USD", "0.25")
     )
 
     # Durability
@@ -59,11 +62,11 @@ class Settings(BaseSettings):
     # memory. Set false only for explicitly disposable deployments.
     REDIS_REQUIRED: bool = os.getenv("REDIS_REQUIRED", "").lower() in ("1", "true", "yes")
     # Lease TTL for concurrency slots and operation liveness (seconds).
-    CONCURRENCY_LEASE_TTL_SECONDS: int = int(os.getenv("CONCURRENCY_LEASE_TTL_SECONDS", 3600))
+    CONCURRENCY_LEASE_TTL_SECONDS: int = int(os.getenv("CONCURRENCY_LEASE_TTL_SECONDS", "3600"))
     # How often a running service re-runs the stale-operation reconciliation
     # scan. Must be shorter than CONCURRENCY_LEASE_TTL_SECONDS so an operation
     # orphaned by a crash is eventually failed rather than stuck forever.
-    STALE_RECONCILE_INTERVAL_SECONDS: int = int(os.getenv("STALE_RECONCILE_INTERVAL_SECONDS", 60))
+    STALE_RECONCILE_INTERVAL_SECONDS: int = int(os.getenv("STALE_RECONCILE_INTERVAL_SECONDS", "60"))
 
     @model_validator(mode="after")
     def _validate_operational_limits(self):
