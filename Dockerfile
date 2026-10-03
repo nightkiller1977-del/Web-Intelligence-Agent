@@ -17,7 +17,10 @@ RUN pip install --no-cache-dir -r requirements.lock
 # Copy application files
 COPY . .
 
-# Default port. Render will overwrite PORT env and bind to 0.0.0.0
+# Default port 8080. The primary deployment target, Azure Container Apps, is
+# configured with ingress targeting this port (see the deploy job in
+# .github/workflows/sidecar-tests.yml). The legacy Render instance instead
+# overwrites the PORT env var itself; either way the app binds 0.0.0.0:$PORT.
 ENV PORT=8080
 EXPOSE 8080
 

@@ -23,7 +23,9 @@ class Settings(BaseSettings):
     PORT: int = int(os.getenv("PORT", 8080))
 
     # Deployment Modes
-    # 'local' means managed locally by Electron. 'remote' means cloud-hosted (Render).
+    # 'local' means managed locally by Electron. 'remote' means cloud-hosted (primary:
+    # Azure Container Apps, see grafana_observability.py's CONTAINER_APP_NAME check and
+    # the deploy job in .github/workflows/sidecar-tests.yml; legacy/secondary: Render).
     DEPLOYMENT_MODE: str = os.getenv("DEPLOYMENT_MODE", "local")
 
     # Token Authentication
@@ -34,7 +36,8 @@ class Settings(BaseSettings):
     )
 
     # Storage and Durable Queuing
-    # 'local' (in-memory/SQLite) vs. 'redis' (production queues on Render)
+    # 'local' (in-memory/SQLite) vs. 'redis' (production queues; primary deployment is
+    # Azure Container Apps, with a legacy Render instance still running the same way)
     STORAGE_BACKEND: str = os.getenv("STORAGE_BACKEND", "local")
     REDIS_URL: str = os.getenv("REDIS_URL", "")
     # Concurrency and resource limits. The daily spend ceiling below is a local

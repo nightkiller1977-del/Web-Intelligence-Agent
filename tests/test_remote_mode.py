@@ -44,7 +44,8 @@ from app.storage import storage
 
 
 class TestHealthEndpoints:
-    """Test health check endpoints required by Render."""
+    """Test health check endpoints required by remote deployments (Azure Container Apps
+    revision health/ingress checks in CI; the legacy Render instance also probes these)."""
 
     def test_health_live_responds(self):
         """GET /health/live should respond quickly for liveness probes."""
