@@ -7,14 +7,13 @@ and end-to-end research workflow.
 """
 
 import os
-import json
 import asyncio
 import secrets
 from pathlib import Path
 import pytest
 import httpx
 import sys
-from unittest.mock import patch, MagicMock, AsyncMock, MagicMock as MockModule
+from unittest.mock import patch, MagicMock, AsyncMock
 
 # Generate ephemeral test token (randomized per test run for security)
 test_token = os.getenv('WEB_INTELLIGENCE_AUTH_TOKEN', secrets.token_hex(32))
@@ -101,7 +100,7 @@ class TestHealthEndpoints:
         assert response.json()["inference"] is False
 
     def test_render_uses_readiness_probe(self):
-        render_config = Path(__file__).parents[1].joinpath("render.yaml").read_text()
+        render_config = Path(__file__).parents[1].joinpath("render.yaml").read_text(encoding="utf-8")
 
         assert "healthCheckPath: /health/ready" in render_config
 
@@ -267,8 +266,6 @@ class TestRedisLocking:
         client = TestClient(app)
         headers = {"Authorization": f"Bearer {settings.AUTH_TOKEN}"}
 
-        operation_ids = []
-
         # Simulate multiple concurrent requests
         async def make_request(op_id):
             try:
@@ -293,7 +290,7 @@ class TestRedisLocking:
                     }
                 )
                 return response.status_code
-            except Exception as e:
+            except Exception as e:  # pylint: disable=broad-exception-caught
                 pytest.fail(f"Request failed: {e}")
 
         with patch('app.api.conduct_web_research', new_callable=AsyncMock):
@@ -353,7 +350,7 @@ class TestConcurrencyLimiting:
             # (a slow CI runner could let the sleep expire mid-assertion).
             release_gate = asyncio.Event()
 
-            async def gated_research(*args, **kwargs):
+            async def gated_research(*_args, **_kwargs):
                 await release_gate.wait()
                 return {"status": "completed", "answer": "test"}
 
@@ -408,7 +405,7 @@ class TestConcurrencyLimiting:
             # against this test's own bookkeeping of which gates exist yet.
             gates_by_op = {op_id: asyncio.Event() for op_id in fill_op_ids + ["op-slot-new"]}
 
-            async def gated_research(*args, **kwargs):
+            async def gated_research(*_args, **kwargs):
                 await gates_by_op[kwargs["op_id"]].wait()
                 return {"status": "completed", "answer": "test"}
 
@@ -584,7 +581,7 @@ class TestDeploymentEnvironmentVariables:
     def test_live_gate_targets_the_new_revision_fqdn(self):
         workflow = Path(__file__).parents[1].joinpath(
             ".github/workflows/sidecar-tests.yml"
-        ).read_text()
+        ).read_text(encoding="utf-8")
         smoke_step = workflow.split(
             "- name: Smoke-test public ingress on the new revision", 1
         )[1].split("\n  live-integration:", 1)[0]
@@ -597,7 +594,7 @@ class TestDeploymentEnvironmentVariables:
     def test_live_tests_run_without_azure_deployment_credentials(self):
         workflow = Path(__file__).parents[1].joinpath(
             ".github/workflows/sidecar-tests.yml"
-        ).read_text()
+        ).read_text(encoding="utf-8")
         deploy_job, live_job = workflow.split("\n  live-integration:", 1)
 
         assert "id-token: write" in deploy_job
@@ -613,7 +610,7 @@ class TestDeploymentEnvironmentVariables:
     def test_live_gate_reuses_the_workflow_run_id_for_retries(self):
         workflow = Path(__file__).parents[1].joinpath(
             ".github/workflows/sidecar-tests.yml"
-        ).read_text()
+        ).read_text(encoding="utf-8")
         live_step = workflow.split("- name: Run live Azure integration tests", 1)[1]
 
         assert "LIVE_TEST_RUN_ID: ${{ github.run_id }}" in live_step
