@@ -19,6 +19,11 @@ description: Use whenever starting, updating, reviewing, completing, or discover
 
 Current documented mappings: AI Command Center → `nightkiller1977-del/Ai-Command-Center-Desktop-App`; AICC Coordinator/Routing → `nightkiller1977-del/Aicc-Coordinator`; Job Agent → `nightkiller1977-del/job-agent`; Email Agent → `nightkiller1977-del/email-agent`; ConnectionSphere → `nightkiller1977-del/connectionsphere`; TrustGraph → `nightkiller1977-del/TrustGraph`; Code Review Agent → `nightkiller1977-del/Code-Review-Agent`; AI OpenRouter → `nightkiller1977-del/AI-OpenRouter`. If absent, consult current Coordinator data instead of guessing.
 
+## Design lives in the work item
+
+- Do not create a separate design-only ticket. Keep the active design in the implementation issue or its parent.
+- Include behavioral acceptance evidence for executable workflow changes; unit/mock-only evidence is not enough to call the behavior complete.
+
 ## Before coding
 1. Identify the Jira work ticket.
 2. Verify it has a parent Epic/roadmap ticket; identify/create the parent first if orphaned.
