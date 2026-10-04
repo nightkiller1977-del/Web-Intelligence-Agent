@@ -43,8 +43,7 @@ from app.storage import storage
 
 
 class TestHealthEndpoints:
-    """Test health check endpoints required by remote deployments (Azure Container Apps
-    revision health/ingress checks in CI; the legacy Render instance also probes these)."""
+    """Test health endpoints required by remote deployments and Azure revision CI checks."""
 
     def test_health_live_responds(self):
         """GET /health/live should respond quickly for liveness probes."""
@@ -99,7 +98,7 @@ class TestHealthEndpoints:
         assert response.status_code == 503
         assert response.json()["inference"] is False
 
-    def test_render_uses_readiness_probe(self):
+    def test_legacy_render_blueprint_uses_readiness_probe(self):
         render_config = Path(__file__).parents[1].joinpath("render.yaml").read_text(encoding="utf-8")
 
         assert "healthCheckPath: /health/ready" in render_config

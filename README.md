@@ -42,7 +42,7 @@ The project continues to harden restart behavior, resource limits, untrusted-con
 - **Bearer-token authentication** — protected API routes fail closed when remote authentication is not configured.
 - **SSRF-oriented protections** — explicit URL validation and restrictions around private/protected network destinations.
 - **Prometheus metrics** — `/metrics` is available for operational monitoring.
-- **Container deployment** — Docker is the deployment unit; the service runs as an Azure Container Apps revision in `rg-aicc-fleet` (image built via `az acr build` to the `aiccfleetacr` registry). The retained `render.yaml` is a legacy blueprint, not a live secondary instance or a shared-state topology.
+- **Container deployment** — Docker is the deployment unit; the service runs as an Azure Container Apps revision in `rg-aicc-fleet` (image built via `az acr build` to the `aiccfleetacr` registry). The retained `render.yaml` is a legacy blueprint, not a verified live secondary instance or a shared-state topology.
 
 ## Architecture
 
