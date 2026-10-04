@@ -20,7 +20,7 @@ If you discover a security vulnerability in Web Intelligence Agent, please email
 - **Never commit `.env` files** to the repository. Use `.env.example` as a template only.
 - All sensitive configuration (API keys, tokens, authentication) must be provided via environment variables at runtime.
 - In development, use a local `.env` file (ignored by `.gitignore`).
-- In production, use your deployment platform's secrets management (Azure Container Apps secrets/environment variables for the primary deployment; Render environment variables for the legacy secondary instance).
+- In production, use your deployment platform's secrets management. Azure Container Apps secrets/environment variables are the primary deployment path; a legacy Render blueprint requires separate, current verification before any renewed deployment or secret provisioning.
 
 ### Authentication Security
 - All protected routes require bearer token authentication.
