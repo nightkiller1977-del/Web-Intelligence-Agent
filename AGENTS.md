@@ -40,13 +40,13 @@ OpenHands skills live under `.agents/skills/`. Claude Code skills live under `.c
 
 ## Pull request review policy
 
-- OpenHands and the AI Commander Code Review Agent are the only AI reviewers authorized to run automatically on pull requests.
-- OpenHands is the primary automatic reviewer. The AI Commander Code Review Agent is an independent automatic second reviewer using its own deterministic checks and authorized model path.
-- Do not automatically request, invoke, enable, or depend on ChatGPT/Codex, Claude, GitHub Copilot, or any other AI pull-request reviewer.
+- OpenHands is the sole AI reviewer authorized to run automatically on pull requests.
+- The AI Commander Code Review Agent is manual/shadow-only and non-authoritative for PR review until it passes an explicitly approved quality/promotion gate. It must not automatically post PR reviews.
+- Do not automatically request, invoke, enable, or depend on ChatGPT/Codex, Claude, GitHub Copilot, Code-Review-Agent, or any other AI pull-request reviewer besides OpenHands.
 - Another named AI reviewer may review a pull request only when Anthony explicitly requests that reviewer for that PR. The request authorizes one independent review of the current head SHA only; later commits require another request.
 - A requested reviewer must inspect the current head, diff, surrounding implementation, and validation evidence itself. It must not copy, repackage, aggregate, or merely endorse OpenHands, Code-Review-Agent, or another review.
+- Distinguish native/external OpenHands PR-review automation from Desktop/Repair OpenHands execution and remediation-candidate review. Desktop/Repair OpenHands remains an isolated, bounded coding/remediation path with scoped workspaces and no general GitHub/secret access unless a separately reviewed integration explicitly grants it.
 - AI findings are hypotheses. Required CI, tests, lint, security checks, source verification, and repository-specific merge controls remain authoritative.
-
 ## AI Commander ecosystem map and shared infrastructure
 
 **This repository:** `Web-Intelligence-Agent` owns bounded browser/research service that collects source-backed web evidence for authorized AI Commander workflows. Do not move another repository's authority here or build a parallel scheduler, policy engine, secret store, memory system, model gateway, or incident framework.
@@ -68,6 +68,8 @@ OpenHands skills live under `.agents/skills/`. Claude Code skills live under `.c
 | `aicc-secrets` | Encrypted secret/deployment authority; stores and distributes only explicitly mapped names. |
 
 ### Shared infrastructure and tools
+
+- **Fleet deployment authority:** Azure Container Apps is the authoritative/default production platform for the shared AI Commander fleet. Render is legacy/secondary/rollback-only unless current deployment evidence proves an explicit exception. A checked-in `render.yaml` is not proof that Render is live; verify the active target before deployment, environment, or secret changes.
 
 - **Secrets:** `~/Dev/Projects/aicc-secrets` is the encrypted local authority. `secrets.enc.env` is SOPS+age encrypted; age private keys and plaintext output stay outside Git. Authorized local processes decrypt into their own process environment at startup, including `AI-OpenRouter/boot.sh`, the `ai-commander-service` systemd unit, and Job Agent scheduled units. Never source decrypted values into logs, prompts, tests, screenshots, memory, issues, or PR text.
 - **Variable ownership:** use service-scoped names and least-privilege credentials. Established MongoDB names include `MONGODB_URI_EMAIL_AGENT`, `MONGODB_URI_AI_OPENROUTER`, and `MONGODB_URI_JOB_AGENT_DASHBOARD`. Brain Memory and new services must add an explicitly owned name/mapping rather than reuse another service's credential.

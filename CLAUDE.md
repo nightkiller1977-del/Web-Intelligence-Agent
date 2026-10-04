@@ -24,4 +24,4 @@ This repository is `Web-Intelligence-Agent`: bounded browser/research service th
 
 ## Pull request reviews
 
-Follow the pull request review policy in `AGENTS.md`. OpenHands and Code-Review-Agent are the only automatic AI reviewers. Claude and other named reviewers require Anthony's explicit request for one independent review of the named PR's current head SHA; later commits require a new request.
+Follow the pull request review policy in `AGENTS.md`. OpenHands is the sole automatic AI reviewer. Code-Review-Agent, Claude, and every other named AI reviewer require Anthony's explicit request for one independent review of the named PR's current head SHA; later commits require a new request.
