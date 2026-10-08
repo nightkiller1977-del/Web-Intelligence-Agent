@@ -19,3 +19,7 @@ lupa==2.8
 # pytest-cov drives the `pytest --cov=app` coverage reporting used in
 # .github/workflows/sidecar-tests.yml.
 pytest-cov==7.1.0
+
+# pytest-timeout provides the --timeout CLI flag and @pytest.mark.timeout
+# marker used by the e2e behavior tests (tests/test_behavior_e2e.py).
+pytest-timeout==2.4.0

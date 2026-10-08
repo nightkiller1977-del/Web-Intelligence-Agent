@@ -5,12 +5,12 @@ These tests start a real uvicorn server backed by local Ollama inference
 and DuckDuckGo search, then exercise the full research lifecycle against
 live external services. They are NOT meant for CI — run them locally with:
 
-    pytest tests/test_behavior_e2e.py -m e2e -v --timeout=900
+    pytest tests/test_behavior_e2e.py -m e2e -v -s
 
 Prerequisites:
   - Ollama running at http://127.0.0.1:11434 with 'mistral' and 'nomic-embed-text' pulled
   - Network access for DuckDuckGo search and web scraping
-  - ddgs package installed (pip install ddgs)
+  - pytest-timeout installed (in requirements-test.txt)
 """
 
 import asyncio
@@ -116,6 +116,33 @@ def _make_request_body(op_id: str, query: str, *, mode: str = "quick", timeout_s
     }
 
 
+def _cancel_and_wait(base_url: str, op_id: str, timeout: int = 30) -> None:
+    """Cancel an operation and wait for it to reach a terminal state."""
+    try:
+        httpx.post(
+            f"{base_url}/v1/research/{op_id}/cancel",
+            headers=_auth_headers(),
+            timeout=timeout,
+        )
+    except httpx.HTTPError:
+        pass
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            r = httpx.get(
+                f"{base_url}/v1/research/{op_id}/result",
+                headers=_auth_headers(),
+                timeout=10,
+            )
+            if r.status_code == 200 and r.json().get("status") in (
+                "completed", "partial", "failed", "cancelled",
+            ):
+                return
+        except httpx.HTTPError:
+            pass
+        time.sleep(2)
+
+
 # ---------------------------------------------------------------------------
 # Fast path tests — no Ollama needed, exercise service plumbing
 # ---------------------------------------------------------------------------
@@ -170,7 +197,8 @@ class TestAuth:
         assert resp.status_code == 401
 
     def test_valid_token_passes_auth(self, e2e_server):
-        body = _make_request_body("auth-pass-1", "test query")
+        op_id = f"auth-pass-{uuid.uuid4().hex[:8]}"
+        body = _make_request_body(op_id, "test query")
         body["idempotencyKey"] = str(uuid.uuid4())
         resp = httpx.post(
             f"{e2e_server}/v1/research",
@@ -178,6 +206,8 @@ class TestAuth:
             headers=_auth_headers(),
         )
         assert resp.status_code in (202, 409)
+        if resp.status_code == 202:
+            _cancel_and_wait(e2e_server, op_id)
 
 
 @pytest.mark.e2e
@@ -193,8 +223,9 @@ class TestIdempotency:
         assert "Idempotency" in resp.json()["detail"]
 
     def test_duplicate_idempotency_key_returns_same_op(self, e2e_server):
+        op_id = f"idemp-dup-{uuid.uuid4().hex[:8]}"
         idem_key = str(uuid.uuid4())
-        body = _make_request_body("idemp-dup-1", "test query")
+        body = _make_request_body(op_id, "test query")
         body["idempotencyKey"] = idem_key
 
         resp1 = httpx.post(
@@ -214,7 +245,9 @@ class TestIdempotency:
         # 200 = idempotent hit returning existing state
         # 202 = local backend re-admitted the same operation (benign with in-memory storage)
         assert resp2.status_code in (200, 202)
-        assert resp2.json()["operationId"] == "idemp-dup-1"
+        assert resp2.json()["operationId"] == op_id
+
+        _cancel_and_wait(e2e_server, op_id)
 
 
 @pytest.mark.e2e

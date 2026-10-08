@@ -96,3 +96,6 @@ def pytest_configure(config):
     config.addinivalue_line(
         "markers", "e2e: end-to-end behavior test requiring live Ollama and network access"
     )
+    config.addinivalue_line(
+        "markers", "timeout(seconds): per-test timeout (requires pytest-timeout)"
+    )

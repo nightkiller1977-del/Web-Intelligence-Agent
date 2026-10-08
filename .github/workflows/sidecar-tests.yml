@@ -34,8 +34,8 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.lock -r requirements-test.txt
 
-      - name: Run test suite (excluding SSRF/egress security tests)
-        run: pytest --cov=app --ignore=tests/test_security_egress.py -v
+      - name: Run test suite (excluding SSRF/egress security tests and e2e)
+        run: pytest --cov=app --ignore=tests/test_security_egress.py -m "not e2e" -v
 
   security-egress-test:
     name: pytest security egress (py${{ matrix.python-version }})
