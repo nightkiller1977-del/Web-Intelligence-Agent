@@ -837,6 +837,7 @@ def test_retained_findings_withhold_claims_whose_text_embeds_a_secret():
         "Retrieve example.test/f?signature=deadbeef while it is valid.",
         # Scheme-relative with a bracketed IPv6 authority.
         "Pull //[2606:4700:4700::1111]/f?X-Amz-Signature=deadbeef now.",
+        "Grab //8.8.8.8/f?signature=deadbeef from the mirror.",
     ]
     findings, _withheld, secret_bearing = researcher_adapter._retained_findings(
         verified_claims=[claim(text) for text in unsafe], **args
@@ -889,6 +890,10 @@ def test_retained_findings_withhold_claims_whose_text_embeds_a_secret():
         "The entry point is app/researcher_adapter.py in that package.",
         "A bare www.example.test carries no path or query to leak.",
         "The node answers at //[2606:4700:4700::1111] for that region.",
+        "The resolver is reachable at //8.8.8.8 from that subnet.",
+        # A dotted quad in prose is a version string, not an authority; the
+        # "//" prefix is what disambiguates the two.
+        "The release is 1.2.3.4 in that distribution channel.",
     ]
     kept, _withheld2, none_secret = researcher_adapter._retained_findings(
         verified_claims=[claim(text) for text in safe], **args

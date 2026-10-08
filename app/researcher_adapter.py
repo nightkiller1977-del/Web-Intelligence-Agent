@@ -707,6 +707,11 @@ _SCHEME_RELATIVE_URL_IN_CLAIM_TEXT = re.compile(
     # and _public_locator() already round-trips one — the two were simply
     # inconsistent.
     r"(?:\[[0-9A-Fa-f:.]+\](?::\d{1,5})?"
+    # An unbracketed IPv4 literal has no alphabetic TLD and needs no port, so
+    # the host alternative below never matched it. Safe to accept here because
+    # the "//" prefix is what disambiguates: a bare "1.2.3.4" in prose is a
+    # version string, "//1.2.3.4" is an authority.
+    r"|\d{1,3}(?:\.\d{1,3}){3}(?::\d{1,5})?"
     r"|[A-Za-z0-9._-]*(?:\.[A-Za-z]{2,}|:\d{1,5}))"
     r"(?:[/?#]\S*)?"
 )
