@@ -658,10 +658,16 @@ def _public_locator(raw: str) -> str:
     host = parts.hostname or ""
     if not host:
         return ""
+    if parts.query:
+        # The query can carry the secret (signature, token) or the resource
+        # identity (/article?id=123) and there is no general way to tell which.
+        # Stripping it would silently publish a locator for a different page,
+        # so omit it entirely: no provenance beats wrong provenance.
+        return ""
     if parts.port:
         host = f"{host}:{parts.port}"
-    # Drop userinfo, query and fragment — that is where credentials and
-    # signed-URL secrets live. Scheme, host and path are the provenance.
+    # Drop userinfo and fragment — that is where credentials live. Scheme, host
+    # and path are the provenance.
     return urlunsplit((parts.scheme, host, parts.path, "", ""))
 
 
@@ -673,19 +679,24 @@ def _retained_findings(verified_claims: list, evidence: list, sources: list) -> 
     still retained: the finding is what makes the record recallable, and dropping
     it for want of a URL would discard verified knowledge.
     """
-    locator_by_source = {
-        source.get("id"): _public_locator(source.get("url") or source.get("uri") or "")
+    provenance_by_source = {
+        source.get("id"): (
+            _public_locator(source.get("url") or source.get("uri") or ""),
+            str(source.get("sourceType") or ""),
+        )
         for source in sources
     }
     source_by_evidence = {item.get("id"): item.get("sourceId") for item in evidence}
     findings = []
     for claim in verified_claims:
-        locator = ""
+        locator, source_type = "", ""
         for evidence_id in claim.get("evidenceIds", []):
-            locator = locator_by_source.get(source_by_evidence.get(evidence_id), "")
-            if locator:
+            locator, source_type = provenance_by_source.get(source_by_evidence.get(evidence_id), ("", ""))
+            # A local document redacts to no locator but still has a type worth
+            # carrying, so settle on the first evidence that resolves to either.
+            if locator or source_type:
                 break
-        findings.append({"text": claim.get("text", ""), "url": locator})
+        findings.append({"text": claim.get("text", ""), "url": locator, "sourceType": source_type})
     return findings
 
 

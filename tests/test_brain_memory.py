@@ -115,16 +115,24 @@ def test_ingest_retains_verified_findings_with_locator_and_as_of_stamp(monkeypat
         verified_claim_count=2,
         source_types=["web"],
         findings=[
-            {"text": "urllib3 v2 requires OpenSSL 1.1.1 or newer", "url": "https://example.test/a"},
-            {"text": "A claim whose evidence resolved to no locator", "url": ""},
+            {"text": "urllib3 v2 requires OpenSSL 1.1.1 or newer", "url": "https://example.test/a", "sourceType": "web"},
+            {"text": "A claim from a local design note", "url": "", "sourceType": "document"},
+            {"text": "A claim whose evidence resolved to nothing", "url": "", "sourceType": ""},
         ],
     ) is True
 
     text = json.loads(captured["body"])["sourceText"]
-    assert "urllib3 v2 requires OpenSSL 1.1.1 or newer [https://example.test/a]" in text
-    # Retained even without a locator — dropping it would discard verified knowledge.
-    assert "- A claim whose evidence resolved to no locator" in text
-    assert "web-sourced, true as of " in text
+    assert "urllib3 v2 requires OpenSSL 1.1.1 or newer [web: https://example.test/a]" in text
+    # A redacted local locator still carries its type, so first-party material
+    # is not recalled later as if it came from the web.
+    assert "A claim from a local design note [document]" in text
+    # Retained even with no provenance at all — dropping it would discard
+    # verified knowledge.
+    assert "- A claim whose evidence resolved to nothing" in text
+    assert "Source-supported findings (passage-matched, not fact-checked), retrieved " in text
+    # Verification is token overlap plus a negation check. It must never be
+    # persisted as a claim of truth.
+    assert "true as of" not in text
 
 
 def test_ingest_bounds_retained_findings(monkeypatch):
@@ -165,7 +173,7 @@ def test_ingest_without_findings_keeps_counter_only_record(monkeypatch):
     )
 
     text = json.loads(captured["body"])["sourceText"]
-    assert "true as of" not in text
+    assert "Source-supported findings" not in text
     assert "Sources consulted: 0 (none). Verified claims: 0." in text
 
 

@@ -25,6 +25,7 @@ _MAX_CONTEXT_BYTES = 6000
 _MAX_RETAINED_FINDINGS = 10
 _MAX_FINDING_BYTES = 400
 _MAX_SOURCE_URL_BYTES = 300
+_MAX_SOURCE_TYPE_BYTES = 40
 _MAX_INGEST_TEXT_BYTES = 8000
 
 
@@ -55,9 +56,9 @@ def _render_outcome_text(
     The counters alone embed to nothing useful, so a repeat of the same question
     never recalled a prior answer and re-researched it. The claim text is what
     makes the record semantically recallable; the counters stay on the trailing
-    line so nothing that read them is lost. Retained text is web-derived — the
-    recall path is what marks it untrusted, so it must not be replayed as
-    instructions.
+    line so nothing that read them is lost. Retained text is source-derived
+    (web, document or repository) — the recall path is what marks it untrusted,
+    so it must not be replayed as instructions.
     """
     lines = [f"Web research outcome: {status} (mode={mode})."]
     retained = []
@@ -66,12 +67,26 @@ def _render_outcome_text(
         if not text:
             continue
         url = " ".join(str(finding.get("url") or "").split())
-        suffix = f" [{_truncate_utf8(url, _MAX_SOURCE_URL_BYTES)}]" if url else ""
+        source_type = " ".join(str(finding.get("sourceType") or "").split())
+        # Per-finding, because a run can mix web, document and repository
+        # sources; a blanket "web-sourced" label would misreport first-party
+        # material, and a redacted local locator leaves the type as the only
+        # provenance left to carry.
+        provenance = [
+            value for value in (
+                _truncate_utf8(source_type, _MAX_SOURCE_TYPE_BYTES),
+                _truncate_utf8(url, _MAX_SOURCE_URL_BYTES),
+            ) if value
+        ]
+        suffix = f" [{': '.join(provenance)}]" if provenance else ""
         retained.append(f"- {_truncate_utf8(text, _MAX_FINDING_BYTES)}{suffix}")
     if retained:
-        # Stamped as of retrieval: a stored finding is evidence of what the web
-        # said then, never proof of current state.
-        lines.append(f"Verified findings, web-sourced, true as of {captured_at}:")
+        # "Source-supported", never "true": verification is passage token
+        # overlap plus a negation check. It establishes that a source said
+        # this — not that the statement is correct, and not that the source is
+        # reliable. Stamped with retrieval time, since even that is only
+        # evidence of what was said then.
+        lines.append(f"Source-supported findings (passage-matched, not fact-checked), retrieved {captured_at}:")
         lines.extend(retained)
     observed = ", ".join(sorted({str(value) for value in source_types if value})) or "none"
     lines.append(

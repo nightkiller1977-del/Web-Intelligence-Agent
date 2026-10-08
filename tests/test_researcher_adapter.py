@@ -660,7 +660,7 @@ async def test_schedule_outcome_ingest_runs_only_after_durable_save(monkeypatch)
     assert spy.ingested == [{
         "operation_id": "test-op", "status": "completed", "mode": "standard",
         "source_count": 1, "verified_claim_count": 1, "source_types": ["web"],
-        "findings": [{"text": "supported claim", "url": "https://example.test/a"}],
+        "findings": [{"text": "supported claim", "url": "https://example.test/a", "sourceType": "web"}],
     }]
 
 
@@ -677,31 +677,37 @@ def test_retained_findings_resolve_locator_through_evidence():
             {"id": "ev-3", "sourceId": "src-2"},
         ],
         sources=[
-            {"id": "src-1", "url": "https://example.test/a"},
+            {"id": "src-1", "url": "https://example.test/a", "sourceType": "web"},
             # A local document carries its locator on uri; url stays empty.
-            {"id": "src-2", "url": "", "uri": "file:///home/someone/private/notes.md"},
+            {"id": "src-2", "url": "", "uri": "file:///home/someone/private/notes.md", "sourceType": "document"},
         ],
     )
 
     assert findings == [
-        {"text": "has http locator", "url": "https://example.test/a"},
+        {"text": "has http locator", "url": "https://example.test/a", "sourceType": "web"},
         # The claim is still retained, but the local path is not published into
         # a shared artifact — the operator may never have cleared it for
-        # external use.
-        {"text": "from a local document", "url": ""},
-        {"text": "unresolvable", "url": ""},
+        # external use. The type survives so the finding is not later recalled
+        # as web evidence.
+        {"text": "from a local document", "url": "", "sourceType": "document"},
+        {"text": "unresolvable", "url": "", "sourceType": ""},
     ]
 
 
-def test_public_locator_strips_credentials_and_secret_bearing_parts():
+def test_public_locator_strips_credentials_and_omits_ambiguous_identity():
     """Brain persists what it is handed and replays it into later prompts, so a
     presigned or authenticated locator has to be redacted before ingestion."""
     redact = researcher_adapter._public_locator
 
     assert redact("https://user:s3cr3t@example.test/doc") == "https://example.test/doc"
-    assert redact("https://example.test/doc?X-Amz-Signature=deadbeef&token=abc") == "https://example.test/doc"
     assert redact("https://example.test/doc#fragment") == "https://example.test/doc"
     assert redact("https://example.test:8443/doc") == "https://example.test:8443/doc"
+    # A query can carry the secret OR the resource identity, and there is no
+    # general way to tell which. Stripping it would publish a locator for a
+    # different page, so the locator is omitted instead — no provenance beats
+    # wrong provenance.
+    assert redact("https://example.test/doc?X-Amz-Signature=deadbeef&token=abc") == ""
+    assert redact("https://example.test/article?id=123") == ""
     # Non-http schemes carry local filesystem paths; omit them entirely.
     assert redact("file:///home/someone/private/notes.md") == ""
     assert redact("") == ""
