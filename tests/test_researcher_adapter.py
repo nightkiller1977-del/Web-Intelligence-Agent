@@ -663,6 +663,7 @@ async def test_schedule_outcome_ingest_runs_only_after_durable_save(monkeypatch)
         "source_count": 1, "verified_claim_count": 1, "source_types": ["web"],
         "findings": [{"text": "supported claim", "url": "https://example.test", "sourceType": "web"}],
         "withheld_findings": 0,
+        "secret_bearing_findings": 0,
     }]
 
 
@@ -742,6 +743,7 @@ def test_retained_findings_resolve_locator_through_evidence():
             {"text": "unresolvable", "url": "", "sourceType": ""},
         ],
         0,
+        0,
     )
 
 
@@ -769,14 +771,14 @@ def test_retained_findings_withhold_local_evidence_without_consent():
         ],
     )
 
-    findings, withheld = researcher_adapter._retained_findings(**args)
+    findings, withheld, _secret = researcher_adapter._retained_findings(**args)
     # Fail closed: only the web-sourced claim survives, and an unresolved type
     # cannot be shown to be web either.
     assert findings == [{"text": "from the web", "url": "https://example.test", "sourceType": "web"}]
     assert withheld == 3
     assert not any("confidential" in f["text"] or "private repository" in f["text"] for f in findings)
 
-    permitted, withheld_with_consent = researcher_adapter._retained_findings(**args, allow_external_inputs=True)
+    permitted, withheld_with_consent, _ = researcher_adapter._retained_findings(**args, allow_external_inputs=True)
     assert len(permitted) == 4
     assert withheld_with_consent == 0
 
@@ -809,6 +811,42 @@ def test_public_locator_reduces_to_origin_and_omits_ambiguous_identity():
     assert redact("not a url") == ""
 
 
+def test_retained_findings_withhold_claims_whose_text_embeds_a_secret():
+    """A report sentence can quote a presigned URL, magic link or session id
+    copied from an authenticated page. _public_locator() only sanitizes the
+    separate locator, so the claim text is checked against the same policy."""
+    def claim(text):
+        return {"text": text, "evidenceIds": ["ev-1"]}
+
+    args = dict(
+        evidence=[{"id": "ev-1", "sourceId": "src-1"}],
+        sources=[{"id": "src-1", "url": "https://example.test/a", "sourceType": "web"}],
+    )
+
+    unsafe = [
+        "Download it from https://example.test/f?X-Amz-Signature=deadbeef to proceed.",
+        "The reset link is https://example.test/reset/a1b2c3d4e5f6secrettoken for that account.",
+        "Use https://user:s3cr3t@example.test/admin to reach the console.",
+        "The session is at https://example.test/app;jsessionid=A1B2C3D4E5 right now.",
+        "The local copy lives at file:///home/someone/private/notes.md on disk.",
+    ]
+    findings, _withheld, secret_bearing = researcher_adapter._retained_findings(
+        verified_claims=[claim(text) for text in unsafe], **args
+    )
+    assert findings == []
+    assert secret_bearing == len(unsafe)
+
+    safe = [
+        "urllib3 v2 requires OpenSSL 1.1.1 or newer for HTTPS support.",
+        "The documentation is published at https://example.test for this release.",
+    ]
+    kept, _withheld2, none_secret = researcher_adapter._retained_findings(
+        verified_claims=[claim(text) for text in safe], **args
+    )
+    assert [f["text"] for f in kept] == safe
+    assert none_secret == 0
+
+
 def test_public_locator_keeps_ipv6_brackets():
     """hostname strips the brackets an IPv6 literal needs; without them the
     rebuilt locator cannot identify the evidence page."""
@@ -830,7 +868,7 @@ def test_retained_findings_survive_a_malformed_port():
     )
 
     # Unusable locator, not an exception — and the claim and its type survive.
-    assert findings == ([{"text": "claim from a badly formed locator", "url": "", "sourceType": "web"}], 0)
+    assert findings == ([{"text": "claim from a badly formed locator", "url": "", "sourceType": "web"}], 0, 0)
 
 
 @pytest.mark.anyio

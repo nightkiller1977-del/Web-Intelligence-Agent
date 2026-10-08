@@ -51,6 +51,7 @@ def _render_outcome_text(
     findings: list[dict],
     captured_at: str,
     withheld_findings: int = 0,
+    secret_bearing_findings: int = 0,
 ) -> str:
     """Render the outcome as prose so Brain's embeddings can match it later.
 
@@ -125,6 +126,8 @@ def _render_outcome_text(
         # The counters below still report every verified claim, so without this
         # line the gap between them and the findings listed would be unexplained.
         notes.append(f"{withheld_findings} finding(s) withheld: local-source evidence without explicit external-use consent.")
+    if secret_bearing_findings > 0:
+        notes.append(f"{secret_bearing_findings} finding(s) withheld: claim text embedded a credential-bearing URL.")
     for note in notes:
         if used + len(note.encode("utf-8")) + 1 <= _MAX_INGEST_TEXT_BYTES:
             lines.append(note)
@@ -247,6 +250,7 @@ class BrainMemoryClient:
         source_types: list[str],
         findings: list[dict] | None = None,
         withheld_findings: int = 0,
+        secret_bearing_findings: int = 0,
     ) -> bool:
         opaque_id = hashlib.sha256(f"web-intelligence-outcome:{operation_id}".encode("utf-8")).hexdigest()
         now = datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
@@ -276,6 +280,7 @@ class BrainMemoryClient:
                 findings=findings or [],
                 captured_at=now,
                 withheld_findings=withheld_findings,
+                secret_bearing_findings=secret_bearing_findings,
             ),
         }
         try:

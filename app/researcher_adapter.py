@@ -692,7 +692,33 @@ def _public_locator(raw: str) -> str:
     return urlunsplit((parts.scheme, netloc, "", "", ""))
 
 
-def _retained_findings(verified_claims: list, evidence: list, sources: list, allow_external_inputs: bool = False) -> tuple[list[dict], int]:
+_URL_IN_CLAIM_TEXT = re.compile(r"\w+://\S+")
+
+
+def _claim_text_carries_a_secret(text: str) -> bool:
+    """A report sentence can quote a presigned URL, magic link or session id
+    copied from an authenticated page.
+
+    _public_locator() sanitizes only the separate source locator, so the claim
+    text needs the same policy — applied by *reuse*, so the two cannot drift
+    apart as that policy changes. A URL embedded in a claim is cleared only when
+    it already equals what _public_locator() would reduce it to: a bare origin.
+
+    Anything carrying userinfo, a query, a fragment or a path makes the whole
+    claim ineligible rather than being rewritten in place, because silently
+    editing a verified claim is exactly what the truncation rule forbids.
+
+    Known limit: a bare secret with no URL around it (a naked session token in
+    prose) is not detectable this way and is not caught.
+    """
+    for match in _URL_IN_CLAIM_TEXT.findall(text):
+        candidate = match.rstrip(".,;:!?)]}\"'")
+        if _public_locator(candidate) != candidate:
+            return True
+    return False
+
+
+def _retained_findings(verified_claims: list, evidence: list, sources: list, allow_external_inputs: bool = False) -> tuple[list[dict], int, int]:
     """Pair each verified claim with the URL of the source its evidence came from.
 
     A claim records evidence ids, not a source, so the locator is resolved
@@ -719,7 +745,7 @@ def _retained_findings(verified_claims: list, evidence: list, sources: list, all
         for source in sources
     }
     source_by_evidence = {item.get("id"): item.get("sourceId") for item in evidence}
-    findings, withheld = [], 0
+    findings, withheld, secret_bearing = [], 0, 0
     for claim in verified_claims:
         locator, source_type = "", ""
         for evidence_id in claim.get("evidenceIds", []):
@@ -731,8 +757,12 @@ def _retained_findings(verified_claims: list, evidence: list, sources: list, all
         if not allow_external_inputs and source_type != "web":
             withheld += 1
             continue
-        findings.append({"text": claim.get("text", ""), "url": locator, "sourceType": source_type})
-    return findings, withheld
+        text = claim.get("text", "")
+        if _claim_text_carries_a_secret(text):
+            secret_bearing += 1
+            continue
+        findings.append({"text": text, "url": locator, "sourceType": source_type})
+    return findings, withheld, secret_bearing
 
 
 def _schedule_outcome_ingest(client, result: Dict[str, Any], op_id: str, mode: str, allow_external_inputs: bool = False) -> None:
@@ -753,7 +783,7 @@ def _schedule_outcome_ingest(client, result: Dict[str, Any], op_id: str, mode: s
         if claim.get("verificationStatus") == "supported" and claim.get("evidenceIds")
     ]
     sources = result.get("sources", [])
-    findings, withheld = _retained_findings(
+    findings, withheld, secret_bearing = _retained_findings(
         verified_claims, result.get("evidence", []), sources, allow_external_inputs
     )
     task = asyncio.create_task(asyncio.to_thread(
@@ -764,6 +794,7 @@ def _schedule_outcome_ingest(client, result: Dict[str, Any], op_id: str, mode: s
         source_count=len(sources), verified_claim_count=len(verified_claims),
         source_types=[source.get("sourceType", "") for source in sources],
         findings=findings, withheld_findings=withheld,
+        secret_bearing_findings=secret_bearing,
     ))
     _pending_ingest_tasks.add(task)
     task.add_done_callback(_pending_ingest_tasks.discard)
