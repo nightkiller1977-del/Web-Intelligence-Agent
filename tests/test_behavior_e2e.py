@@ -20,6 +20,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 
@@ -52,6 +53,12 @@ def _server_env(port: int) -> dict:
         "AI_OPENROUTER_ENABLED": "false",
         "MAX_CONCURRENT_OPS": "3",
         "MAX_MEMORY_MB": "512",
+        # Isolate from ambient Brain Memory so tests never read/write the real store
+        "BRAIN_MEMORY_ENABLED": "false",
+        "BRAIN_MEMORY_CONTEXT_ENABLED": "false",
+        "BRAIN_MEMORY_URL": "",
+        "BRAIN_MEMORY_KEY_ID": "",
+        "BRAIN_MEMORY_SECRET": "",
     })
     return env
 
@@ -60,6 +67,9 @@ def _server_env(port: int) -> dict:
 def e2e_server():
     port = _free_port()
     base_url = f"http://127.0.0.1:{port}"
+    log_file = tempfile.NamedTemporaryFile(
+        prefix="wia_e2e_", suffix=".log", delete=False,
+    )
     proc = subprocess.Popen(
         [
             sys.executable, "-m", "uvicorn",
@@ -69,7 +79,7 @@ def e2e_server():
         ],
         cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
         env=_server_env(port),
-        stdout=subprocess.PIPE,
+        stdout=log_file,
         stderr=subprocess.STDOUT,
     )
 
@@ -84,8 +94,12 @@ def e2e_server():
         time.sleep(0.5)
     else:
         proc.kill()
-        out, _ = proc.communicate(timeout=5)
-        pytest.fail(f"Server did not start within 30s. Output:\n{out.decode()}")
+        proc.wait(timeout=5)
+        log_file.seek(0)
+        out = log_file.read().decode(errors="replace")
+        log_file.close()
+        os.unlink(log_file.name)
+        pytest.fail(f"Server did not start within 30s. Output:\n{out}")
 
     yield base_url
 
@@ -95,6 +109,8 @@ def e2e_server():
     except subprocess.TimeoutExpired:
         proc.kill()
         proc.wait()
+    log_file.close()
+    os.unlink(log_file.name)
 
 
 def _auth_headers() -> dict:
