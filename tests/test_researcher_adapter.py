@@ -832,6 +832,9 @@ def test_retained_findings_withhold_claims_whose_text_embeds_a_secret():
         # Scheme-relative: a real URL form the scheme-ful pattern never saw.
         "Follow //example.test/reset/a1b2c3d4e5f6secrettoken to finish setup.",
         "Fetch //example.test/f?signature=deadbeef before the link expires.",
+        # Schemeless, in the two unambiguous shapes.
+        "Open www.example.test/reset/a1b2c3d4e5f6secrettoken to continue.",
+        "Retrieve example.test/f?signature=deadbeef while it is valid.",
     ]
     findings, _withheld, secret_bearing = researcher_adapter._retained_findings(
         verified_claims=[claim(text) for text in unsafe], **args
@@ -876,6 +879,13 @@ def test_retained_findings_withhold_claims_whose_text_embeds_a_secret():
         "Write //TODO above the call to mark it for the next pass.",
         # A scheme-relative bare origin carries no path or query to leak.
         "The CDN is reachable at //example.test for every region.",
+        # A general host.tld/path rule would withhold all of these. They are
+        # ordinary subject matter for a research agent, which is why the
+        # schemeless matcher is limited to www. and query-bearing forms.
+        "The driver lives at github.com/owner/repo in the module graph.",
+        "See docs.python.org/3/library/urllib.html for the parsing rules.",
+        "The entry point is app/researcher_adapter.py in that package.",
+        "A bare www.example.test carries no path or query to leak.",
     ]
     kept, _withheld2, none_secret = researcher_adapter._retained_findings(
         verified_claims=[claim(text) for text in safe], **args

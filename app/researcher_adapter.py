@@ -707,6 +707,23 @@ _SCHEME_RELATIVE_URL_IN_CLAIM_TEXT = re.compile(
     r"(?:[/?#]\S*)?"
 )
 
+# Schemeless host-shaped links, limited to the two unambiguous shapes: a "www."
+# prefix, or a dotted host carrying a query string.
+#
+# A general "host.tld/path" rule is deliberately NOT used. "github.com/owner/repo"
+# is a Go module path, "docs.python.org/3/library/urllib.html" is an ordinary
+# citation, and this agent researches exactly that kind of text — the broad form
+# would withhold legitimate findings far more often than it caught a capability
+# link, and silently shrinking retention is its own failure. The residue that
+# leaves (a schemeless token link with neither "www." nor a query) is real and
+# is not covered here.
+_SCHEMELESS_URL_IN_CLAIM_TEXT = re.compile(
+    r"(?<![/@\w.])(?:"
+    r"www\.[A-Za-z0-9._-]+\.[A-Za-z]{2,}(?:[/?#]\S*)?"
+    r"|[A-Za-z0-9._-]+\.[A-Za-z]{2,}/\S*\?\S+"
+    r")"
+)
+
 # Well-known credential formats, matched by their issuer-assigned prefix and
 # length. Deliberately prefix-anchored rather than entropy-based: this is a
 # technical research agent, so commit SHAs, UUIDs, digests and base64 payloads
@@ -754,6 +771,10 @@ def _claim_text_carries_a_secret(text: str) -> bool:
         # Resolved against a scheme so the same locator policy decides it:
         # "//host" survives as a bare origin, "//host/reset/<token>" does not.
         candidate = "https:" + match.rstrip(".,;:!?)]}\"'")
+        if _public_locator(candidate) != candidate:
+            return True
+    for match in _SCHEMELESS_URL_IN_CLAIM_TEXT.findall(text):
+        candidate = "https://" + match.rstrip(".,;:!?)]}\"'")
         if _public_locator(candidate) != candidate:
             return True
     return any(pattern.search(text) for pattern in _CREDENTIAL_PATTERNS)
