@@ -59,6 +59,12 @@ def _server_env(port: int) -> dict:
         "BRAIN_MEMORY_URL": "",
         "BRAIN_MEMORY_KEY_ID": "",
         "BRAIN_MEMORY_SECRET": "",
+        # Isolate from ambient observability so tests never push to shared Loki
+        "OBSERVABILITY_REMOTE": "0",
+        "LOKI_URL_REMOTE": "",
+        "LOKI_REMOTE_AUTH": "",
+        "RENDER": "",
+        "CONTAINER_APP_NAME": "",
     })
     return env
 
