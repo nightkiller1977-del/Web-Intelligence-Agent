@@ -352,6 +352,33 @@ def test_ingest_rejects_malformed_receipt_counters_without_raising(monkeypatch):
         ) is False, receipt
 
 
+def test_recall_keeps_whole_findings_when_bounding(monkeypatch):
+    """The retained artifact is multi-line prose, one finding per line. Cutting
+    it at a byte offset would slice the last finding before its qualifier — the
+    same inversion the ingest side avoids by dropping whole findings."""
+    from app.brain_memory import BrainMemoryClient
+
+    client = BrainMemoryClient("https://brain.example", "web-agent-1", "test-secret")
+    findings = [
+        f"- finding {index} " + "x" * 300 + " however, this is not approved."
+        for index in range(12)
+    ]
+    artifact = "Web research outcome: completed (mode=quick).\n" + "\n".join(findings)
+    monkeypatch.setattr(client, "_request", lambda *_args: {
+        "results": [{"text": artifact, "provenance": {"sourceType": "web-intelligence-outcome"}}]
+    })
+
+    context = client.recall_context("question")
+
+    recalled = [line.strip() for line in context.splitlines() if line.strip().startswith("- finding")]
+    assert recalled, "bounding dropped every finding"
+    assert len(recalled) < len(findings), "fixture must exceed the budget or this proves nothing"
+    for line in recalled:
+        # Whole, never a prefix — a sliced line would not match any original.
+        assert line in findings
+    assert len(context.encode("utf-8")) <= 6000
+
+
 def test_recall_context_is_bounded_in_utf8_bytes(monkeypatch):
     from app.brain_memory import BrainMemoryClient
 

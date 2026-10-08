@@ -729,7 +729,7 @@ _SCHEME_RELATIVE_URL_IN_CLAIM_TEXT = re.compile(
 _SCHEMELESS_URL_IN_CLAIM_TEXT = re.compile(
     r"(?<![/@\w.])(?:"
     r"www\.[A-Za-z0-9._-]+\.[A-Za-z]{2,}(?:[/?#]\S*)?"
-    r"|[A-Za-z0-9._-]+\.[A-Za-z]{2,}/\S*\?\S+"
+    r"|[A-Za-z0-9._-]+\.[A-Za-z]{2,}(?:/\S*)?\?\S+"
     r")"
 )
 

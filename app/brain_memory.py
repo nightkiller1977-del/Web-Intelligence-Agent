@@ -41,6 +41,29 @@ def _truncate_utf8(value: str, maximum_bytes: int) -> str:
     return "".join(result)
 
 
+def _bounded_lines(raw: str, maximum_bytes: int, indent: str = "") -> str:
+    """Fit text to a byte budget by keeping whole lines.
+
+    The retained artifact is multi-line prose with one finding per line, so
+    collapsing it and cutting at a byte offset would slice the last finding
+    mid-sentence — the same inversion the ingest side avoids by dropping whole
+    findings. A line that does not fit is dropped, never shortened.
+    """
+    kept: list[str] = []
+    used = 0
+    for line in raw.splitlines():
+        line = " ".join(line.split())
+        if not line:
+            continue
+        candidate = indent + line
+        size = len(candidate.encode("utf-8")) + 1
+        if used + size > maximum_bytes:
+            break
+        kept.append(candidate)
+        used += size
+    return "\n".join(kept)
+
+
 def _render_outcome_text(
     *,
     status: str,
@@ -217,7 +240,7 @@ class BrainMemoryClient:
         for result in results[:3]:
             if not isinstance(result, dict) or not isinstance(result.get("text"), str):
                 continue
-            text = _truncate_utf8(" ".join(result["text"].split()), 1600)
+            text = _bounded_lines(result["text"], 1600)
             if not text:
                 continue
             provenance = result.get("provenance") if isinstance(result.get("provenance"), dict) else {}
@@ -227,11 +250,14 @@ class BrainMemoryClient:
             # Brain artifact instead of only a coarse sourceType.
             artifact_id = provenance.get("artifactId") or provenance.get("sourceId")
             reference = f" artifact:{_truncate_utf8(str(artifact_id), 128)}" if artifact_id else ""
-            prefix = f"- [historical source: {source_type}{reference}] "
-            text = _truncate_utf8(text, max(0, remaining - len(prefix.encode("utf-8")) - 1))
-            if not text:
+            prefix = f"- [historical source: {source_type}{reference}]"
+            # The record's own lines are kept intact beneath the provenance
+            # header rather than flattened into it, so a recalled finding is
+            # either present whole or absent.
+            body = _bounded_lines(text, max(0, remaining - len(prefix.encode("utf-8")) - 1), indent="  ")
+            if not body:
                 break
-            items.append(f"{prefix}{text}")
+            items.append(f"{prefix}\n{body}")
             remaining -= len(items[-1].encode("utf-8")) + 1
             if remaining <= 0:
                 break

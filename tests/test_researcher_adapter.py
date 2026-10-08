@@ -838,6 +838,8 @@ def test_retained_findings_withhold_claims_whose_text_embeds_a_secret():
         # Scheme-relative with a bracketed IPv6 authority.
         "Pull //[2606:4700:4700::1111]/f?X-Amz-Signature=deadbeef now.",
         "Grab //8.8.8.8/f?signature=deadbeef from the mirror.",
+        # Query immediately after the host, no path separator.
+        "Use example.test?signature=deadbeef before it rotates.",
     ]
     findings, _withheld, secret_bearing = researcher_adapter._retained_findings(
         verified_claims=[claim(text) for text in unsafe], **args
