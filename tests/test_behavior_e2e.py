@@ -83,22 +83,26 @@ def e2e_server():
         stderr=subprocess.STDOUT,
     )
 
-    deadline = time.monotonic() + 30
-    while time.monotonic() < deadline:
-        try:
-            resp = httpx.get(f"{base_url}/health/live", timeout=2)
-            if resp.status_code == 200:
-                break
-        except httpx.ConnectError:
-            pass
-        time.sleep(0.5)
-    else:
+    def _cleanup():
         proc.kill()
         proc.wait(timeout=5)
         log_file.seek(0)
         out = log_file.read().decode(errors="replace")
         log_file.close()
         os.unlink(log_file.name)
+        return out
+
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        try:
+            resp = httpx.get(f"{base_url}/health/live", timeout=2)
+            if resp.status_code == 200:
+                break
+        except (httpx.ConnectError, httpx.ReadTimeout, httpx.RemoteProtocolError):
+            pass
+        time.sleep(0.5)
+    else:
+        out = _cleanup()
         pytest.fail(f"Server did not start within 30s. Output:\n{out}")
 
     yield base_url
@@ -157,6 +161,9 @@ def _cancel_and_wait(base_url: str, op_id: str, timeout: int = 30) -> None:
         except httpx.HTTPError:
             pass
         time.sleep(2)
+    pytest.fail(
+        f"Operation {op_id} did not reach terminal state within {timeout}s after cancel"
+    )
 
 
 # ---------------------------------------------------------------------------

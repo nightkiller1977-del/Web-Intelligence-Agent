@@ -99,3 +99,14 @@ def pytest_configure(config):
     config.addinivalue_line(
         "markers", "timeout(seconds): per-test timeout (requires pytest-timeout)"
     )
+
+
+def pytest_collection_modifyitems(config, items):
+    """Auto-skip e2e tests unless explicitly selected with ``-m e2e``."""
+    marker_expr = config.getoption("-m", default="")
+    if "e2e" in marker_expr:
+        return
+    skip_e2e = pytest.mark.skip(reason="e2e tests require explicit -m e2e")
+    for item in items:
+        if "e2e" in item.keywords:
+            item.add_marker(skip_e2e)
