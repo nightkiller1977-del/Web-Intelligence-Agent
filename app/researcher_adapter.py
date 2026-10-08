@@ -838,11 +838,23 @@ async def conduct_web_research(
     # search would reject must not reach the report.
     profile_rules = PROFILE_DOMAINS.get(profile) or {}
     profile_restricts_domains = bool(profile_rules.get("allowed"))
+    # Freshness is the same problem on a different axis. A retained record keeps
+    # the claim, origin and source type but no publication date, and
+    # recall_context() supplies none either, so "exclude sources published after
+    # <until>" cannot be enforced against recalled text — the model would be
+    # asked to honour a cutoff it has no dates for. Same remedy as the domain
+    # case: withhold recall rather than feed unfiltered history through a filter
+    # it cannot satisfy.
+    freshness_constrained = any(
+        str((freshness or {}).get(key) or "").strip()
+        for key in ("since", "until", "maxAgeDays")
+    )
     if (
         memory_client
         and settings.BRAIN_MEMORY_CONTEXT_ENABLED
         and not has_explicit_domain_allowlist
         and not profile_restricts_domains
+        and not freshness_constrained
     ):
         remaining = max(0.0, max_duration - (time.time() - start_time))
         try:

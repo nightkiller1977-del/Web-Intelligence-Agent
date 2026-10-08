@@ -884,6 +884,87 @@ async def test_recall_disabled_for_profile_specific_domain_allowlist(monkeypatch
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("freshness", [
+    {"until": "2026-01-01"},
+    {"since": "2026-01-01"},
+    {"maxAgeDays": "14"},
+])
+async def test_recall_disabled_when_freshness_is_constrained(monkeypatch, freshness):
+    """A retained record keeps the claim, origin and source type but no
+    publication date, and recall_context() supplies none either — so a hard
+    "exclude sources published after <until>" cutoff cannot be enforced against
+    recalled text. Same remedy as the domain allowlist: withhold recall."""
+    recalled = {"called": False}
+
+    class BrainMemorySpy:
+        def recall_context(self, query):
+            recalled["called"] = True
+            return "UNTRUSTED HISTORICAL EVIDENCE — should not appear"
+
+        def ingest_verified_outcome(self, **kwargs):
+            return False
+
+    spy = BrainMemorySpy()
+    monkeypatch.setattr(researcher_adapter.settings, "BRAIN_MEMORY_CONTEXT_ENABLED", True)
+    monkeypatch.setattr(researcher_adapter, "GPTResearcher", FakeCompletedGPTResearcher)
+    monkeypatch.setattr(researcher_adapter, "brain_memory_client", lambda: spy)
+    monkeypatch.setattr(researcher_adapter, "is_safe_url", lambda url, profile: True)
+    reporter = MagicMock()
+    reporter.report = AsyncMock()
+
+    result = await conduct_web_research(
+        op_id="test-op",
+        query="test query",
+        mode="standard",
+        profile="general",
+        limits={"maximumDurationSeconds": 30, "maximumSearches": 3, "maximumPages": 5, "maximumSources": 5},
+        source_policy=None,
+        freshness=freshness,
+        inputs=None,
+        model_provider=None,
+        model_name=None,
+        require_claim_verification=False,
+        reporter=reporter,
+        headers={},
+    )
+
+    assert result["status"] == "completed"
+    assert recalled["called"] is False
+
+
+@pytest.mark.anyio
+async def test_recall_still_runs_without_freshness_constraints(monkeypatch):
+    """The freshness gate must not disable recall outright — an empty or absent
+    freshness dict still permits it, or the retention this PR adds is dead."""
+    recalled = {"called": False}
+
+    class BrainMemorySpy:
+        def recall_context(self, query):
+            recalled["called"] = True
+            return ""
+
+        def ingest_verified_outcome(self, **kwargs):
+            return False
+
+    spy = BrainMemorySpy()
+    monkeypatch.setattr(researcher_adapter.settings, "BRAIN_MEMORY_CONTEXT_ENABLED", True)
+    monkeypatch.setattr(researcher_adapter, "GPTResearcher", FakeCompletedGPTResearcher)
+    monkeypatch.setattr(researcher_adapter, "brain_memory_client", lambda: spy)
+    monkeypatch.setattr(researcher_adapter, "is_safe_url", lambda url, profile: True)
+    reporter = MagicMock()
+    reporter.report = AsyncMock()
+
+    await conduct_web_research(
+        op_id="test-op", query="test query", mode="standard", profile="general",
+        limits={"maximumDurationSeconds": 30, "maximumSearches": 3, "maximumPages": 5, "maximumSources": 5},
+        source_policy=None, freshness={}, inputs=None, model_provider=None, model_name=None,
+        require_claim_verification=False, reporter=reporter, headers={},
+    )
+
+    assert recalled["called"] is True
+
+
+@pytest.mark.anyio
 async def test_recall_disabled_for_explicit_source_allowlist(monkeypatch):
     recalled = {"called": False}
 
