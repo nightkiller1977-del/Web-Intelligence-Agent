@@ -703,7 +703,11 @@ _URL_IN_CLAIM_TEXT = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://\S+")
 _SCHEME_RELATIVE_URL_IN_CLAIM_TEXT = re.compile(
     r"(?<![A-Za-z0-9:])//"
     r"(?:[^\s/?#@]*@)?"
-    r"[A-Za-z0-9._-]*(?:\.[A-Za-z]{2,}|:\d{1,5})"
+    # A bracketed IPv6 literal is as unambiguous an authority as a dotted host,
+    # and _public_locator() already round-trips one — the two were simply
+    # inconsistent.
+    r"(?:\[[0-9A-Fa-f:.]+\](?::\d{1,5})?"
+    r"|[A-Za-z0-9._-]*(?:\.[A-Za-z]{2,}|:\d{1,5}))"
     r"(?:[/?#]\S*)?"
 )
 
@@ -742,6 +746,29 @@ _CREDENTIAL_PATTERNS = (
 )
 
 
+_CLOSERS = {")": "(", "]": "[", "}": "{"}
+
+
+def _trim_sentence_punctuation(candidate: str) -> str:
+    """Strip trailing sentence punctuation from a URL match.
+
+    A closing bracket is removed only when it is unbalanced, so "(see
+    https://example.test/a)" loses its ")" while "//[2606:4700:4700::1111]"
+    keeps the "]" that closes its IPv6 literal. A blanket rstrip ate that
+    bracket and turned a valid bare origin into an unparseable string, which
+    then failed closed and withheld the claim.
+    """
+    while candidate:
+        last = candidate[-1]
+        if last in ".,;:!?\"'":
+            candidate = candidate[:-1]
+        elif last in _CLOSERS and candidate.count(last) > candidate.count(_CLOSERS[last]):
+            candidate = candidate[:-1]
+        else:
+            break
+    return candidate
+
+
 def _claim_text_carries_a_secret(text: str) -> bool:
     """A report sentence can quote a presigned URL, magic link or session id
     copied from an authenticated page.
@@ -764,17 +791,17 @@ def _claim_text_carries_a_secret(text: str) -> bool:
     reduced-risk, never as guaranteed secret-free.
     """
     for match in _URL_IN_CLAIM_TEXT.findall(text):
-        candidate = match.rstrip(".,;:!?)]}\"'")
+        candidate = _trim_sentence_punctuation(match)
         if _public_locator(candidate) != candidate:
             return True
     for match in _SCHEME_RELATIVE_URL_IN_CLAIM_TEXT.findall(text):
         # Resolved against a scheme so the same locator policy decides it:
         # "//host" survives as a bare origin, "//host/reset/<token>" does not.
-        candidate = "https:" + match.rstrip(".,;:!?)]}\"'")
+        candidate = "https:" + _trim_sentence_punctuation(match)
         if _public_locator(candidate) != candidate:
             return True
     for match in _SCHEMELESS_URL_IN_CLAIM_TEXT.findall(text):
-        candidate = "https://" + match.rstrip(".,;:!?)]}\"'")
+        candidate = "https://" + _trim_sentence_punctuation(match)
         if _public_locator(candidate) != candidate:
             return True
     return any(pattern.search(text) for pattern in _CREDENTIAL_PATTERNS)

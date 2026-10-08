@@ -835,6 +835,8 @@ def test_retained_findings_withhold_claims_whose_text_embeds_a_secret():
         # Schemeless, in the two unambiguous shapes.
         "Open www.example.test/reset/a1b2c3d4e5f6secrettoken to continue.",
         "Retrieve example.test/f?signature=deadbeef while it is valid.",
+        # Scheme-relative with a bracketed IPv6 authority.
+        "Pull //[2606:4700:4700::1111]/f?X-Amz-Signature=deadbeef now.",
     ]
     findings, _withheld, secret_bearing = researcher_adapter._retained_findings(
         verified_claims=[claim(text) for text in unsafe], **args
@@ -886,6 +888,7 @@ def test_retained_findings_withhold_claims_whose_text_embeds_a_secret():
         "See docs.python.org/3/library/urllib.html for the parsing rules.",
         "The entry point is app/researcher_adapter.py in that package.",
         "A bare www.example.test carries no path or query to leak.",
+        "The node answers at //[2606:4700:4700::1111] for that region.",
     ]
     kept, _withheld2, none_secret = researcher_adapter._retained_findings(
         verified_claims=[claim(text) for text in safe], **args
