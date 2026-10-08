@@ -694,6 +694,23 @@ def _public_locator(raw: str) -> str:
 
 _URL_IN_CLAIM_TEXT = re.compile(r"\w+://\S+")
 
+# Well-known credential formats, matched by their issuer-assigned prefix and
+# length. Deliberately prefix-anchored rather than entropy-based: this is a
+# technical research agent, so commit SHAs, UUIDs, digests and base64 payloads
+# are ordinary subject matter, and a generic high-entropy rule would withhold
+# legitimate findings far more often than it caught a secret.
+_CREDENTIAL_PATTERNS = (
+    re.compile(r"\b[sp]k-[A-Za-z0-9_-]{16,}"),                                      # OpenAI-style
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}"),                                    # GitHub token
+    re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}"),                                  # GitHub fine-grained PAT
+    re.compile(r"\bglpat-[A-Za-z0-9_-]{16,}"),                                      # GitLab PAT
+    re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}"),                                  # Slack
+    re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"),                                   # AWS access key id
+    re.compile(r"\bAIza[0-9A-Za-z_-]{30,}"),                                        # Google API key
+    re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"),    # JWT
+    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),                              # PEM private key
+)
+
 
 def _claim_text_carries_a_secret(text: str) -> bool:
     """A report sentence can quote a presigned URL, magic link or session id
@@ -708,14 +725,19 @@ def _claim_text_carries_a_secret(text: str) -> bool:
     claim ineligible rather than being rewritten in place, because silently
     editing a verified claim is exactly what the truncation rule forbids.
 
-    Known limit: a bare secret with no URL around it (a naked session token in
-    prose) is not detectable this way and is not caught.
+    A bare credential outside any URI ("The API key is sk-proj-...") is caught
+    separately, by matching well-known issuer prefixes.
+
+    Known limit, stated rather than papered over: prefix matching cannot be
+    complete. A novel, internal, or unprefixed secret still passes, so this
+    narrows the exposure — it does not close it. Treat the retained record as
+    reduced-risk, never as guaranteed secret-free.
     """
     for match in _URL_IN_CLAIM_TEXT.findall(text):
         candidate = match.rstrip(".,;:!?)]}\"'")
         if _public_locator(candidate) != candidate:
             return True
-    return False
+    return any(pattern.search(text) for pattern in _CREDENTIAL_PATTERNS)
 
 
 def _retained_findings(verified_claims: list, evidence: list, sources: list, allow_external_inputs: bool = False) -> tuple[list[dict], int, int]:

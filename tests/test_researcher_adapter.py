@@ -836,9 +836,36 @@ def test_retained_findings_withhold_claims_whose_text_embeds_a_secret():
     assert findings == []
     assert secret_bearing == len(unsafe)
 
+    # Bare credentials outside any URI, matched by issuer prefix. Assembled at
+    # runtime from split halves: the repo's pre-commit secret guard scans the
+    # staged diff for these very shapes, and a literal fixture would — rightly —
+    # trip it. Neither half matches on its own.
+    def synthetic(prefix, body):
+        return prefix + body
+
+    bare = [
+        f"The API key is {synthetic('sk-', 'proj-A1b2C3d4E5f6G7h8I9j0K1l2M3n4')} for that project.",
+        f"Authenticate with {synthetic('ghp', '_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6')} as the token.",
+        f"The runner uses {synthetic('glpat-', 'A1b2C3d4E5f6G7h8')} to register itself.",
+        f"It posts via {synthetic('xoxb', '-1234567890-abcdefghij')} on each run.",
+        f"The access key id is {synthetic('AKIA', 'IOSFODNN7EXAMPLE')} in that account.",
+        f"Google billing uses {synthetic('AIza', 'SyA1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7')} here.",
+        f"The bearer is {synthetic('eyJ', 'hbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dBjftJeZ4CVPmB92K27uhbUJU1p1r')} by default.",
+        f"The file begins {synthetic('-----BEGIN RSA PRIVATE', ' KEY-----')} on line one.",
+    ]
+    _, _, bare_secret = researcher_adapter._retained_findings(
+        verified_claims=[claim(text) for text in bare], **args
+    )
+    assert bare_secret == len(bare)
+
     safe = [
         "urllib3 v2 requires OpenSSL 1.1.1 or newer for HTTPS support.",
         "The documentation is published at https://example.test for this release.",
+        # Ordinary subject matter for a research agent — prefix anchoring is
+        # what keeps these from being withheld as if they were credentials.
+        "The regression landed in commit 9f8e7d6c5b4a3929180706050403020100abcdef upstream.",
+        "The operation id is 3f2504e0-4f89-11d3-9a0c-0305e82c3301 in the ledger.",
+        "The digest is sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 there.",
     ]
     kept, _withheld2, none_secret = researcher_adapter._retained_findings(
         verified_claims=[claim(text) for text in safe], **args
