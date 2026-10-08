@@ -60,40 +60,69 @@ def _render_outcome_text(
     (web, document or repository) — the recall path is what marks it untrusted,
     so it must not be replayed as instructions.
     """
-    lines = [f"Web research outcome: {status} (mode={mode})."]
-    retained = []
+    header = f"Web research outcome: {status} (mode={mode})."
+    observed = ", ".join(sorted({str(value) for value in source_types if value})) or "none"
+    footer = (
+        f"Sources consulted: {max(0, int(source_count))} ({observed}). "
+        f"Verified claims: {max(0, int(verified_claim_count))}."
+    )
+    # "Source-supported", never "true": verification is passage token overlap
+    # plus a negation check. It establishes that a source said this — not that
+    # the statement is correct, and not that the source is reliable. Stamped
+    # with retrieval time, since even that is only evidence of what was said
+    # then.
+    heading = f"Source-supported findings (passage-matched, not fact-checked), retrieved {captured_at}:"
+
+    candidates, omitted = [], 0
     for finding in findings[:_MAX_RETAINED_FINDINGS]:
         text = " ".join(str(finding.get("text") or "").split())
         if not text:
             continue
+        if len(text.encode("utf-8")) > _MAX_FINDING_BYTES:
+            # Cutting a claim can strip a trailing qualifier or negation
+            # ("...however, this is not approved") and invert what the source
+            # actually supported. A mangled claim is worse than an absent one.
+            omitted += 1
+            continue
         url = " ".join(str(finding.get("url") or "").split())
+        if len(url.encode("utf-8")) > _MAX_SOURCE_URL_BYTES:
+            # Same reasoning: a cut path segment or percent-escape yields an
+            # invalid URL, or a valid one for a different resource.
+            url = ""
         source_type = " ".join(str(finding.get("sourceType") or "").split())
-        # Per-finding, because a run can mix web, document and repository
-        # sources; a blanket "web-sourced" label would misreport first-party
-        # material, and a redacted local locator leaves the type as the only
-        # provenance left to carry.
-        provenance = [
-            value for value in (
-                _truncate_utf8(source_type, _MAX_SOURCE_TYPE_BYTES),
-                _truncate_utf8(url, _MAX_SOURCE_URL_BYTES),
-            ) if value
-        ]
-        suffix = f" [{': '.join(provenance)}]" if provenance else ""
-        retained.append(f"- {_truncate_utf8(text, _MAX_FINDING_BYTES)}{suffix}")
-    if retained:
-        # "Source-supported", never "true": verification is passage token
-        # overlap plus a negation check. It establishes that a source said
-        # this — not that the statement is correct, and not that the source is
-        # reliable. Stamped with retrieval time, since even that is only
-        # evidence of what was said then.
-        lines.append(f"Source-supported findings (passage-matched, not fact-checked), retrieved {captured_at}:")
-        lines.extend(retained)
-    observed = ", ".join(sorted({str(value) for value in source_types if value})) or "none"
-    lines.append(
-        f"Sources consulted: {max(0, int(source_count))} ({observed}). "
-        f"Verified claims: {max(0, int(verified_claim_count))}."
-    )
-    return _truncate_utf8("\n".join(lines), _MAX_INGEST_TEXT_BYTES)
+        if len(source_type.encode("utf-8")) > _MAX_SOURCE_TYPE_BYTES:
+            source_type = ""
+        # Provenance is per-finding because a run can mix web, document and
+        # repository sources; a blanket "web-sourced" label would misreport
+        # first-party material, and a redacted locator leaves the type as the
+        # only provenance left to carry.
+        provenance = [value for value in (source_type, url) if value]
+        candidates.append(f"- {text}" + (f" [{': '.join(provenance)}]" if provenance else ""))
+
+    # Fit by dropping whole findings rather than truncating the joined text,
+    # which would cut the last claim mid-sentence for the same reason.
+    used = len(header.encode("utf-8")) + len(footer.encode("utf-8")) + 2
+    kept = []
+    if candidates:
+        used += len(heading.encode("utf-8")) + 1
+        for line in candidates:
+            size = len(line.encode("utf-8")) + 1
+            if used + size > _MAX_INGEST_TEXT_BYTES:
+                omitted += 1
+                continue
+            kept.append(line)
+            used += size
+
+    lines = [header]
+    if kept:
+        lines.append(heading)
+        lines.extend(kept)
+    if omitted:
+        note = f"{omitted} finding(s) omitted rather than truncated: shortening a claim or locator can change its meaning."
+        if used + len(note.encode("utf-8")) + 1 <= _MAX_INGEST_TEXT_BYTES:
+            lines.append(note)
+    lines.append(footer)
+    return "\n".join(lines)
 
 
 class _NoRedirect(HTTPRedirectHandler):

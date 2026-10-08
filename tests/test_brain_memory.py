@@ -149,7 +149,7 @@ def test_ingest_bounds_retained_findings(monkeypatch):
         source_count=40,
         verified_claim_count=40,
         source_types=["web"],
-        findings=[{"text": f"claim {index} " + "x" * 5000, "url": "https://example.test/" + "y" * 900} for index in range(40)],
+        findings=[{"text": f"short claim {index}", "url": "https://example.test/a", "sourceType": "web"} for index in range(40)],
     )
 
     text = json.loads(captured["body"])["sourceText"]
@@ -158,6 +158,53 @@ def test_ingest_bounds_retained_findings(monkeypatch):
     # every finding would also satisfy an upper bound.
     assert len([line for line in text.splitlines() if line.startswith("- ")]) == 10
     assert "Verified claims: 40." in text
+
+
+def test_ingest_omits_overlong_claims_rather_than_truncating(monkeypatch):
+    """Cutting a claim can strip a trailing negation and invert what the source
+    supported, so an overlong claim is dropped and counted, never shortened."""
+    from app.brain_memory import BrainMemoryClient
+
+    client = BrainMemoryClient("https://brain.example", "web-agent-1", "test-secret")
+    captured = {}
+    monkeypatch.setattr(client, "_request", lambda path, body, domain: captured.update(body=body) or {"acceptedChunks": 1})
+
+    long_claim = "The adapter supports streaming " + "x" * 5000 + " however, this is not approved."
+    client.ingest_verified_outcome(
+        operation_id="op-1", status="completed", mode="quick",
+        source_count=1, verified_claim_count=2, source_types=["web"],
+        findings=[
+            {"text": long_claim, "url": "https://example.test/a", "sourceType": "web"},
+            {"text": "a short verified claim", "url": "https://example.test/b", "sourceType": "web"},
+        ],
+    )
+
+    text = json.loads(captured["body"])["sourceText"]
+    assert "The adapter supports streaming" not in text
+    assert "a short verified claim [web: https://example.test/b]" in text
+    # The omission is recorded, not silent.
+    assert "1 finding(s) omitted rather than truncated" in text
+    assert len(text.encode("utf-8")) <= 8000
+
+
+def test_ingest_omits_an_overlong_locator_but_keeps_the_claim(monkeypatch):
+    """A cut path segment or percent-escape yields an invalid URL, or a valid
+    one for a different resource — but the claim itself is still knowledge."""
+    from app.brain_memory import BrainMemoryClient
+
+    client = BrainMemoryClient("https://brain.example", "web-agent-1", "test-secret")
+    captured = {}
+    monkeypatch.setattr(client, "_request", lambda path, body, domain: captured.update(body=body) or {"acceptedChunks": 1})
+
+    client.ingest_verified_outcome(
+        operation_id="op-1", status="completed", mode="quick",
+        source_count=1, verified_claim_count=1, source_types=["web"],
+        findings=[{"text": "a verified claim", "url": "https://example.test/" + "y" * 400, "sourceType": "web"}],
+    )
+
+    text = json.loads(captured["body"])["sourceText"]
+    assert "a verified claim [web]" in text
+    assert "yyy" not in text
 
 
 def test_ingest_without_findings_keeps_counter_only_record(monkeypatch):
