@@ -644,20 +644,50 @@ async def test_schedule_outcome_ingest_runs_only_after_durable_save(monkeypatch)
 
     result = {
         "status": "completed",
-        "sources": [{"sourceType": "web"}],
+        "sources": [{"id": "src-1", "sourceType": "web", "url": "https://example.test/a"}],
+        "evidence": [{"id": "ev-1", "sourceId": "src-1"}, {"id": "ev-2", "sourceId": "src-1"}],
         "claims": [
-            {"verificationStatus": "supported", "evidenceIds": ["ev-1"]},
-            {"verificationStatus": "supported", "evidenceIds": []},
-            {"verificationStatus": "partially-supported", "evidenceIds": ["ev-2"]},
+            {"text": "supported claim", "verificationStatus": "supported", "evidenceIds": ["ev-1"]},
+            {"text": "no evidence", "verificationStatus": "supported", "evidenceIds": []},
+            {"text": "report-derived", "verificationStatus": "partially-supported", "evidenceIds": ["ev-2"]},
         ],
     }
 
     assert researcher_adapter.schedule_outcome_ingest(result, "test-op", "standard") is True
     assert await researcher_adapter.flush_pending_ingest_tasks() == 1
+    # Only the independently evidenced claim is retained as knowledge, and it
+    # carries the locator of the source its evidence came from.
     assert spy.ingested == [{
         "operation_id": "test-op", "status": "completed", "mode": "standard",
         "source_count": 1, "verified_claim_count": 1, "source_types": ["web"],
+        "findings": [{"text": "supported claim", "url": "https://example.test/a"}],
     }]
+
+
+def test_retained_findings_resolve_locator_through_evidence():
+    """A claim names evidence ids, not a source, so the locator is a two-hop join."""
+    findings = researcher_adapter._retained_findings(
+        verified_claims=[
+            {"text": "has http locator", "evidenceIds": ["ev-missing", "ev-2"]},
+            {"text": "local file locator", "evidenceIds": ["ev-3"]},
+            {"text": "unresolvable", "evidenceIds": ["ev-nope"]},
+        ],
+        evidence=[
+            {"id": "ev-2", "sourceId": "src-1"},
+            {"id": "ev-3", "sourceId": "src-2"},
+        ],
+        sources=[
+            {"id": "src-1", "url": "https://example.test/a"},
+            # A local document carries its locator on uri; url stays empty.
+            {"id": "src-2", "url": "", "uri": "file:///tmp/notes.md"},
+        ],
+    )
+
+    assert findings == [
+        {"text": "has http locator", "url": "https://example.test/a"},
+        {"text": "local file locator", "url": "file:///tmp/notes.md"},
+        {"text": "unresolvable", "url": ""},
+    ]
 
 
 @pytest.mark.anyio

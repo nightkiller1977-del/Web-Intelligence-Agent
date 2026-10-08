@@ -82,18 +82,91 @@ def test_ingest_uses_route_specific_signature_and_deidentified_outcome(monkeypat
     ) is True
 
     envelope = json.loads(captured["body"])
-    payload = json.loads(envelope["sourceText"])
+    text = envelope["sourceText"]
     assert captured["path"] == "/v1/artifacts/ingest"
     assert captured["domain"] == "brain-memory-http-ingest-v1"
-    assert payload == {
-        "kind": "outcome",
-        "mode": "standard",
-        "status": "completed",
-        "sourceCount": 2,
-        "verifiedClaimCount": 1,
-        "sourceTypes": ["web"],
-    }
+    # Prose, not JSON: a .json fileName or application/json mimeType routes the
+    # artifact through Brain's provider-export importers, which this is not.
+    assert envelope["descriptor"]["fileName"] == "outcome.txt"
+    assert envelope["descriptor"]["mimeType"] == "text/plain"
+    assert "Web research outcome: completed (mode=standard)." in text
+    assert "Sources consulted: 2 (web). Verified claims: 1." in text
     assert "op-1" not in captured["body"]
+
+
+def test_ingest_retains_verified_findings_with_locator_and_as_of_stamp(monkeypatch):
+    """Counters alone embed to nothing; the claim text is what makes it recallable."""
+    from app.brain_memory import BrainMemoryClient
+
+    client = BrainMemoryClient("https://brain.example", "web-agent-1", "test-secret")
+    captured = {}
+
+    def fake_request(path, body, domain):
+        captured.update(body=body)
+        return {"acceptedChunks": 1, "duplicates": 0, "rejected": 0, "quarantined": 0}
+
+    monkeypatch.setattr(client, "_request", fake_request)
+
+    assert client.ingest_verified_outcome(
+        operation_id="op-1",
+        status="completed",
+        mode="quick",
+        source_count=1,
+        verified_claim_count=2,
+        source_types=["web"],
+        findings=[
+            {"text": "urllib3 v2 requires OpenSSL 1.1.1 or newer", "url": "https://example.test/a"},
+            {"text": "A claim whose evidence resolved to no locator", "url": ""},
+        ],
+    ) is True
+
+    text = json.loads(captured["body"])["sourceText"]
+    assert "urllib3 v2 requires OpenSSL 1.1.1 or newer [https://example.test/a]" in text
+    # Retained even without a locator — dropping it would discard verified knowledge.
+    assert "- A claim whose evidence resolved to no locator" in text
+    assert "web-sourced, true as of " in text
+
+
+def test_ingest_bounds_retained_findings(monkeypatch):
+    from app.brain_memory import BrainMemoryClient
+
+    client = BrainMemoryClient("https://brain.example", "web-agent-1", "test-secret")
+    captured = {}
+    monkeypatch.setattr(client, "_request", lambda path, body, domain: captured.update(body=body) or {"acceptedChunks": 1})
+
+    client.ingest_verified_outcome(
+        operation_id="op-1",
+        status="completed",
+        mode="quick",
+        source_count=40,
+        verified_claim_count=40,
+        source_types=["web"],
+        findings=[{"text": f"claim {index} " + "x" * 5000, "url": "https://example.test/" + "y" * 900} for index in range(40)],
+    )
+
+    text = json.loads(captured["body"])["sourceText"]
+    assert len(text.encode("utf-8")) <= 8000
+    # Exactly the cap, not merely "at most": a retention regression that dropped
+    # every finding would also satisfy an upper bound.
+    assert len([line for line in text.splitlines() if line.startswith("- ")]) == 10
+    assert "Verified claims: 40." in text
+
+
+def test_ingest_without_findings_keeps_counter_only_record(monkeypatch):
+    from app.brain_memory import BrainMemoryClient
+
+    client = BrainMemoryClient("https://brain.example", "web-agent-1", "test-secret")
+    captured = {}
+    monkeypatch.setattr(client, "_request", lambda path, body, domain: captured.update(body=body) or {"acceptedChunks": 1})
+
+    client.ingest_verified_outcome(
+        operation_id="op-1", status="partial", mode="quick",
+        source_count=0, verified_claim_count=0, source_types=[],
+    )
+
+    text = json.loads(captured["body"])["sourceText"]
+    assert "true as of" not in text
+    assert "Sources consulted: 0 (none). Verified claims: 0." in text
 
 
 def test_signature_is_bound_to_exact_body():

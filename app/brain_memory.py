@@ -22,6 +22,10 @@ _SEARCH_DOMAIN = "brain-memory-http-search-v1"
 _INGEST_DOMAIN = "brain-memory-http-ingest-v1"
 _MAX_RESPONSE_BYTES = 64 * 1024
 _MAX_CONTEXT_BYTES = 6000
+_MAX_RETAINED_FINDINGS = 10
+_MAX_FINDING_BYTES = 400
+_MAX_SOURCE_URL_BYTES = 300
+_MAX_INGEST_TEXT_BYTES = 8000
 
 
 def _truncate_utf8(value: str, maximum_bytes: int) -> str:
@@ -34,6 +38,47 @@ def _truncate_utf8(value: str, maximum_bytes: int) -> str:
         result.append(character)
         used += size
     return "".join(result)
+
+
+def _render_outcome_text(
+    *,
+    status: str,
+    mode: str,
+    source_count: int,
+    verified_claim_count: int,
+    source_types: list[str],
+    findings: list[dict],
+    captured_at: str,
+) -> str:
+    """Render the outcome as prose so Brain's embeddings can match it later.
+
+    The counters alone embed to nothing useful, so a repeat of the same question
+    never recalled a prior answer and re-researched it. The claim text is what
+    makes the record semantically recallable; the counters stay on the trailing
+    line so nothing that read them is lost. Retained text is web-derived — the
+    recall path is what marks it untrusted, so it must not be replayed as
+    instructions.
+    """
+    lines = [f"Web research outcome: {status} (mode={mode})."]
+    retained = []
+    for finding in findings[:_MAX_RETAINED_FINDINGS]:
+        text = " ".join(str(finding.get("text") or "").split())
+        if not text:
+            continue
+        url = " ".join(str(finding.get("url") or "").split())
+        suffix = f" [{_truncate_utf8(url, _MAX_SOURCE_URL_BYTES)}]" if url else ""
+        retained.append(f"- {_truncate_utf8(text, _MAX_FINDING_BYTES)}{suffix}")
+    if retained:
+        # Stamped as of retrieval: a stored finding is evidence of what the web
+        # said then, never proof of current state.
+        lines.append(f"Verified findings, web-sourced, true as of {captured_at}:")
+        lines.extend(retained)
+    observed = ", ".join(sorted({str(value) for value in source_types if value})) or "none"
+    lines.append(
+        f"Sources consulted: {max(0, int(source_count))} ({observed}). "
+        f"Verified claims: {max(0, int(verified_claim_count))}."
+    )
+    return _truncate_utf8("\n".join(lines), _MAX_INGEST_TEXT_BYTES)
 
 
 class _NoRedirect(HTTPRedirectHandler):
@@ -139,15 +184,17 @@ class BrainMemoryClient:
             return ""
         return heading + "\n".join(items)
 
-    def ingest_verified_outcome(self, *, operation_id: str, status: str, mode: str, source_count: int, verified_claim_count: int, source_types: list[str]) -> bool:
-        outcome = {
-            "kind": "outcome",
-            "mode": mode,
-            "status": status,
-            "sourceCount": max(0, int(source_count)),
-            "verifiedClaimCount": max(0, int(verified_claim_count)),
-            "sourceTypes": sorted({str(value) for value in source_types if value}),
-        }
+    def ingest_verified_outcome(
+        self,
+        *,
+        operation_id: str,
+        status: str,
+        mode: str,
+        source_count: int,
+        verified_claim_count: int,
+        source_types: list[str],
+        findings: list[dict] | None = None,
+    ) -> bool:
         opaque_id = hashlib.sha256(f"web-intelligence-outcome:{operation_id}".encode("utf-8")).hexdigest()
         now = datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
         envelope = {
@@ -155,8 +202,11 @@ class BrainMemoryClient:
                 "artifactId": opaque_id,
                 "sourceType": "web-intelligence-outcome",
                 "sourceId": opaque_id,
-                "fileName": "outcome.json",
-                "mimeType": "application/json",
+                # Prose, not JSON: Brain routes an application/json artifact (or a
+                # .json fileName) through its provider-export importers, which this
+                # record is not.
+                "fileName": "outcome.txt",
+                "mimeType": "text/plain",
                 "ownerId": "web-intelligence",
                 "personaId": "web-intelligence",
                 "scope": "web-intelligence",
@@ -164,7 +214,15 @@ class BrainMemoryClient:
             },
             "sensitivity": "private",
             "permittedAgents": ["brain"],
-            "sourceText": json.dumps(outcome, separators=(",", ":")),
+            "sourceText": _render_outcome_text(
+                status=status,
+                mode=mode,
+                source_count=source_count,
+                verified_claim_count=verified_claim_count,
+                source_types=source_types,
+                findings=findings or [],
+                captured_at=now,
+            ),
         }
         try:
             receipt = self._request(_INGEST_PATH, json.dumps(envelope, separators=(",", ":")), _INGEST_DOMAIN)

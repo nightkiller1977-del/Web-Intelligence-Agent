@@ -637,6 +637,30 @@ def append_input_sources(op_id: str, input_chunks: list[dict], sources: list[dic
 _pending_ingest_tasks: set = set()
 
 
+def _retained_findings(verified_claims: list, evidence: list, sources: list) -> list[dict]:
+    """Pair each verified claim with the URL of the source its evidence came from.
+
+    A claim records evidence ids, not a source, so the locator is resolved
+    claim -> evidence -> source. A claim whose evidence resolves to no locator is
+    still retained: the finding is what makes the record recallable, and dropping
+    it for want of a URL would discard verified knowledge.
+    """
+    locator_by_source = {
+        source.get("id"): source.get("url") or source.get("uri") or ""
+        for source in sources
+    }
+    source_by_evidence = {item.get("id"): item.get("sourceId") for item in evidence}
+    findings = []
+    for claim in verified_claims:
+        locator = ""
+        for evidence_id in claim.get("evidenceIds", []):
+            locator = locator_by_source.get(source_by_evidence.get(evidence_id), "")
+            if locator:
+                break
+        findings.append({"text": claim.get("text", ""), "url": locator})
+    return findings
+
+
 def _schedule_outcome_ingest(client, result: Dict[str, Any], op_id: str, mode: str) -> None:
     """Persist an optional Brain outcome best-effort, off the critical path.
 
@@ -650,16 +674,17 @@ def _schedule_outcome_ingest(client, result: Dict[str, Any], op_id: str, mode: s
     # "partially-supported", so counting that status would ingest a fabricated
     # verification success. "supported" against a real passage (or any status
     # backed by an evidence id) is the independently evidenced shape.
-    verified_claim_count = sum(
-        1 for claim in result.get("claims", [])
+    verified_claims = [
+        claim for claim in result.get("claims", [])
         if claim.get("verificationStatus") == "supported" and claim.get("evidenceIds")
-    )
+    ]
     sources = result.get("sources", [])
     task = asyncio.create_task(asyncio.to_thread(
         client.ingest_verified_outcome,
         operation_id=op_id, status=result["status"], mode=mode,
-        source_count=len(sources), verified_claim_count=verified_claim_count,
+        source_count=len(sources), verified_claim_count=len(verified_claims),
         source_types=[source.get("sourceType", "") for source in sources],
+        findings=_retained_findings(verified_claims, result.get("evidence", []), sources),
     ))
     _pending_ingest_tasks.add(task)
     task.add_done_callback(_pending_ingest_tasks.discard)
