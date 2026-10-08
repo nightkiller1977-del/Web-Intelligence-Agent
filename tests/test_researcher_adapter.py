@@ -1,3 +1,4 @@
+import json
 import os
 
 import pytest
@@ -663,6 +664,50 @@ async def test_schedule_outcome_ingest_runs_only_after_durable_save(monkeypatch)
         "findings": [{"text": "supported claim", "url": "https://example.test", "sourceType": "web"}],
         "withheld_findings": 0,
     }]
+
+
+@pytest.mark.anyio
+async def test_schedule_outcome_ingest_reads_consent_from_the_request_inputs(monkeypatch):
+    """The gate is only worth anything if the request's own allowExternalUse
+    actually reaches it. The flag is computed inside conduct_web_research() and
+    is absent from the result dict, which is how local passages reached
+    retention unchecked — so the wiring itself needs covering, not just the gate."""
+    class BrainMemorySpy:
+        def __init__(self):
+            self.ingested = []
+
+        def ingest_verified_outcome(self, **kwargs):
+            self.ingested.append(kwargs)
+            return True
+
+    result = {
+        "status": "completed",
+        "sources": [{"id": "src-doc", "sourceType": "document", "url": "", "uri": "file:///home/someone/design.md"}],
+        "evidence": [{"id": "ev-1", "sourceId": "src-doc"}],
+        "claims": [{"text": "a confidential local claim", "verificationStatus": "supported", "evidenceIds": ["ev-1"]}],
+    }
+
+    withheld_spy = BrainMemorySpy()
+    monkeypatch.setattr(researcher_adapter, "brain_memory_client", lambda: withheld_spy)
+    assert researcher_adapter.schedule_outcome_ingest(result, "test-op", "standard") is True
+    await researcher_adapter.flush_pending_ingest_tasks()
+    assert withheld_spy.ingested[0]["findings"] == []
+    assert withheld_spy.ingested[0]["withheld_findings"] == 1
+    # The content must not reach Brain in any field.
+    assert "confidential" not in json.dumps(withheld_spy.ingested[0])
+    # The counter is aggregate and carries no content, so it stays whole.
+    assert withheld_spy.ingested[0]["verified_claim_count"] == 1
+
+    consented_spy = BrainMemorySpy()
+    monkeypatch.setattr(researcher_adapter, "brain_memory_client", lambda: consented_spy)
+    assert researcher_adapter.schedule_outcome_ingest(
+        result, "test-op", "standard", inputs={"allowExternalUse": True}
+    ) is True
+    await researcher_adapter.flush_pending_ingest_tasks()
+    assert consented_spy.ingested[0]["findings"] == [
+        {"text": "a confidential local claim", "url": "", "sourceType": "document"}
+    ]
+    assert consented_spy.ingested[0]["withheld_findings"] == 0
 
 
 def test_retained_findings_resolve_locator_through_evidence():
