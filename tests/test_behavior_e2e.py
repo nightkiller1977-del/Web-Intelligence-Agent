@@ -83,9 +83,9 @@ def e2e_server():
             pass
         time.sleep(0.5)
     else:
-        out = proc.stdout.read().decode() if proc.stdout else ""
         proc.kill()
-        pytest.fail(f"Server did not start within 30s. Output:\n{out}")
+        out, _ = proc.communicate(timeout=5)
+        pytest.fail(f"Server did not start within 30s. Output:\n{out.decode()}")
 
     yield base_url
 
