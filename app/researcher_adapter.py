@@ -5,7 +5,7 @@ import logging
 import time
 import hashlib
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit, urlunsplit
 from typing import Dict, Any
 from gpt_researcher import GPTResearcher
 
@@ -637,6 +637,34 @@ def append_input_sources(op_id: str, input_chunks: list[dict], sources: list[dic
 _pending_ingest_tasks: set = set()
 
 
+def _public_locator(raw: str) -> str:
+    """Reduce a source locator to something safe to persist in shared memory.
+
+    A presigned or authenticated URL carries its secret in userinfo or the query
+    string, and a local input's locator is an absolute filesystem path the
+    operator may never have cleared for external use (allowExternalUse unset or
+    false). is_safe_url() validates only scheme, host and resolved address, so
+    neither is filtered upstream. Brain persists what it is handed and replays it
+    through recall_context() into later model prompts, so the redaction has to
+    happen before ingestion — there is no read-side filter to fall back on.
+    """
+    try:
+        parts = urlsplit(raw)
+    except ValueError:
+        return ""
+    if parts.scheme not in ("http", "https"):
+        # file:// and anything else: omit rather than publish a local path.
+        return ""
+    host = parts.hostname or ""
+    if not host:
+        return ""
+    if parts.port:
+        host = f"{host}:{parts.port}"
+    # Drop userinfo, query and fragment — that is where credentials and
+    # signed-URL secrets live. Scheme, host and path are the provenance.
+    return urlunsplit((parts.scheme, host, parts.path, "", ""))
+
+
 def _retained_findings(verified_claims: list, evidence: list, sources: list) -> list[dict]:
     """Pair each verified claim with the URL of the source its evidence came from.
 
@@ -646,7 +674,7 @@ def _retained_findings(verified_claims: list, evidence: list, sources: list) -> 
     it for want of a URL would discard verified knowledge.
     """
     locator_by_source = {
-        source.get("id"): source.get("url") or source.get("uri") or ""
+        source.get("id"): _public_locator(source.get("url") or source.get("uri") or "")
         for source in sources
     }
     source_by_evidence = {item.get("id"): item.get("sourceId") for item in evidence}

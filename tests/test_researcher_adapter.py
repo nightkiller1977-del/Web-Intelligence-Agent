@@ -669,7 +669,7 @@ def test_retained_findings_resolve_locator_through_evidence():
     findings = researcher_adapter._retained_findings(
         verified_claims=[
             {"text": "has http locator", "evidenceIds": ["ev-missing", "ev-2"]},
-            {"text": "local file locator", "evidenceIds": ["ev-3"]},
+            {"text": "from a local document", "evidenceIds": ["ev-3"]},
             {"text": "unresolvable", "evidenceIds": ["ev-nope"]},
         ],
         evidence=[
@@ -679,15 +679,33 @@ def test_retained_findings_resolve_locator_through_evidence():
         sources=[
             {"id": "src-1", "url": "https://example.test/a"},
             # A local document carries its locator on uri; url stays empty.
-            {"id": "src-2", "url": "", "uri": "file:///tmp/notes.md"},
+            {"id": "src-2", "url": "", "uri": "file:///home/someone/private/notes.md"},
         ],
     )
 
     assert findings == [
         {"text": "has http locator", "url": "https://example.test/a"},
-        {"text": "local file locator", "url": "file:///tmp/notes.md"},
+        # The claim is still retained, but the local path is not published into
+        # a shared artifact — the operator may never have cleared it for
+        # external use.
+        {"text": "from a local document", "url": ""},
         {"text": "unresolvable", "url": ""},
     ]
+
+
+def test_public_locator_strips_credentials_and_secret_bearing_parts():
+    """Brain persists what it is handed and replays it into later prompts, so a
+    presigned or authenticated locator has to be redacted before ingestion."""
+    redact = researcher_adapter._public_locator
+
+    assert redact("https://user:s3cr3t@example.test/doc") == "https://example.test/doc"
+    assert redact("https://example.test/doc?X-Amz-Signature=deadbeef&token=abc") == "https://example.test/doc"
+    assert redact("https://example.test/doc#fragment") == "https://example.test/doc"
+    assert redact("https://example.test:8443/doc") == "https://example.test:8443/doc"
+    # Non-http schemes carry local filesystem paths; omit them entirely.
+    assert redact("file:///home/someone/private/notes.md") == ""
+    assert redact("") == ""
+    assert redact("not a url") == ""
 
 
 @pytest.mark.anyio
