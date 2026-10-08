@@ -840,6 +840,11 @@ def test_retained_findings_withhold_claims_whose_text_embeds_a_secret():
         "Grab //8.8.8.8/f?signature=deadbeef from the mirror.",
         # Query immediately after the host, no path separator.
         "Use example.test?signature=deadbeef before it rotates.",
+        # Non-default port: the matcher must not stop at the bare authority and
+        # call the rest safe.
+        "Open www.example.test:8443/reset/a1b2c3d4e5f6token to continue.",
+        "Open //www.example.test:8443/reset/a1b2c3d4e5f6token to continue.",
+        "Session at www.example.test;jsessionid=A1B2C3D4E5 right now.",
     ]
     findings, _withheld, secret_bearing = researcher_adapter._retained_findings(
         verified_claims=[claim(text) for text in unsafe], **args
@@ -891,6 +896,9 @@ def test_retained_findings_withhold_claims_whose_text_embeds_a_secret():
         "See docs.python.org/3/library/urllib.html for the parsing rules.",
         "The entry point is app/researcher_adapter.py in that package.",
         "A bare www.example.test carries no path or query to leak.",
+        "A bare www.example.test:8443 is still just an origin.",
+        # Sentence colon, not a port — the punctuation trimmer takes it back off.
+        "The docs are at www.example.test: it is the canonical mirror.",
         "The node answers at //[2606:4700:4700::1111] for that region.",
         "The resolver is reachable at //8.8.8.8 from that subnet.",
         # A dotted quad in prose is a version string, not an authority; the

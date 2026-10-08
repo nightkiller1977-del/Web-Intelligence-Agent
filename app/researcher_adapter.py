@@ -713,7 +713,12 @@ _SCHEME_RELATIVE_URL_IN_CLAIM_TEXT = re.compile(
     # version string, "//1.2.3.4" is an authority.
     r"|\d{1,3}(?:\.\d{1,3}){3}(?::\d{1,5})?"
     r"|[A-Za-z0-9._-]*(?:\.[A-Za-z]{2,}|:\d{1,5}))"
-    r"(?:[/?#]\S*)?"
+    # ":" and ";" start a continuation too — a port, or a ";jsessionid=" path
+    # parameter. Without them the match stops at the bare authority, which then
+    # reduces to a safe origin and lets the credential-bearing tail through.
+    # A sentence colon ("at //example.test: it is fast") is handled by
+    # _trim_sentence_punctuation, which strips the trailing ":" back off.
+    r"(?:[:/?#;]\S*)?"
 )
 
 # Schemeless host-shaped links, limited to the two unambiguous shapes: a "www."
@@ -728,7 +733,7 @@ _SCHEME_RELATIVE_URL_IN_CLAIM_TEXT = re.compile(
 # is not covered here.
 _SCHEMELESS_URL_IN_CLAIM_TEXT = re.compile(
     r"(?<![/@\w.])(?:"
-    r"www\.[A-Za-z0-9._-]+\.[A-Za-z]{2,}(?:[/?#]\S*)?"
+    r"www\.[A-Za-z0-9._-]+\.[A-Za-z]{2,}(?:[:/?#;]\S*)?"
     r"|[A-Za-z0-9._-]+\.[A-Za-z]{2,}(?:/\S*)?\?\S+"
     r")"
 )
