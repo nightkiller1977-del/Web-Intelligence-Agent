@@ -714,6 +714,30 @@ def test_public_locator_strips_credentials_and_omits_ambiguous_identity():
     assert redact("not a url") == ""
 
 
+def test_public_locator_keeps_ipv6_brackets():
+    """hostname strips the brackets an IPv6 literal needs; without them the
+    rebuilt locator cannot identify the evidence page."""
+    redact = researcher_adapter._public_locator
+
+    assert redact("https://[2606:4700:4700::1111]/doc") == "https://[2606:4700:4700::1111]/doc"
+    assert redact("https://[2606:4700:4700::1111]:8443/doc") == "https://[2606:4700:4700::1111]:8443/doc"
+
+
+def test_retained_findings_survive_a_malformed_port():
+    """urlsplit parses .port lazily and raises on ':bad', which is_safe_url()
+    never inspects. This runs while building the ingest task arguments, so an
+    escaping ValueError would fail research that already succeeded and was
+    already saved — for the sake of an optional memory record."""
+    findings = researcher_adapter._retained_findings(
+        verified_claims=[{"text": "claim from a badly formed locator", "evidenceIds": ["ev-1"]}],
+        evidence=[{"id": "ev-1", "sourceId": "src-1"}],
+        sources=[{"id": "src-1", "url": "https://example.com:bad/a", "sourceType": "web"}],
+    )
+
+    # Unusable locator, not an exception — and the claim and its type survive.
+    assert findings == [{"text": "claim from a badly formed locator", "url": "", "sourceType": "web"}]
+
+
 @pytest.mark.anyio
 async def test_schedule_outcome_ingest_skips_non_durable_or_disabled(monkeypatch):
     monkeypatch.setattr(researcher_adapter, "brain_memory_client", lambda: None)

@@ -650,25 +650,35 @@ def _public_locator(raw: str) -> str:
     """
     try:
         parts = urlsplit(raw)
+        if parts.scheme not in ("http", "https"):
+            # file:// and anything else: omit rather than publish a local path.
+            return ""
+        host = parts.hostname or ""
+        if not host:
+            return ""
+        if parts.query:
+            # The query can carry the secret (signature, token) or the resource
+            # identity (/article?id=123) and there is no general way to tell
+            # which. Stripping it would silently publish a locator for a
+            # different page, so omit it entirely: no provenance beats wrong
+            # provenance.
+            return ""
+        # .port parses lazily and raises on a malformed value like ":bad",
+        # which is_safe_url() does not inspect. It stays inside the guard
+        # because this runs while building the ingest task arguments: an
+        # escaping exception would fail research that already succeeded and
+        # was already saved, for the sake of an optional memory record.
+        port = parts.port
     except ValueError:
         return ""
-    if parts.scheme not in ("http", "https"):
-        # file:// and anything else: omit rather than publish a local path.
-        return ""
-    host = parts.hostname or ""
-    if not host:
-        return ""
-    if parts.query:
-        # The query can carry the secret (signature, token) or the resource
-        # identity (/article?id=123) and there is no general way to tell which.
-        # Stripping it would silently publish a locator for a different page,
-        # so omit it entirely: no provenance beats wrong provenance.
-        return ""
-    if parts.port:
-        host = f"{host}:{parts.port}"
+    # hostname strips the brackets an IPv6 literal needs, so put them back —
+    # otherwise the rebuilt locator cannot identify the evidence page.
+    netloc = f"[{host}]" if ":" in host else host
+    if port:
+        netloc = f"{netloc}:{port}"
     # Drop userinfo and fragment — that is where credentials live. Scheme, host
     # and path are the provenance.
-    return urlunsplit((parts.scheme, host, parts.path, "", ""))
+    return urlunsplit((parts.scheme, netloc, parts.path, "", ""))
 
 
 def _retained_findings(verified_claims: list, evidence: list, sources: list) -> list[dict]:
