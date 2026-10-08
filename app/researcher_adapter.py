@@ -640,13 +640,19 @@ _pending_ingest_tasks: set = set()
 def _public_locator(raw: str) -> str:
     """Reduce a source locator to something safe to persist in shared memory.
 
-    A presigned or authenticated URL carries its secret in userinfo or the query
-    string, and a local input's locator is an absolute filesystem path the
-    operator may never have cleared for external use (allowExternalUse unset or
-    false). is_safe_url() validates only scheme, host and resolved address, so
-    neither is filtered upstream. Brain persists what it is handed and replays it
+    Reduces a URL to its origin. A secret can ride in userinfo, in the query, or
+    in the path itself (a magic-link token, "/reset/<token>", ";jsessionid="),
+    and a local input's locator is an absolute filesystem path the operator may
+    never have cleared for external use (allowExternalUse unset or false).
+    is_safe_url() validates only scheme, host and resolved address, so none of
+    that is filtered upstream. Brain persists what it is handed and replays it
     through recall_context() into later model prompts, so the redaction has to
     happen before ingestion — there is no read-side filter to fall back on.
+
+    The cost is deliberate: provenance drops to publisher level, and two claims
+    from one site become indistinguishable by locator. The authoritative
+    research result keeps the full URL; only this shared-memory copy fails
+    closed.
     """
     try:
         parts = urlsplit(raw)
@@ -672,13 +678,18 @@ def _public_locator(raw: str) -> str:
     except ValueError:
         return ""
     # hostname strips the brackets an IPv6 literal needs, so put them back —
-    # otherwise the rebuilt locator cannot identify the evidence page.
+    # otherwise the rebuilt locator cannot identify the evidence host.
     netloc = f"[{host}]" if ":" in host else host
     if port:
         netloc = f"{netloc}:{port}"
-    # Drop userinfo and fragment — that is where credentials live. Scheme, host
-    # and path are the provenance.
-    return urlunsplit((parts.scheme, netloc, parts.path, "", ""))
+    # Origin only. The path is dropped for the same reason the query is: it can
+    # carry a capability credential — a magic-link token, /reset/<token>, a
+    # ";jsessionid=" path parameter — and there is no general way to tell one
+    # from an identifying segment like /article/12345. is_safe_url() validates
+    # the destination, never the path's contents. The authoritative research
+    # result still holds the complete URL; this is the shared-memory copy, so
+    # it fails closed to publisher-level provenance.
+    return urlunsplit((parts.scheme, netloc, "", "", ""))
 
 
 def _retained_findings(verified_claims: list, evidence: list, sources: list) -> list[dict]:

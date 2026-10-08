@@ -660,7 +660,7 @@ async def test_schedule_outcome_ingest_runs_only_after_durable_save(monkeypatch)
     assert spy.ingested == [{
         "operation_id": "test-op", "status": "completed", "mode": "standard",
         "source_count": 1, "verified_claim_count": 1, "source_types": ["web"],
-        "findings": [{"text": "supported claim", "url": "https://example.test/a", "sourceType": "web"}],
+        "findings": [{"text": "supported claim", "url": "https://example.test", "sourceType": "web"}],
     }]
 
 
@@ -684,7 +684,7 @@ def test_retained_findings_resolve_locator_through_evidence():
     )
 
     assert findings == [
-        {"text": "has http locator", "url": "https://example.test/a", "sourceType": "web"},
+        {"text": "has http locator", "url": "https://example.test", "sourceType": "web"},
         # The claim is still retained, but the local path is not published into
         # a shared artifact — the operator may never have cleared it for
         # external use. The type survives so the finding is not later recalled
@@ -694,14 +694,22 @@ def test_retained_findings_resolve_locator_through_evidence():
     ]
 
 
-def test_public_locator_strips_credentials_and_omits_ambiguous_identity():
+def test_public_locator_reduces_to_origin_and_omits_ambiguous_identity():
     """Brain persists what it is handed and replays it into later prompts, so a
-    presigned or authenticated locator has to be redacted before ingestion."""
+    locator is reduced to its origin before ingestion: a secret can ride in
+    userinfo, in the query, or in the path itself, and nothing upstream
+    sanitizes any of them."""
     redact = researcher_adapter._public_locator
 
-    assert redact("https://user:s3cr3t@example.test/doc") == "https://example.test/doc"
-    assert redact("https://example.test/doc#fragment") == "https://example.test/doc"
-    assert redact("https://example.test:8443/doc") == "https://example.test:8443/doc"
+    assert redact("https://user:s3cr3t@example.test/doc") == "https://example.test"
+    assert redact("https://example.test/doc#fragment") == "https://example.test"
+    assert redact("https://example.test:8443/doc") == "https://example.test:8443"
+    # Path-borne capability credentials: a magic-link token and a path
+    # parameter. Neither is distinguishable from an identifying segment like
+    # /article/12345, so the path goes entirely.
+    assert redact("https://example.test/reset/a1b2c3d4e5f6secrettoken") == "https://example.test"
+    assert redact("https://example.test/app;jsessionid=A1B2C3D4E5") == "https://example.test"
+    assert redact("https://example.test/article/12345") == "https://example.test"
     # A query can carry the secret OR the resource identity, and there is no
     # general way to tell which. Stripping it would publish a locator for a
     # different page, so the locator is omitted instead — no provenance beats
@@ -719,8 +727,8 @@ def test_public_locator_keeps_ipv6_brackets():
     rebuilt locator cannot identify the evidence page."""
     redact = researcher_adapter._public_locator
 
-    assert redact("https://[2606:4700:4700::1111]/doc") == "https://[2606:4700:4700::1111]/doc"
-    assert redact("https://[2606:4700:4700::1111]:8443/doc") == "https://[2606:4700:4700::1111]:8443/doc"
+    assert redact("https://[2606:4700:4700::1111]/doc") == "https://[2606:4700:4700::1111]"
+    assert redact("https://[2606:4700:4700::1111]:8443/doc") == "https://[2606:4700:4700::1111]:8443"
 
 
 def test_retained_findings_survive_a_malformed_port():
