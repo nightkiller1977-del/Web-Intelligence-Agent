@@ -93,3 +93,6 @@ def pytest_configure(config):
     config.addinivalue_line(
         "markers", "asyncio: mark test as async"
     )
+    config.addinivalue_line(
+        "markers", "e2e: end-to-end behavior test requiring live Ollama and network access"
+    )
