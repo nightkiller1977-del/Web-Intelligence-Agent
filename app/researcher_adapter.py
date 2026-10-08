@@ -692,7 +692,20 @@ def _public_locator(raw: str) -> str:
     return urlunsplit((parts.scheme, netloc, "", "", ""))
 
 
-_URL_IN_CLAIM_TEXT = re.compile(r"\w+://\S+")
+_URL_IN_CLAIM_TEXT = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://\S+")
+
+# Scheme-relative form ("//example.com/reset/<token>"). Matched separately and
+# more strictly than the scheme-ful pattern: bare "//" also opens a line comment
+# in most languages this agent researches, so the authority must look like a
+# host — a dotted TLD or an explicit port — or "// see the notes below" would
+# cost a legitimate finding its retention. The lookbehind keeps it from
+# re-matching the "//" inside a scheme-ful URL.
+_SCHEME_RELATIVE_URL_IN_CLAIM_TEXT = re.compile(
+    r"(?<![A-Za-z0-9:])//"
+    r"(?:[^\s/?#@]*@)?"
+    r"[A-Za-z0-9._-]*(?:\.[A-Za-z]{2,}|:\d{1,5})"
+    r"(?:[/?#]\S*)?"
+)
 
 # Well-known credential formats, matched by their issuer-assigned prefix and
 # length. Deliberately prefix-anchored rather than entropy-based: this is a
@@ -735,6 +748,12 @@ def _claim_text_carries_a_secret(text: str) -> bool:
     """
     for match in _URL_IN_CLAIM_TEXT.findall(text):
         candidate = match.rstrip(".,;:!?)]}\"'")
+        if _public_locator(candidate) != candidate:
+            return True
+    for match in _SCHEME_RELATIVE_URL_IN_CLAIM_TEXT.findall(text):
+        # Resolved against a scheme so the same locator policy decides it:
+        # "//host" survives as a bare origin, "//host/reset/<token>" does not.
+        candidate = "https:" + match.rstrip(".,;:!?)]}\"'")
         if _public_locator(candidate) != candidate:
             return True
     return any(pattern.search(text) for pattern in _CREDENTIAL_PATTERNS)

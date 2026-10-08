@@ -829,6 +829,9 @@ def test_retained_findings_withhold_claims_whose_text_embeds_a_secret():
         "Use https://user:s3cr3t@example.test/admin to reach the console.",
         "The session is at https://example.test/app;jsessionid=A1B2C3D4E5 right now.",
         "The local copy lives at file:///home/someone/private/notes.md on disk.",
+        # Scheme-relative: a real URL form the scheme-ful pattern never saw.
+        "Follow //example.test/reset/a1b2c3d4e5f6secrettoken to finish setup.",
+        "Fetch //example.test/f?signature=deadbeef before the link expires.",
     ]
     findings, _withheld, secret_bearing = researcher_adapter._retained_findings(
         verified_claims=[claim(text) for text in unsafe], **args
@@ -866,6 +869,13 @@ def test_retained_findings_withhold_claims_whose_text_embeds_a_secret():
         "The regression landed in commit 9f8e7d6c5b4a3929180706050403020100abcdef upstream.",
         "The operation id is 3f2504e0-4f89-11d3-9a0c-0305e82c3301 in the ledger.",
         "The digest is sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 there.",
+        # Bare "//" opens a line comment in most languages this agent
+        # researches; requiring a host-shaped authority is what keeps these
+        # from being withheld as if they were scheme-relative URLs.
+        "The guard is skipped when // the compiler strips it during inlining.",
+        "Write //TODO above the call to mark it for the next pass.",
+        # A scheme-relative bare origin carries no path or query to leak.
+        "The CDN is reachable at //example.test for every region.",
     ]
     kept, _withheld2, none_secret = researcher_adapter._retained_findings(
         verified_claims=[claim(text) for text in safe], **args
