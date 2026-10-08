@@ -264,7 +264,7 @@ async def background_research_task(
         # Only after the result is durable may the optional Brain outcome ingest
         # be scheduled; otherwise Brain could record a completed/partial outcome
         # for a result that was never stored.
-        schedule_outcome_ingest(result, op_id, req.mode)
+        schedule_outcome_ingest(result, op_id, req.mode, inputs=req.inputs)
 
     except asyncio.CancelledError:
         logger.warning(f"Operation {op_id} was cancelled during execution.")

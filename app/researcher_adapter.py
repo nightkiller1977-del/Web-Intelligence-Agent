@@ -692,13 +692,24 @@ def _public_locator(raw: str) -> str:
     return urlunsplit((parts.scheme, netloc, "", "", ""))
 
 
-def _retained_findings(verified_claims: list, evidence: list, sources: list) -> list[dict]:
+def _retained_findings(verified_claims: list, evidence: list, sources: list, allow_external_inputs: bool = False) -> tuple[list[dict], int]:
     """Pair each verified claim with the URL of the source its evidence came from.
 
     A claim records evidence ids, not a source, so the locator is resolved
     claim -> evidence -> source. A claim whose evidence resolves to no locator is
     still retained: the finding is what makes the record recallable, and dropping
     it for want of a URL would discard verified knowledge.
+
+    Local-source findings are withheld unless inputs.allowExternalUse was true.
+    append_input_sources() feeds document and repository passages into claim
+    verification regardless of that flag, so a report sentence can be supported
+    by a confidential local passage. Brain is shared memory and recall_context()
+    can replay it into an external model prompt, so retention needs the same
+    consent the external research path required. An unresolved source type
+    cannot be shown to be web either, so it fails closed with the rest.
+
+    Returns (findings, withheld_count) — the count is recorded in the artifact
+    so the gap between verified claims and retained findings is never silent.
     """
     provenance_by_source = {
         source.get("id"): (
@@ -708,7 +719,7 @@ def _retained_findings(verified_claims: list, evidence: list, sources: list) -> 
         for source in sources
     }
     source_by_evidence = {item.get("id"): item.get("sourceId") for item in evidence}
-    findings = []
+    findings, withheld = [], 0
     for claim in verified_claims:
         locator, source_type = "", ""
         for evidence_id in claim.get("evidenceIds", []):
@@ -717,11 +728,14 @@ def _retained_findings(verified_claims: list, evidence: list, sources: list) -> 
             # carrying, so settle on the first evidence that resolves to either.
             if locator or source_type:
                 break
+        if not allow_external_inputs and source_type != "web":
+            withheld += 1
+            continue
         findings.append({"text": claim.get("text", ""), "url": locator, "sourceType": source_type})
-    return findings
+    return findings, withheld
 
 
-def _schedule_outcome_ingest(client, result: Dict[str, Any], op_id: str, mode: str) -> None:
+def _schedule_outcome_ingest(client, result: Dict[str, Any], op_id: str, mode: str, allow_external_inputs: bool = False) -> None:
     """Persist an optional Brain outcome best-effort, off the critical path.
 
     The task is kept referenced so it is not garbage-collected mid-flight and
@@ -739,12 +753,17 @@ def _schedule_outcome_ingest(client, result: Dict[str, Any], op_id: str, mode: s
         if claim.get("verificationStatus") == "supported" and claim.get("evidenceIds")
     ]
     sources = result.get("sources", [])
+    findings, withheld = _retained_findings(
+        verified_claims, result.get("evidence", []), sources, allow_external_inputs
+    )
     task = asyncio.create_task(asyncio.to_thread(
         client.ingest_verified_outcome,
         operation_id=op_id, status=result["status"], mode=mode,
+        # The counters stay whole: they are aggregate and carry no content, so
+        # withholding a finding must not also understate what was verified.
         source_count=len(sources), verified_claim_count=len(verified_claims),
         source_types=[source.get("sourceType", "") for source in sources],
-        findings=_retained_findings(verified_claims, result.get("evidence", []), sources),
+        findings=findings, withheld_findings=withheld,
     ))
     _pending_ingest_tasks.add(task)
     task.add_done_callback(_pending_ingest_tasks.discard)
@@ -759,7 +778,7 @@ async def flush_pending_ingest_tasks(timeout: float = 6.0) -> int:
     return len(pending)
 
 
-def schedule_outcome_ingest(result: Dict[str, Any], op_id: str, mode: str) -> bool:
+def schedule_outcome_ingest(result: Dict[str, Any], op_id: str, mode: str, inputs: Dict[str, Any] | None = None) -> bool:
     """Schedule the optional Brain outcome ingest once the result is durable.
 
     Called by the caller after a successful ``storage.save_operation`` so a
@@ -771,7 +790,10 @@ def schedule_outcome_ingest(result: Dict[str, Any], op_id: str, mode: str) -> bo
     client = brain_memory_client()
     if not client:
         return False
-    _schedule_outcome_ingest(client, result, op_id, mode)
+    # Consent is read from the request's own inputs, not from the result:
+    # the result never carried the flag, which is how local passages reached
+    # retention unchecked in the first place.
+    _schedule_outcome_ingest(client, result, op_id, mode, (inputs or {}).get("allowExternalUse") is True)
     return True
 
 

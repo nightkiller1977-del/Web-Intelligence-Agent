@@ -661,6 +661,7 @@ async def test_schedule_outcome_ingest_runs_only_after_durable_save(monkeypatch)
         "operation_id": "test-op", "status": "completed", "mode": "standard",
         "source_count": 1, "verified_claim_count": 1, "source_types": ["web"],
         "findings": [{"text": "supported claim", "url": "https://example.test", "sourceType": "web"}],
+        "withheld_findings": 0,
     }]
 
 
@@ -681,17 +682,58 @@ def test_retained_findings_resolve_locator_through_evidence():
             # A local document carries its locator on uri; url stays empty.
             {"id": "src-2", "url": "", "uri": "file:///home/someone/private/notes.md", "sourceType": "document"},
         ],
+        # Consent granted so this test covers locator resolution across source
+        # types; the consent gate itself is covered separately below.
+        allow_external_inputs=True,
     )
 
-    assert findings == [
-        {"text": "has http locator", "url": "https://example.test", "sourceType": "web"},
-        # The claim is still retained, but the local path is not published into
-        # a shared artifact — the operator may never have cleared it for
-        # external use. The type survives so the finding is not later recalled
-        # as web evidence.
-        {"text": "from a local document", "url": "", "sourceType": "document"},
-        {"text": "unresolvable", "url": "", "sourceType": ""},
-    ]
+    assert findings == (
+        [
+            {"text": "has http locator", "url": "https://example.test", "sourceType": "web"},
+            # The claim is still retained, but the local path is not published
+            # into a shared artifact. The type survives so the finding is not
+            # later recalled as web evidence.
+            {"text": "from a local document", "url": "", "sourceType": "document"},
+            {"text": "unresolvable", "url": "", "sourceType": ""},
+        ],
+        0,
+    )
+
+
+def test_retained_findings_withhold_local_evidence_without_consent():
+    """append_input_sources() verifies claims against local passages whether or
+    not inputs.allowExternalUse was true, so a report sentence can be supported
+    by confidential local content. Brain is shared memory that recall_context()
+    can replay into an external prompt, so retention needs that same consent."""
+    args = dict(
+        verified_claims=[
+            {"text": "from the web", "evidenceIds": ["ev-1"]},
+            {"text": "from a confidential design note", "evidenceIds": ["ev-2"]},
+            {"text": "from a private repository", "evidenceIds": ["ev-3"]},
+            {"text": "source type never resolved", "evidenceIds": ["ev-none"]},
+        ],
+        evidence=[
+            {"id": "ev-1", "sourceId": "src-web"},
+            {"id": "ev-2", "sourceId": "src-doc"},
+            {"id": "ev-3", "sourceId": "src-repo"},
+        ],
+        sources=[
+            {"id": "src-web", "url": "https://example.test/a", "sourceType": "web"},
+            {"id": "src-doc", "url": "", "uri": "file:///home/someone/design.md", "sourceType": "document"},
+            {"id": "src-repo", "url": "", "uri": "file:///home/someone/repo", "sourceType": "repository"},
+        ],
+    )
+
+    findings, withheld = researcher_adapter._retained_findings(**args)
+    # Fail closed: only the web-sourced claim survives, and an unresolved type
+    # cannot be shown to be web either.
+    assert findings == [{"text": "from the web", "url": "https://example.test", "sourceType": "web"}]
+    assert withheld == 3
+    assert not any("confidential" in f["text"] or "private repository" in f["text"] for f in findings)
+
+    permitted, withheld_with_consent = researcher_adapter._retained_findings(**args, allow_external_inputs=True)
+    assert len(permitted) == 4
+    assert withheld_with_consent == 0
 
 
 def test_public_locator_reduces_to_origin_and_omits_ambiguous_identity():
@@ -743,7 +785,7 @@ def test_retained_findings_survive_a_malformed_port():
     )
 
     # Unusable locator, not an exception — and the claim and its type survive.
-    assert findings == [{"text": "claim from a badly formed locator", "url": "", "sourceType": "web"}]
+    assert findings == ([{"text": "claim from a badly formed locator", "url": "", "sourceType": "web"}], 0)
 
 
 @pytest.mark.anyio
