@@ -1,0 +1,58 @@
+name: Diagnose Brain Memory data flow (read-only)
+
+# Manually triggered only — never runs automatically. Reuses this repo's
+# existing OIDC federated Azure login (scoped to rg-aicc-fleet, no stored
+# secret) to read Container App configuration and revision health.
+#
+# Strictly read-only: every query below selects only env var *names*
+# (never .value) and revision/replica status. No env var is set, no
+# secret is read, no revision is created or modified.
+on:
+  workflow_dispatch: {}
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  diagnose:
+    name: Read-only Azure Container Apps diagnostics
+    runs-on: ubuntu-latest
+    env:
+      RESOURCE_GROUP: rg-aicc-fleet
+    steps:
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Install Azure Container Apps CLI extension
+        run: az extension add --name containerapp --upgrade -y
+
+      - name: web-intelligence-agent — configured env var names (no values)
+        run: |
+          set -euo pipefail
+          az containerapp show --name web-intelligence-agent --resource-group "$RESOURCE_GROUP" \
+            --query "properties.template.containers[0].env[].name" -o tsv
+
+      - name: web-intelligence-agent — revisions and replica health
+        run: |
+          set -euo pipefail
+          az containerapp revision list --name web-intelligence-agent --resource-group "$RESOURCE_GROUP" \
+            --query "[].{name:name, active:properties.active, running:properties.runningState, health:properties.healthState, replicas:properties.replicas, created:properties.createdTime}" \
+            -o table
+
+      - name: ai-commander-brain-memory — configured env var names (no values)
+        run: |
+          set -euo pipefail
+          az containerapp show --name ai-commander-brain-memory --resource-group "$RESOURCE_GROUP" \
+            --query "properties.template.containers[0].env[].name" -o tsv
+
+      - name: ai-commander-brain-memory — revisions and replica health
+        run: |
+          set -euo pipefail
+          az containerapp revision list --name ai-commander-brain-memory --resource-group "$RESOURCE_GROUP" \
+            --query "[].{name:name, active:properties.active, running:properties.runningState, health:properties.healthState, replicas:properties.replicas, created:properties.createdTime}" \
+            -o table
