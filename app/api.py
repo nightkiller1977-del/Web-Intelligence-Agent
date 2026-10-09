@@ -265,15 +265,6 @@ async def background_research_task(
         # be scheduled; otherwise Brain could record a completed/partial outcome
         # for a result that was never stored.
         schedule_outcome_ingest(result, op_id, req.mode, inputs=req.inputs)
-        # This task's own HTTP request (POST /v1/research) already returned
-        # 202 before this coroutine started, so Azure Container Apps' request
-        # concurrency scaler has no open connection tying this replica to this
-        # operation. Once the SSE consumer disconnects, the replica is free to
-        # scale toward zero at any point. A detached ingest task has no such
-        # protection and can be killed mid-flight before it ever reaches Brain
-        # Memory. Waiting for it here, inside the still-running task, is the
-        # only thing keeping it alive long enough to complete.
-        await flush_pending_ingest_tasks()
 
     except asyncio.CancelledError:
         logger.warning(f"Operation {op_id} was cancelled during execution.")
@@ -319,7 +310,46 @@ async def background_research_task(
         observe_research_result(failed_state)
 
     finally:
-        # Cleanup steps are independent: a failure in one (for example a
+        # This task's own HTTP request (POST /v1/research) already returned
+        # 202 before this coroutine started, so Azure Container Apps' request
+        # concurrency scaler has no open connection tying this replica to this
+        # operation. Once the SSE consumer disconnects, the replica is free to
+        # scale toward zero at any point. A detached Brain Memory ingest task
+        # has no such protection and can be killed mid-flight before it ever
+        # completes. This belongs in `finally`, not inline after
+        # schedule_outcome_ingest(), specifically so cancellation also waits:
+        # a CancelledError delivered while suspended on an inline await is
+        # caught by the except block below it and never retried, so the
+        # already-scheduled ingest task kept running detached while the
+        # operation reported "cancelled" - the same race this whole fix
+        # targets, just reachable through cancellation instead of normal
+        # completion. Running it here covers every exit path uniformly.
+        #
+        # asyncio.shield, not a bare await: a cancellation landing exactly
+        # while suspended here would otherwise interrupt only the *waiting*,
+        # not the pending ingest task(s) themselves (asyncio.wait, inside
+        # flush_pending_ingest_tasks, does not cancel its own members when
+        # the wait around it is cancelled) - so without the shield, this
+        # function would move on and release the owner lease/concurrency
+        # slot while an ingest it already scheduled is still mid-flight and
+        # now has nothing left tracking it: the exact race this whole fix
+        # targets, just moved one line down instead of closed. Shielding
+        # lets that ingest keep running to completion (or its own internal
+        # timeout) independently of whether this task itself gets cancelled
+        # again right here. The outer await still raises CancelledError
+        # immediately either way - shield does not change this function's
+        # own cancellation semantics, only whether the awaited work survives
+        # being cancelled out from under it - so the except below is still
+        # needed, both for that and because asyncio.CancelledError is a
+        # BaseException (not an Exception), so the broader `except
+        # Exception` guards later in this block would not catch it; letting
+        # it propagate from here would skip every cleanup step after it and
+        # leak the owner lease and concurrency slot.
+        try:
+            await asyncio.shield(flush_pending_ingest_tasks())
+        except (Exception, asyncio.CancelledError):
+            logger.warning("Failed to flush pending Brain Memory ingest for operation %s.", op_id, exc_info=True)
+        # Cleanup steps below are independent: a failure in one (for example a
         # transient Redis error releasing the spend hold) must not skip the
         # others, or the owner lease and concurrency slot would stay pinned for
         # the full lease TTL and the task would leak in the local registry.

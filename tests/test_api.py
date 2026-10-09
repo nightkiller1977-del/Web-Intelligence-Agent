@@ -197,6 +197,75 @@ async def test_background_task_waits_for_brain_ingest_before_returning(monkeypat
     assert ingest_done.is_set(), "background_research_task returned before the Brain ingest task finished"
 
 
+@pytest.mark.anyio
+async def test_cancellation_right_after_scheduling_ingest_still_lets_it_complete(monkeypatch):
+    """Regression for a finding from an automated review on PR #32. The first
+    version of this fix put `await flush_pending_ingest_tasks()` inline right
+    after schedule_outcome_ingest(), inside the try block - a CancelledError
+    delivered while suspended exactly there was caught by the
+    `except asyncio.CancelledError` block below it, which never retried the
+    flush, reproducing the scale-to-zero ingest loss through cancellation
+    instead of normal completion.
+
+    Moving the flush into `finally` alone is not sufficient: cancelling the
+    task while it is suspended on a bare (unshielded) await interrupts the
+    *waiting*, not the pending ingest task(s) themselves - asyncio.wait does
+    not cancel its own members when the wait around it is cancelled - so an
+    unshielded flush would let the still-running ingest task become orphaned
+    at exactly this point instead, just relocated. The fix wraps the flush in
+    asyncio.shield() so the pending ingest keeps running to completion
+    independently of whether this task is cancelled again right here.
+
+    This simulates the exact timing: cancel the current task from inside
+    schedule_outcome_ingest, i.e. the instant after an ingest is scheduled,
+    before any further await gives the fix a chance to run. The fake flush
+    has its own internal await so a real suspension point exists for the
+    pending cancellation to land on."""
+    async def fake_conduct_web_research(**kwargs):
+        return {
+            "operationId": kwargs["op_id"], "status": "completed", "mode": kwargs["mode"],
+            "profile": kwargs["profile"], "answer": "Mock answer", "sources": [], "evidence": [],
+            "claims": [], "citations": [], "searchesPerformed": [],
+            "metrics": {"startedAt": "2026-01-01T00:00:00+00:00", "completedAt": "2026-01-01T00:00:01+00:00",
+                        "durationMs": 1, "searchesPerformed": 0, "pagesRead": 0, "sourcesConsidered": 0, "sourcesUsed": 0},
+        }
+
+    def fake_schedule_outcome_ingest(result, op_id, mode, inputs=None):
+        asyncio.current_task().cancel()
+        return True
+
+    flush_calls = []
+
+    async def fake_flush_pending_ingest_tasks():
+        flush_calls.append("started")
+        await asyncio.sleep(0.05)  # a real suspension point, like the Brain Memory HTTP call it stands in for
+        flush_calls.append("completed")
+        return 0
+
+    monkeypatch.setattr(api, "conduct_web_research", fake_conduct_web_research)
+    monkeypatch.setattr(api, "schedule_outcome_ingest", fake_schedule_outcome_ingest)
+    monkeypatch.setattr(api, "flush_pending_ingest_tasks", fake_flush_pending_ingest_tasks)
+
+    operation_id = "op-cancel-after-ingest"
+    req = ResearchRequestInput(**_payload(operation_id))
+    reporter = ProgressReporter(operation_id)
+
+    # background_research_task must not propagate this cancellation: it is
+    # consumed by `finally`'s own try/except around the shielded flush,
+    # specifically so a second cancellation there cannot skip the lease/slot
+    # cleanup that follows it.
+    await api.background_research_task(req, reporter, headers={})
+
+    # The shield means the flush survives as its own task even after
+    # background_research_task itself has returned; give the event loop a
+    # turn to actually run it to completion before asserting on it.
+    await asyncio.sleep(0.1)
+
+    assert flush_calls == ["started", "completed"], (
+        "the shielded flush must run to completion even though the task awaiting it was cancelled"
+    )
+
+
 def test_research_submission_returns_passage_backed_claims(monkeypatch):
     async def fake_conduct_web_research(**kwargs):
         return {
