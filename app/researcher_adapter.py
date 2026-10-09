@@ -692,7 +692,11 @@ def _public_locator(raw: str) -> str:
     return urlunsplit((parts.scheme, netloc, "", "", ""))
 
 
-_URL_IN_CLAIM_TEXT = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://\S+")
+# "file:/path" is a valid single-slash URI (RFC 8089) and carries a local
+# path, so it is matched alongside the "scheme://" form. Scoped to file:
+# deliberately — a general "scheme:/" rule would swallow Windows paths
+# like C:/Users, which are ordinary subject matter here.
+_URL_IN_CLAIM_TEXT = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://\S+|\bfile:/\S+")
 
 # Scheme-relative form ("//example.com/reset/<token>"). Matched separately and
 # more strictly than the scheme-ful pattern: bare "//" also opens a line comment

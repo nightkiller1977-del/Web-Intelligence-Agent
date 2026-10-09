@@ -859,6 +859,8 @@ def test_retained_findings_withhold_claims_whose_text_embeds_a_secret():
         # Userinfo containing its own "@": URL parsing treats the LAST one as
         # the authority separator, so the real host is still evil.test.
         "Follow //user@department@evil.test/reset/a1b2c3token now.",
+        # Single-slash file URI (RFC 8089) — valid, and carries a local path.
+        "The copy is at file:/home/someone/private/notes.txt here.",
     ]
     findings, _withheld, secret_bearing = researcher_adapter._retained_findings(
         verified_claims=[claim(text) for text in unsafe], **args
@@ -919,6 +921,8 @@ def test_retained_findings_withhold_claims_whose_text_embeds_a_secret():
         # Two hosts and an address in one sentence, none of them a capability
         # link — the userinfo group must not reach across the whitespace.
         "See //a.test and mail me@b.test about the rollout plan.",
+        # A general "scheme:/" rule would swallow these; file: is scoped.
+        "The build output lands in C:/Users/build/out on Windows.",
         # Sentence colon, not a port — the punctuation trimmer takes it back off.
         "The docs are at www.example.test: it is the canonical mirror.",
         "The node answers at //[2606:4700:4700::1111] for that region.",
