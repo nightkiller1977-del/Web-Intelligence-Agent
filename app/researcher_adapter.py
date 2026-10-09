@@ -745,8 +745,8 @@ _SCHEME_RELATIVE_URL_IN_CLAIM_TEXT = re.compile(
 # is not covered here.
 _SCHEMELESS_URL_IN_CLAIM_TEXT = re.compile(
     r"(?<![/@\w.])(?:"
-    r"www\." + _HOST + r"+\." + _TLD + r"(?:[:/?#;]\S*)?"
-    r"|" + _HOST + r"+\." + _TLD + r"(?:/\S*)?\?\S+"
+    r"www\." + _HOST + r"+\." + _TLD + r"(?:[:/?#;@]\S*)?"
+    r"|" + _HOST + r"+\." + _TLD + r"(?:[@/]\S*)?\?\S+"
     r")"
 )
 
