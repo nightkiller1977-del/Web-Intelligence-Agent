@@ -18,7 +18,7 @@ from app.storage import storage
 from app.schemas import ResearchRequestInput, ResearchResultResponse, CapabilitiesInfo
 from app.cancellation import cancellation_manager
 from app.progress_adapter import ProgressReporter
-from app.researcher_adapter import conduct_web_research, _LeaseLostError, schedule_outcome_ingest
+from app.researcher_adapter import conduct_web_research, _LeaseLostError, schedule_outcome_ingest, flush_pending_ingest_tasks
 from app.security import is_gateway_destination_allowed, is_safe_url
 from app.metrics import observe_research_result, record_operation_spend
 
@@ -265,6 +265,15 @@ async def background_research_task(
         # be scheduled; otherwise Brain could record a completed/partial outcome
         # for a result that was never stored.
         schedule_outcome_ingest(result, op_id, req.mode, inputs=req.inputs)
+        # This task's own HTTP request (POST /v1/research) already returned
+        # 202 before this coroutine started, so Azure Container Apps' request
+        # concurrency scaler has no open connection tying this replica to this
+        # operation. Once the SSE consumer disconnects, the replica is free to
+        # scale toward zero at any point. A detached ingest task has no such
+        # protection and can be killed mid-flight before it ever reaches Brain
+        # Memory. Waiting for it here, inside the still-running task, is the
+        # only thing keeping it alive long enough to complete.
+        await flush_pending_ingest_tasks()
 
     except asyncio.CancelledError:
         logger.warning(f"Operation {op_id} was cancelled during execution.")

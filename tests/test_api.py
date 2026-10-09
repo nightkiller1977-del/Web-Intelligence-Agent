@@ -7,8 +7,11 @@ import pytest
 from fastapi.testclient import TestClient
 
 import app.api as api
+from app import researcher_adapter
 from app.config import settings
 from app.main import app
+from app.progress_adapter import ProgressReporter
+from app.schemas import ResearchRequestInput
 
 
 def _payload(operation_id="op-api", idempotency_key="idem-api"):
@@ -147,6 +150,51 @@ def test_research_submission_completes_with_mocked_adapter(monkeypatch):
     assert result["status"] == "completed"
     assert result["answer"] == "Mock answer"
     assert events.status_code == 200
+
+
+@pytest.mark.anyio
+async def test_background_task_waits_for_brain_ingest_before_returning(monkeypatch):
+    """Regression for the scale-to-zero race: background_research_task's own
+    HTTP request already returned 202 before this coroutine runs, so nothing
+    keeps the container alive except this task itself. A Brain Memory ingest
+    fired-and-forgotten here could be killed mid-flight the moment the
+    container is judged idle. The fix awaits flush_pending_ingest_tasks()
+    before the function returns, so the ingest must already be done (or
+    timed out) by then - never left to the mercy of autoscaling. This calls
+    background_research_task directly (not through the HTTP layer) because
+    the terminal status is persisted *before* the ingest is scheduled, so
+    polling the public result endpoint for "completed" cannot by itself
+    distinguish "ingest finished" from "ingest still detached in flight"."""
+    ingest_done = asyncio.Event()
+
+    async def fake_conduct_web_research(**kwargs):
+        return {
+            "operationId": kwargs["op_id"], "status": "completed", "mode": kwargs["mode"],
+            "profile": kwargs["profile"], "answer": "Mock answer", "sources": [], "evidence": [],
+            "claims": [], "citations": [], "searchesPerformed": [],
+            "metrics": {"startedAt": "2026-01-01T00:00:00+00:00", "completedAt": "2026-01-01T00:00:01+00:00",
+                        "durationMs": 1, "searchesPerformed": 0, "pagesRead": 0, "sourcesConsidered": 0, "sourcesUsed": 0},
+        }
+
+    def fake_schedule_outcome_ingest(result, op_id, mode, inputs=None):
+        async def slow_ingest():
+            await asyncio.sleep(0.1)  # simulate a real outbound HTTP call to Brain Memory
+            ingest_done.set()
+        task = asyncio.create_task(slow_ingest())
+        researcher_adapter._pending_ingest_tasks.add(task)
+        task.add_done_callback(researcher_adapter._pending_ingest_tasks.discard)
+        return True
+
+    monkeypatch.setattr(api, "conduct_web_research", fake_conduct_web_research)
+    monkeypatch.setattr(api, "schedule_outcome_ingest", fake_schedule_outcome_ingest)
+
+    operation_id = "op-api-ingest-ordering"
+    req = ResearchRequestInput(**_payload(operation_id))
+    reporter = ProgressReporter(operation_id)
+
+    await api.background_research_task(req, reporter, headers={})
+
+    assert ingest_done.is_set(), "background_research_task returned before the Brain ingest task finished"
 
 
 def test_research_submission_returns_passage_backed_claims(monkeypatch):
