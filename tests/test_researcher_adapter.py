@@ -849,6 +849,9 @@ def test_retained_findings_withhold_claims_whose_text_embeds_a_secret():
         # matched only "example.xn" and called the rest safe.
         "Follow //example.xn--p1ai/reset/a1b2c3d4e5token to finish.",
         "Open www.example.xn--p1ai/reset/a1b2c3d4e5token to finish.",
+        # Unicode IDN, not punycode-encoded.
+        "Follow //пример.рф/reset/a1b2c3d4e5token to finish.",
+        "Open www.пример.рф/f?signature=deadbeef now.",
     ]
     findings, _withheld, secret_bearing = researcher_adapter._retained_findings(
         verified_claims=[claim(text) for text in unsafe], **args
@@ -902,6 +905,7 @@ def test_retained_findings_withhold_claims_whose_text_embeds_a_secret():
         "A bare www.example.test carries no path or query to leak.",
         "A bare www.example.test:8443 is still just an origin.",
         "A bare //example.xn--p1ai is still just an origin.",
+        "A bare //пример.рф is still just an origin.",
         # Sentence colon, not a port — the punctuation trimmer takes it back off.
         "The docs are at www.example.test: it is the canonical mirror.",
         "The node answers at //[2606:4700:4700::1111] for that region.",
