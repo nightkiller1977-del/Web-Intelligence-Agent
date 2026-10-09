@@ -845,6 +845,10 @@ def test_retained_findings_withhold_claims_whose_text_embeds_a_secret():
         "Open www.example.test:8443/reset/a1b2c3d4e5f6token to continue.",
         "Open //www.example.test:8443/reset/a1b2c3d4e5f6token to continue.",
         "Session at www.example.test;jsessionid=A1B2C3D4E5 right now.",
+        # Punycode TLD: the label contains hyphens, so a {2,} alphabetic TLD
+        # matched only "example.xn" and called the rest safe.
+        "Follow //example.xn--p1ai/reset/a1b2c3d4e5token to finish.",
+        "Open www.example.xn--p1ai/reset/a1b2c3d4e5token to finish.",
     ]
     findings, _withheld, secret_bearing = researcher_adapter._retained_findings(
         verified_claims=[claim(text) for text in unsafe], **args
@@ -897,6 +901,7 @@ def test_retained_findings_withhold_claims_whose_text_embeds_a_secret():
         "The entry point is app/researcher_adapter.py in that package.",
         "A bare www.example.test carries no path or query to leak.",
         "A bare www.example.test:8443 is still just an origin.",
+        "A bare //example.xn--p1ai is still just an origin.",
         # Sentence colon, not a port — the punctuation trimmer takes it back off.
         "The docs are at www.example.test: it is the canonical mirror.",
         "The node answers at //[2606:4700:4700::1111] for that region.",

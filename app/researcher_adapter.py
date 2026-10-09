@@ -700,6 +700,13 @@ _URL_IN_CLAIM_TEXT = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://\S+")
 # host — a dotted TLD or an explicit port — or "// see the notes below" would
 # cost a legitimate finding its retention. The lookbehind keeps it from
 # re-matching the "//" inside a scheme-ful URL.
+# A TLD label, punycode included: "com", "museum", "xn--p1ai". Hyphens are
+# allowed inside but never at the end. Defined once and shared by every matcher:
+# the last two rounds were each the same gap found in a different branch, so a
+# single definition is what keeps them from drifting apart again.
+_TLD = r"[A-Za-z][A-Za-z0-9-]*[A-Za-z0-9]"
+
+
 _SCHEME_RELATIVE_URL_IN_CLAIM_TEXT = re.compile(
     r"(?<![A-Za-z0-9:])//"
     r"(?:[^\s/?#@]*@)?"
@@ -712,7 +719,7 @@ _SCHEME_RELATIVE_URL_IN_CLAIM_TEXT = re.compile(
     # the "//" prefix is what disambiguates: a bare "1.2.3.4" in prose is a
     # version string, "//1.2.3.4" is an authority.
     r"|\d{1,3}(?:\.\d{1,3}){3}(?::\d{1,5})?"
-    r"|[A-Za-z0-9._-]*(?:\.[A-Za-z]{2,}|:\d{1,5}))"
+    r"|[A-Za-z0-9._-]*(?:\." + _TLD + r"|:\d{1,5}))"
     # ":" and ";" start a continuation too — a port, or a ";jsessionid=" path
     # parameter. Without them the match stops at the bare authority, which then
     # reduces to a safe origin and lets the credential-bearing tail through.
@@ -733,8 +740,8 @@ _SCHEME_RELATIVE_URL_IN_CLAIM_TEXT = re.compile(
 # is not covered here.
 _SCHEMELESS_URL_IN_CLAIM_TEXT = re.compile(
     r"(?<![/@\w.])(?:"
-    r"www\.[A-Za-z0-9._-]+\.[A-Za-z]{2,}(?:[:/?#;]\S*)?"
-    r"|[A-Za-z0-9._-]+\.[A-Za-z]{2,}(?:/\S*)?\?\S+"
+    r"www\.[A-Za-z0-9._-]+\." + _TLD + r"(?:[:/?#;]\S*)?"
+    r"|[A-Za-z0-9._-]+\." + _TLD + r"(?:/\S*)?\?\S+"
     r")"
 )
 
