@@ -856,6 +856,9 @@ def test_retained_findings_withhold_claims_whose_text_embeds_a_secret():
         # before it approves the wrong origin.
         "Open www.example.test@evil.test/reset/a1b2c3token now.",
         "Fetch example.test@evil.test/f?signature=deadbeef now.",
+        # Userinfo containing its own "@": URL parsing treats the LAST one as
+        # the authority separator, so the real host is still evil.test.
+        "Follow //user@department@evil.test/reset/a1b2c3token now.",
     ]
     findings, _withheld, secret_bearing = researcher_adapter._retained_findings(
         verified_claims=[claim(text) for text in unsafe], **args
@@ -913,6 +916,9 @@ def test_retained_findings_withhold_claims_whose_text_embeds_a_secret():
         # Ordinary email addresses in prose must not be mistaken for userinfo.
         "Contact john.doe@example.test for access to the mirror.",
         "Email support@docs.example.test about the outage window.",
+        # Two hosts and an address in one sentence, none of them a capability
+        # link — the userinfo group must not reach across the whitespace.
+        "See //a.test and mail me@b.test about the rollout plan.",
         # Sentence colon, not a port — the punctuation trimmer takes it back off.
         "The docs are at www.example.test: it is the canonical mirror.",
         "The node answers at //[2606:4700:4700::1111] for that region.",

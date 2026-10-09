@@ -714,7 +714,10 @@ _HOST = r"[\w.-]"
 
 _SCHEME_RELATIVE_URL_IN_CLAIM_TEXT = re.compile(
     r"(?<![A-Za-z0-9:])//"
-    r"(?:[^\s/?#@]*@)?"
+    # Greedy to the LAST "@", which is what URL parsing treats as the
+    # authority separator. Excluding "@" here allowed only one, so
+    # "//user@department@evil.test/..." matched nothing at all.
+    r"(?:[^\s/?#]*@)?"
     # A bracketed IPv6 literal is as unambiguous an authority as a dotted host,
     # and _public_locator() already round-trips one — the two were simply
     # inconsistent.
