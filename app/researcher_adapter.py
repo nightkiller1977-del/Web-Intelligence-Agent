@@ -5,7 +5,7 @@ import logging
 import time
 import hashlib
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit, urlunsplit
 from typing import Dict, Any
 from gpt_researcher import GPTResearcher
 
@@ -637,7 +637,253 @@ def append_input_sources(op_id: str, input_chunks: list[dict], sources: list[dic
 _pending_ingest_tasks: set = set()
 
 
-def _schedule_outcome_ingest(client, result: Dict[str, Any], op_id: str, mode: str) -> None:
+def _public_locator(raw: str) -> str:
+    """Reduce a source locator to something safe to persist in shared memory.
+
+    Reduces a URL to its origin. A secret can ride in userinfo, in the query, or
+    in the path itself (a magic-link token, "/reset/<token>", ";jsessionid="),
+    and a local input's locator is an absolute filesystem path the operator may
+    never have cleared for external use (allowExternalUse unset or false).
+    is_safe_url() validates only scheme, host and resolved address, so none of
+    that is filtered upstream. Brain persists what it is handed and replays it
+    through recall_context() into later model prompts, so the redaction has to
+    happen before ingestion — there is no read-side filter to fall back on.
+
+    The cost is deliberate: provenance drops to publisher level, and two claims
+    from one site become indistinguishable by locator. The authoritative
+    research result keeps the full URL; only this shared-memory copy fails
+    closed.
+    """
+    try:
+        parts = urlsplit(raw)
+        if parts.scheme not in ("http", "https"):
+            # file:// and anything else: omit rather than publish a local path.
+            return ""
+        host = parts.hostname or ""
+        if not host:
+            return ""
+        if parts.query:
+            # The query can carry the secret (signature, token) or the resource
+            # identity (/article?id=123) and there is no general way to tell
+            # which. Stripping it would silently publish a locator for a
+            # different page, so omit it entirely: no provenance beats wrong
+            # provenance.
+            return ""
+        # .port parses lazily and raises on a malformed value like ":bad",
+        # which is_safe_url() does not inspect. It stays inside the guard
+        # because this runs while building the ingest task arguments: an
+        # escaping exception would fail research that already succeeded and
+        # was already saved, for the sake of an optional memory record.
+        port = parts.port
+    except ValueError:
+        return ""
+    # hostname strips the brackets an IPv6 literal needs, so put them back —
+    # otherwise the rebuilt locator cannot identify the evidence host.
+    netloc = f"[{host}]" if ":" in host else host
+    if port:
+        netloc = f"{netloc}:{port}"
+    # Origin only. The path is dropped for the same reason the query is: it can
+    # carry a capability credential — a magic-link token, /reset/<token>, a
+    # ";jsessionid=" path parameter — and there is no general way to tell one
+    # from an identifying segment like /article/12345. is_safe_url() validates
+    # the destination, never the path's contents. The authoritative research
+    # result still holds the complete URL; this is the shared-memory copy, so
+    # it fails closed to publisher-level provenance.
+    return urlunsplit((parts.scheme, netloc, "", "", ""))
+
+
+# "file:/path" is a valid single-slash URI (RFC 8089) and carries a local
+# path, so it is matched alongside the "scheme://" form. Scoped to file:
+# deliberately — a general "scheme:/" rule would swallow Windows paths
+# like C:/Users, which are ordinary subject matter here.
+_URL_IN_CLAIM_TEXT = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://\S+|\bfile:/\S+")
+
+# Scheme-relative form ("//example.com/reset/<token>"). Matched separately and
+# more strictly than the scheme-ful pattern: bare "//" also opens a line comment
+# in most languages this agent researches, so the authority must look like a
+# host — a dotted TLD or an explicit port — or "// see the notes below" would
+# cost a legitimate finding its retention. The lookbehind keeps it from
+# re-matching the "//" inside a scheme-ful URL.
+# A TLD label, punycode included: "com", "museum", "xn--p1ai". Hyphens are
+# allowed inside but never at the end. Defined once and shared by every matcher:
+# the last two rounds were each the same gap found in a different branch, so a
+# single definition is what keeps them from drifting apart again.
+# Unicode-aware: "com", "xn--p1ai" and "\u0440\u0444" are all valid TLD labels. [^\W\d_] is a
+# letter in any script, [^\W_] a letter or digit — so a label may contain
+# hyphens but never start or end with one.
+_TLD = r"[^\W\d_][\w-]*[^\W_]"
+# A host label, same alphabet.
+_HOST = r"[\w.-]"
+
+
+_SCHEME_RELATIVE_URL_IN_CLAIM_TEXT = re.compile(
+    r"(?<![A-Za-z0-9:])//"
+    # Greedy to the LAST "@", which is what URL parsing treats as the
+    # authority separator. Excluding "@" here allowed only one, so
+    # "//user@department@evil.test/..." matched nothing at all.
+    r"(?:[^\s/?#]*@)?"
+    # A bracketed IPv6 literal is as unambiguous an authority as a dotted host,
+    # and _public_locator() already round-trips one — the two were simply
+    # inconsistent.
+    r"(?:\[[0-9A-Fa-f:.]+\](?::\d{1,5})?"
+    # An unbracketed IPv4 literal has no alphabetic TLD and needs no port, so
+    # the host alternative below never matched it. Safe to accept here because
+    # the "//" prefix is what disambiguates: a bare "1.2.3.4" in prose is a
+    # version string, "//1.2.3.4" is an authority.
+    r"|\d{1,3}(?:\.\d{1,3}){3}(?::\d{1,5})?"
+    r"|" + _HOST + r"*(?:\." + _TLD + r"|:\d{1,5}))"
+    # ":" and ";" start a continuation too — a port, or a ";jsessionid=" path
+    # parameter. Without them the match stops at the bare authority, which then
+    # reduces to a safe origin and lets the credential-bearing tail through.
+    # A sentence colon ("at //example.test: it is fast") is handled by
+    # _trim_sentence_punctuation, which strips the trailing ":" back off.
+    r"(?:[:/?#;]\S*)?"
+)
+
+# Schemeless host-shaped links, limited to the two unambiguous shapes: a "www."
+# prefix, or a dotted host carrying a query string.
+#
+# A general "host.tld/path" rule is deliberately NOT used. "github.com/owner/repo"
+# is a Go module path, "docs.python.org/3/library/urllib.html" is an ordinary
+# citation, and this agent researches exactly that kind of text — the broad form
+# would withhold legitimate findings far more often than it caught a capability
+# link, and silently shrinking retention is its own failure. The residue that
+# leaves (a schemeless token link with neither "www." nor a query) is real and
+# is not covered here.
+_SCHEMELESS_URL_IN_CLAIM_TEXT = re.compile(
+    r"(?<![/@\w.])(?:"
+    r"www\." + _HOST + r"+\." + _TLD + r"(?:[:/?#;@]\S*)?"
+    r"|" + _HOST + r"+\." + _TLD + r"(?:[@/]\S*)?\?\S+"
+    r")"
+)
+
+# Well-known credential formats, matched by their issuer-assigned prefix and
+# length. Deliberately prefix-anchored rather than entropy-based: this is a
+# technical research agent, so commit SHAs, UUIDs, digests and base64 payloads
+# are ordinary subject matter, and a generic high-entropy rule would withhold
+# legitimate findings far more often than it caught a secret.
+_CREDENTIAL_PATTERNS = (
+    re.compile(r"\b[sp]k-[A-Za-z0-9_-]{16,}"),                                      # OpenAI-style
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}"),                                    # GitHub token
+    re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}"),                                  # GitHub fine-grained PAT
+    re.compile(r"\bglpat-[A-Za-z0-9_-]{16,}"),                                      # GitLab PAT
+    re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}"),                                  # Slack
+    re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"),                                   # AWS access key id
+    re.compile(r"\bAIza[0-9A-Za-z_-]{30,}"),                                        # Google API key
+    re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"),    # JWT
+    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),                              # PEM private key
+)
+
+
+_CLOSERS = {")": "(", "]": "[", "}": "{"}
+
+
+def _trim_sentence_punctuation(candidate: str) -> str:
+    """Strip trailing sentence punctuation from a URL match.
+
+    A closing bracket is removed only when it is unbalanced, so "(see
+    https://example.test/a)" loses its ")" while "//[2606:4700:4700::1111]"
+    keeps the "]" that closes its IPv6 literal. A blanket rstrip ate that
+    bracket and turned a valid bare origin into an unparseable string, which
+    then failed closed and withheld the claim.
+    """
+    while candidate:
+        last = candidate[-1]
+        if last in ".,;:!?\"'":
+            candidate = candidate[:-1]
+        elif last in _CLOSERS and candidate.count(last) > candidate.count(_CLOSERS[last]):
+            candidate = candidate[:-1]
+        else:
+            break
+    return candidate
+
+
+def _claim_text_carries_a_secret(text: str) -> bool:
+    """A report sentence can quote a presigned URL, magic link or session id
+    copied from an authenticated page.
+
+    _public_locator() sanitizes only the separate source locator, so the claim
+    text needs the same policy — applied by *reuse*, so the two cannot drift
+    apart as that policy changes. A URL embedded in a claim is cleared only when
+    it already equals what _public_locator() would reduce it to: a bare origin.
+
+    Anything carrying userinfo, a query, a fragment or a path makes the whole
+    claim ineligible rather than being rewritten in place, because silently
+    editing a verified claim is exactly what the truncation rule forbids.
+
+    A bare credential outside any URI ("The API key is sk-proj-...") is caught
+    separately, by matching well-known issuer prefixes.
+
+    Known limit, stated rather than papered over: prefix matching cannot be
+    complete. A novel, internal, or unprefixed secret still passes, so this
+    narrows the exposure — it does not close it. Treat the retained record as
+    reduced-risk, never as guaranteed secret-free.
+    """
+    for match in _URL_IN_CLAIM_TEXT.findall(text):
+        candidate = _trim_sentence_punctuation(match)
+        if _public_locator(candidate) != candidate:
+            return True
+    for match in _SCHEME_RELATIVE_URL_IN_CLAIM_TEXT.findall(text):
+        # Resolved against a scheme so the same locator policy decides it:
+        # "//host" survives as a bare origin, "//host/reset/<token>" does not.
+        candidate = "https:" + _trim_sentence_punctuation(match)
+        if _public_locator(candidate) != candidate:
+            return True
+    for match in _SCHEMELESS_URL_IN_CLAIM_TEXT.findall(text):
+        candidate = "https://" + _trim_sentence_punctuation(match)
+        if _public_locator(candidate) != candidate:
+            return True
+    return any(pattern.search(text) for pattern in _CREDENTIAL_PATTERNS)
+
+
+def _retained_findings(verified_claims: list, evidence: list, sources: list, allow_external_inputs: bool = False) -> tuple[list[dict], int, int]:
+    """Pair each verified claim with the URL of the source its evidence came from.
+
+    A claim records evidence ids, not a source, so the locator is resolved
+    claim -> evidence -> source. A claim whose evidence resolves to no locator is
+    still retained: the finding is what makes the record recallable, and dropping
+    it for want of a URL would discard verified knowledge.
+
+    Local-source findings are withheld unless inputs.allowExternalUse was true.
+    append_input_sources() feeds document and repository passages into claim
+    verification regardless of that flag, so a report sentence can be supported
+    by a confidential local passage. Brain is shared memory and recall_context()
+    can replay it into an external model prompt, so retention needs the same
+    consent the external research path required. An unresolved source type
+    cannot be shown to be web either, so it fails closed with the rest.
+
+    Returns (findings, withheld_count) — the count is recorded in the artifact
+    so the gap between verified claims and retained findings is never silent.
+    """
+    provenance_by_source = {
+        source.get("id"): (
+            _public_locator(source.get("url") or source.get("uri") or ""),
+            str(source.get("sourceType") or ""),
+        )
+        for source in sources
+    }
+    source_by_evidence = {item.get("id"): item.get("sourceId") for item in evidence}
+    findings, withheld, secret_bearing = [], 0, 0
+    for claim in verified_claims:
+        locator, source_type = "", ""
+        for evidence_id in claim.get("evidenceIds", []):
+            locator, source_type = provenance_by_source.get(source_by_evidence.get(evidence_id), ("", ""))
+            # A local document redacts to no locator but still has a type worth
+            # carrying, so settle on the first evidence that resolves to either.
+            if locator or source_type:
+                break
+        if not allow_external_inputs and source_type != "web":
+            withheld += 1
+            continue
+        text = claim.get("text", "")
+        if _claim_text_carries_a_secret(text):
+            secret_bearing += 1
+            continue
+        findings.append({"text": text, "url": locator, "sourceType": source_type})
+    return findings, withheld, secret_bearing
+
+
+def _schedule_outcome_ingest(client, result: Dict[str, Any], op_id: str, mode: str, allow_external_inputs: bool = False) -> None:
     """Persist an optional Brain outcome best-effort, off the critical path.
 
     The task is kept referenced so it is not garbage-collected mid-flight and
@@ -650,16 +896,23 @@ def _schedule_outcome_ingest(client, result: Dict[str, Any], op_id: str, mode: s
     # "partially-supported", so counting that status would ingest a fabricated
     # verification success. "supported" against a real passage (or any status
     # backed by an evidence id) is the independently evidenced shape.
-    verified_claim_count = sum(
-        1 for claim in result.get("claims", [])
+    verified_claims = [
+        claim for claim in result.get("claims", [])
         if claim.get("verificationStatus") == "supported" and claim.get("evidenceIds")
-    )
+    ]
     sources = result.get("sources", [])
+    findings, withheld, secret_bearing = _retained_findings(
+        verified_claims, result.get("evidence", []), sources, allow_external_inputs
+    )
     task = asyncio.create_task(asyncio.to_thread(
         client.ingest_verified_outcome,
         operation_id=op_id, status=result["status"], mode=mode,
-        source_count=len(sources), verified_claim_count=verified_claim_count,
+        # The counters stay whole: they are aggregate and carry no content, so
+        # withholding a finding must not also understate what was verified.
+        source_count=len(sources), verified_claim_count=len(verified_claims),
         source_types=[source.get("sourceType", "") for source in sources],
+        findings=findings, withheld_findings=withheld,
+        secret_bearing_findings=secret_bearing,
     ))
     _pending_ingest_tasks.add(task)
     task.add_done_callback(_pending_ingest_tasks.discard)
@@ -674,7 +927,7 @@ async def flush_pending_ingest_tasks(timeout: float = 6.0) -> int:
     return len(pending)
 
 
-def schedule_outcome_ingest(result: Dict[str, Any], op_id: str, mode: str) -> bool:
+def schedule_outcome_ingest(result: Dict[str, Any], op_id: str, mode: str, inputs: Dict[str, Any] | None = None) -> bool:
     """Schedule the optional Brain outcome ingest once the result is durable.
 
     Called by the caller after a successful ``storage.save_operation`` so a
@@ -686,7 +939,10 @@ def schedule_outcome_ingest(result: Dict[str, Any], op_id: str, mode: str) -> bo
     client = brain_memory_client()
     if not client:
         return False
-    _schedule_outcome_ingest(client, result, op_id, mode)
+    # Consent is read from the request's own inputs, not from the result:
+    # the result never carried the flag, which is how local passages reached
+    # retention unchecked in the first place.
+    _schedule_outcome_ingest(client, result, op_id, mode, (inputs or {}).get("allowExternalUse") is True)
     return True
 
 
@@ -731,11 +987,23 @@ async def conduct_web_research(
     # search would reject must not reach the report.
     profile_rules = PROFILE_DOMAINS.get(profile) or {}
     profile_restricts_domains = bool(profile_rules.get("allowed"))
+    # Freshness is the same problem on a different axis. A retained record keeps
+    # the claim, origin and source type but no publication date, and
+    # recall_context() supplies none either, so "exclude sources published after
+    # <until>" cannot be enforced against recalled text — the model would be
+    # asked to honour a cutoff it has no dates for. Same remedy as the domain
+    # case: withhold recall rather than feed unfiltered history through a filter
+    # it cannot satisfy.
+    freshness_constrained = any(
+        str((freshness or {}).get(key) or "").strip()
+        for key in ("since", "until", "maxAgeDays")
+    )
     if (
         memory_client
         and settings.BRAIN_MEMORY_CONTEXT_ENABLED
         and not has_explicit_domain_allowlist
         and not profile_restricts_domains
+        and not freshness_constrained
     ):
         remaining = max(0.0, max_duration - (time.time() - start_time))
         try:

@@ -1,3 +1,4 @@
+import json
 import os
 
 import pytest
@@ -644,20 +645,321 @@ async def test_schedule_outcome_ingest_runs_only_after_durable_save(monkeypatch)
 
     result = {
         "status": "completed",
-        "sources": [{"sourceType": "web"}],
+        "sources": [{"id": "src-1", "sourceType": "web", "url": "https://example.test/a"}],
+        "evidence": [{"id": "ev-1", "sourceId": "src-1"}, {"id": "ev-2", "sourceId": "src-1"}],
         "claims": [
-            {"verificationStatus": "supported", "evidenceIds": ["ev-1"]},
-            {"verificationStatus": "supported", "evidenceIds": []},
-            {"verificationStatus": "partially-supported", "evidenceIds": ["ev-2"]},
+            {"text": "supported claim", "verificationStatus": "supported", "evidenceIds": ["ev-1"]},
+            {"text": "no evidence", "verificationStatus": "supported", "evidenceIds": []},
+            {"text": "report-derived", "verificationStatus": "partially-supported", "evidenceIds": ["ev-2"]},
         ],
     }
 
     assert researcher_adapter.schedule_outcome_ingest(result, "test-op", "standard") is True
     assert await researcher_adapter.flush_pending_ingest_tasks() == 1
+    # Only the independently evidenced claim is retained as knowledge, and it
+    # carries the locator of the source its evidence came from.
     assert spy.ingested == [{
         "operation_id": "test-op", "status": "completed", "mode": "standard",
         "source_count": 1, "verified_claim_count": 1, "source_types": ["web"],
+        "findings": [{"text": "supported claim", "url": "https://example.test", "sourceType": "web"}],
+        "withheld_findings": 0,
+        "secret_bearing_findings": 0,
     }]
+
+
+@pytest.mark.anyio
+async def test_schedule_outcome_ingest_reads_consent_from_the_request_inputs(monkeypatch):
+    """The gate is only worth anything if the request's own allowExternalUse
+    actually reaches it. The flag is computed inside conduct_web_research() and
+    is absent from the result dict, which is how local passages reached
+    retention unchecked — so the wiring itself needs covering, not just the gate."""
+    class BrainMemorySpy:
+        def __init__(self):
+            self.ingested = []
+
+        def ingest_verified_outcome(self, **kwargs):
+            self.ingested.append(kwargs)
+            return True
+
+    result = {
+        "status": "completed",
+        "sources": [{"id": "src-doc", "sourceType": "document", "url": "", "uri": "file:///home/someone/design.md"}],
+        "evidence": [{"id": "ev-1", "sourceId": "src-doc"}],
+        "claims": [{"text": "a confidential local claim", "verificationStatus": "supported", "evidenceIds": ["ev-1"]}],
+    }
+
+    withheld_spy = BrainMemorySpy()
+    monkeypatch.setattr(researcher_adapter, "brain_memory_client", lambda: withheld_spy)
+    assert researcher_adapter.schedule_outcome_ingest(result, "test-op", "standard") is True
+    await researcher_adapter.flush_pending_ingest_tasks()
+    assert withheld_spy.ingested[0]["findings"] == []
+    assert withheld_spy.ingested[0]["withheld_findings"] == 1
+    # The content must not reach Brain in any field.
+    assert "confidential" not in json.dumps(withheld_spy.ingested[0])
+    # The counter is aggregate and carries no content, so it stays whole.
+    assert withheld_spy.ingested[0]["verified_claim_count"] == 1
+
+    consented_spy = BrainMemorySpy()
+    monkeypatch.setattr(researcher_adapter, "brain_memory_client", lambda: consented_spy)
+    assert researcher_adapter.schedule_outcome_ingest(
+        result, "test-op", "standard", inputs={"allowExternalUse": True}
+    ) is True
+    await researcher_adapter.flush_pending_ingest_tasks()
+    assert consented_spy.ingested[0]["findings"] == [
+        {"text": "a confidential local claim", "url": "", "sourceType": "document"}
+    ]
+    assert consented_spy.ingested[0]["withheld_findings"] == 0
+
+
+def test_retained_findings_resolve_locator_through_evidence():
+    """A claim names evidence ids, not a source, so the locator is a two-hop join."""
+    findings = researcher_adapter._retained_findings(
+        verified_claims=[
+            {"text": "has http locator", "evidenceIds": ["ev-missing", "ev-2"]},
+            {"text": "from a local document", "evidenceIds": ["ev-3"]},
+            {"text": "unresolvable", "evidenceIds": ["ev-nope"]},
+        ],
+        evidence=[
+            {"id": "ev-2", "sourceId": "src-1"},
+            {"id": "ev-3", "sourceId": "src-2"},
+        ],
+        sources=[
+            {"id": "src-1", "url": "https://example.test/a", "sourceType": "web"},
+            # A local document carries its locator on uri; url stays empty.
+            {"id": "src-2", "url": "", "uri": "file:///home/someone/private/notes.md", "sourceType": "document"},
+        ],
+        # Consent granted so this test covers locator resolution across source
+        # types; the consent gate itself is covered separately below.
+        allow_external_inputs=True,
+    )
+
+    assert findings == (
+        [
+            {"text": "has http locator", "url": "https://example.test", "sourceType": "web"},
+            # The claim is still retained, but the local path is not published
+            # into a shared artifact. The type survives so the finding is not
+            # later recalled as web evidence.
+            {"text": "from a local document", "url": "", "sourceType": "document"},
+            {"text": "unresolvable", "url": "", "sourceType": ""},
+        ],
+        0,
+        0,
+    )
+
+
+def test_retained_findings_withhold_local_evidence_without_consent():
+    """append_input_sources() verifies claims against local passages whether or
+    not inputs.allowExternalUse was true, so a report sentence can be supported
+    by confidential local content. Brain is shared memory that recall_context()
+    can replay into an external prompt, so retention needs that same consent."""
+    args = dict(
+        verified_claims=[
+            {"text": "from the web", "evidenceIds": ["ev-1"]},
+            {"text": "from a confidential design note", "evidenceIds": ["ev-2"]},
+            {"text": "from a private repository", "evidenceIds": ["ev-3"]},
+            {"text": "source type never resolved", "evidenceIds": ["ev-none"]},
+        ],
+        evidence=[
+            {"id": "ev-1", "sourceId": "src-web"},
+            {"id": "ev-2", "sourceId": "src-doc"},
+            {"id": "ev-3", "sourceId": "src-repo"},
+        ],
+        sources=[
+            {"id": "src-web", "url": "https://example.test/a", "sourceType": "web"},
+            {"id": "src-doc", "url": "", "uri": "file:///home/someone/design.md", "sourceType": "document"},
+            {"id": "src-repo", "url": "", "uri": "file:///home/someone/repo", "sourceType": "repository"},
+        ],
+    )
+
+    findings, withheld, _secret = researcher_adapter._retained_findings(**args)
+    # Fail closed: only the web-sourced claim survives, and an unresolved type
+    # cannot be shown to be web either.
+    assert findings == [{"text": "from the web", "url": "https://example.test", "sourceType": "web"}]
+    assert withheld == 3
+    assert not any("confidential" in f["text"] or "private repository" in f["text"] for f in findings)
+
+    permitted, withheld_with_consent, _ = researcher_adapter._retained_findings(**args, allow_external_inputs=True)
+    assert len(permitted) == 4
+    assert withheld_with_consent == 0
+
+
+def test_public_locator_reduces_to_origin_and_omits_ambiguous_identity():
+    """Brain persists what it is handed and replays it into later prompts, so a
+    locator is reduced to its origin before ingestion: a secret can ride in
+    userinfo, in the query, or in the path itself, and nothing upstream
+    sanitizes any of them."""
+    redact = researcher_adapter._public_locator
+
+    assert redact("https://user:s3cr3t@example.test/doc") == "https://example.test"
+    assert redact("https://example.test/doc#fragment") == "https://example.test"
+    assert redact("https://example.test:8443/doc") == "https://example.test:8443"
+    # Path-borne capability credentials: a magic-link token and a path
+    # parameter. Neither is distinguishable from an identifying segment like
+    # /article/12345, so the path goes entirely.
+    assert redact("https://example.test/reset/a1b2c3d4e5f6secrettoken") == "https://example.test"
+    assert redact("https://example.test/app;jsessionid=A1B2C3D4E5") == "https://example.test"
+    assert redact("https://example.test/article/12345") == "https://example.test"
+    # A query can carry the secret OR the resource identity, and there is no
+    # general way to tell which. Stripping it would publish a locator for a
+    # different page, so the locator is omitted instead — no provenance beats
+    # wrong provenance.
+    assert redact("https://example.test/doc?X-Amz-Signature=deadbeef&token=abc") == ""
+    assert redact("https://example.test/article?id=123") == ""
+    # Non-http schemes carry local filesystem paths; omit them entirely.
+    assert redact("file:///home/someone/private/notes.md") == ""
+    assert redact("") == ""
+    assert redact("not a url") == ""
+
+
+def test_retained_findings_withhold_claims_whose_text_embeds_a_secret():
+    """A report sentence can quote a presigned URL, magic link or session id
+    copied from an authenticated page. _public_locator() only sanitizes the
+    separate locator, so the claim text is checked against the same policy."""
+    def claim(text):
+        return {"text": text, "evidenceIds": ["ev-1"]}
+
+    args = dict(
+        evidence=[{"id": "ev-1", "sourceId": "src-1"}],
+        sources=[{"id": "src-1", "url": "https://example.test/a", "sourceType": "web"}],
+    )
+
+    unsafe = [
+        "Download it from https://example.test/f?X-Amz-Signature=deadbeef to proceed.",
+        "The reset link is https://example.test/reset/a1b2c3d4e5f6secrettoken for that account.",
+        "Use https://user:s3cr3t@example.test/admin to reach the console.",
+        "The session is at https://example.test/app;jsessionid=A1B2C3D4E5 right now.",
+        "The local copy lives at file:///home/someone/private/notes.md on disk.",
+        # Scheme-relative: a real URL form the scheme-ful pattern never saw.
+        "Follow //example.test/reset/a1b2c3d4e5f6secrettoken to finish setup.",
+        "Fetch //example.test/f?signature=deadbeef before the link expires.",
+        # Schemeless, in the two unambiguous shapes.
+        "Open www.example.test/reset/a1b2c3d4e5f6secrettoken to continue.",
+        "Retrieve example.test/f?signature=deadbeef while it is valid.",
+        # Scheme-relative with a bracketed IPv6 authority.
+        "Pull //[2606:4700:4700::1111]/f?X-Amz-Signature=deadbeef now.",
+        "Grab //8.8.8.8/f?signature=deadbeef from the mirror.",
+        # Query immediately after the host, no path separator.
+        "Use example.test?signature=deadbeef before it rotates.",
+        # Non-default port: the matcher must not stop at the bare authority and
+        # call the rest safe.
+        "Open www.example.test:8443/reset/a1b2c3d4e5f6token to continue.",
+        "Open //www.example.test:8443/reset/a1b2c3d4e5f6token to continue.",
+        "Session at www.example.test;jsessionid=A1B2C3D4E5 right now.",
+        # Punycode TLD: the label contains hyphens, so a {2,} alphabetic TLD
+        # matched only "example.xn" and called the rest safe.
+        "Follow //example.xn--p1ai/reset/a1b2c3d4e5token to finish.",
+        "Open www.example.xn--p1ai/reset/a1b2c3d4e5token to finish.",
+        # Unicode IDN, not punycode-encoded.
+        "Follow //пример.рф/reset/a1b2c3d4e5token to finish.",
+        "Open www.пример.рф/f?signature=deadbeef now.",
+        # Userinfo: the real host is after the "@", so matching only the part
+        # before it approves the wrong origin.
+        "Open www.example.test@evil.test/reset/a1b2c3token now.",
+        "Fetch example.test@evil.test/f?signature=deadbeef now.",
+        # Userinfo containing its own "@": URL parsing treats the LAST one as
+        # the authority separator, so the real host is still evil.test.
+        "Follow //user@department@evil.test/reset/a1b2c3token now.",
+        # Single-slash file URI (RFC 8089) — valid, and carries a local path.
+        "The copy is at file:/home/someone/private/notes.txt here.",
+    ]
+    findings, _withheld, secret_bearing = researcher_adapter._retained_findings(
+        verified_claims=[claim(text) for text in unsafe], **args
+    )
+    assert findings == []
+    assert secret_bearing == len(unsafe)
+
+    # Bare credentials outside any URI, matched by issuer prefix. Assembled at
+    # runtime from split halves: the repo's pre-commit secret guard scans the
+    # staged diff for these very shapes, and a literal fixture would — rightly —
+    # trip it. Neither half matches on its own.
+    def synthetic(prefix, body):
+        return prefix + body
+
+    bare = [
+        f"The API key is {synthetic('sk-', 'proj-A1b2C3d4E5f6G7h8I9j0K1l2M3n4')} for that project.",
+        f"Authenticate with {synthetic('ghp', '_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6')} as the token.",
+        f"The runner uses {synthetic('glpat-', 'A1b2C3d4E5f6G7h8')} to register itself.",
+        f"It posts via {synthetic('xoxb', '-1234567890-abcdefghij')} on each run.",
+        f"The access key id is {synthetic('AKIA', 'IOSFODNN7EXAMPLE')} in that account.",
+        f"Google billing uses {synthetic('AIza', 'SyA1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7')} here.",
+        f"The bearer is {synthetic('eyJ', 'hbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dBjftJeZ4CVPmB92K27uhbUJU1p1r')} by default.",
+        f"The file begins {synthetic('-----BEGIN RSA PRIVATE', ' KEY-----')} on line one.",
+    ]
+    _, _, bare_secret = researcher_adapter._retained_findings(
+        verified_claims=[claim(text) for text in bare], **args
+    )
+    assert bare_secret == len(bare)
+
+    safe = [
+        "urllib3 v2 requires OpenSSL 1.1.1 or newer for HTTPS support.",
+        "The documentation is published at https://example.test for this release.",
+        # Ordinary subject matter for a research agent — prefix anchoring is
+        # what keeps these from being withheld as if they were credentials.
+        "The regression landed in commit 9f8e7d6c5b4a3929180706050403020100abcdef upstream.",
+        "The operation id is 3f2504e0-4f89-11d3-9a0c-0305e82c3301 in the ledger.",
+        "The digest is sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 there.",
+        # Bare "//" opens a line comment in most languages this agent
+        # researches; requiring a host-shaped authority is what keeps these
+        # from being withheld as if they were scheme-relative URLs.
+        "The guard is skipped when // the compiler strips it during inlining.",
+        "Write //TODO above the call to mark it for the next pass.",
+        # A scheme-relative bare origin carries no path or query to leak.
+        "The CDN is reachable at //example.test for every region.",
+        # A general host.tld/path rule would withhold all of these. They are
+        # ordinary subject matter for a research agent, which is why the
+        # schemeless matcher is limited to www. and query-bearing forms.
+        "The driver lives at github.com/owner/repo in the module graph.",
+        "See docs.python.org/3/library/urllib.html for the parsing rules.",
+        "The entry point is app/researcher_adapter.py in that package.",
+        "A bare www.example.test carries no path or query to leak.",
+        "A bare www.example.test:8443 is still just an origin.",
+        "A bare //example.xn--p1ai is still just an origin.",
+        "A bare //пример.рф is still just an origin.",
+        # Ordinary email addresses in prose must not be mistaken for userinfo.
+        "Contact john.doe@example.test for access to the mirror.",
+        "Email support@docs.example.test about the outage window.",
+        # Two hosts and an address in one sentence, none of them a capability
+        # link — the userinfo group must not reach across the whitespace.
+        "See //a.test and mail me@b.test about the rollout plan.",
+        # A general "scheme:/" rule would swallow these; file: is scoped.
+        "The build output lands in C:/Users/build/out on Windows.",
+        # Sentence colon, not a port — the punctuation trimmer takes it back off.
+        "The docs are at www.example.test: it is the canonical mirror.",
+        "The node answers at //[2606:4700:4700::1111] for that region.",
+        "The resolver is reachable at //8.8.8.8 from that subnet.",
+        # A dotted quad in prose is a version string, not an authority; the
+        # "//" prefix is what disambiguates the two.
+        "The release is 1.2.3.4 in that distribution channel.",
+    ]
+    kept, _withheld2, none_secret = researcher_adapter._retained_findings(
+        verified_claims=[claim(text) for text in safe], **args
+    )
+    assert [f["text"] for f in kept] == safe
+    assert none_secret == 0
+
+
+def test_public_locator_keeps_ipv6_brackets():
+    """hostname strips the brackets an IPv6 literal needs; without them the
+    rebuilt locator cannot identify the evidence page."""
+    redact = researcher_adapter._public_locator
+
+    assert redact("https://[2606:4700:4700::1111]/doc") == "https://[2606:4700:4700::1111]"
+    assert redact("https://[2606:4700:4700::1111]:8443/doc") == "https://[2606:4700:4700::1111]:8443"
+
+
+def test_retained_findings_survive_a_malformed_port():
+    """urlsplit parses .port lazily and raises on ':bad', which is_safe_url()
+    never inspects. This runs while building the ingest task arguments, so an
+    escaping ValueError would fail research that already succeeded and was
+    already saved — for the sake of an optional memory record."""
+    findings = researcher_adapter._retained_findings(
+        verified_claims=[{"text": "claim from a badly formed locator", "evidenceIds": ["ev-1"]}],
+        evidence=[{"id": "ev-1", "sourceId": "src-1"}],
+        sources=[{"id": "src-1", "url": "https://example.com:bad/a", "sourceType": "web"}],
+    )
+
+    # Unusable locator, not an exception — and the claim and its type survive.
+    assert findings == ([{"text": "claim from a badly formed locator", "url": "", "sourceType": "web"}], 0, 0)
 
 
 @pytest.mark.anyio
@@ -708,6 +1010,87 @@ async def test_recall_disabled_for_profile_specific_domain_allowlist(monkeypatch
 
     assert result["status"] == "completed"
     assert recalled["called"] is False
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("freshness", [
+    {"until": "2026-01-01"},
+    {"since": "2026-01-01"},
+    {"maxAgeDays": "14"},
+])
+async def test_recall_disabled_when_freshness_is_constrained(monkeypatch, freshness):
+    """A retained record keeps the claim, origin and source type but no
+    publication date, and recall_context() supplies none either — so a hard
+    "exclude sources published after <until>" cutoff cannot be enforced against
+    recalled text. Same remedy as the domain allowlist: withhold recall."""
+    recalled = {"called": False}
+
+    class BrainMemorySpy:
+        def recall_context(self, query):
+            recalled["called"] = True
+            return "UNTRUSTED HISTORICAL EVIDENCE — should not appear"
+
+        def ingest_verified_outcome(self, **kwargs):
+            return False
+
+    spy = BrainMemorySpy()
+    monkeypatch.setattr(researcher_adapter.settings, "BRAIN_MEMORY_CONTEXT_ENABLED", True)
+    monkeypatch.setattr(researcher_adapter, "GPTResearcher", FakeCompletedGPTResearcher)
+    monkeypatch.setattr(researcher_adapter, "brain_memory_client", lambda: spy)
+    monkeypatch.setattr(researcher_adapter, "is_safe_url", lambda url, profile: True)
+    reporter = MagicMock()
+    reporter.report = AsyncMock()
+
+    result = await conduct_web_research(
+        op_id="test-op",
+        query="test query",
+        mode="standard",
+        profile="general",
+        limits={"maximumDurationSeconds": 30, "maximumSearches": 3, "maximumPages": 5, "maximumSources": 5},
+        source_policy=None,
+        freshness=freshness,
+        inputs=None,
+        model_provider=None,
+        model_name=None,
+        require_claim_verification=False,
+        reporter=reporter,
+        headers={},
+    )
+
+    assert result["status"] == "completed"
+    assert recalled["called"] is False
+
+
+@pytest.mark.anyio
+async def test_recall_still_runs_without_freshness_constraints(monkeypatch):
+    """The freshness gate must not disable recall outright — an empty or absent
+    freshness dict still permits it, or the retention this PR adds is dead."""
+    recalled = {"called": False}
+
+    class BrainMemorySpy:
+        def recall_context(self, query):
+            recalled["called"] = True
+            return ""
+
+        def ingest_verified_outcome(self, **kwargs):
+            return False
+
+    spy = BrainMemorySpy()
+    monkeypatch.setattr(researcher_adapter.settings, "BRAIN_MEMORY_CONTEXT_ENABLED", True)
+    monkeypatch.setattr(researcher_adapter, "GPTResearcher", FakeCompletedGPTResearcher)
+    monkeypatch.setattr(researcher_adapter, "brain_memory_client", lambda: spy)
+    monkeypatch.setattr(researcher_adapter, "is_safe_url", lambda url, profile: True)
+    reporter = MagicMock()
+    reporter.report = AsyncMock()
+
+    await conduct_web_research(
+        op_id="test-op", query="test query", mode="standard", profile="general",
+        limits={"maximumDurationSeconds": 30, "maximumSearches": 3, "maximumPages": 5, "maximumSources": 5},
+        source_policy=None, freshness={}, inputs=None, model_provider=None, model_name=None,
+        require_claim_verification=False, reporter=reporter, headers={},
+    )
+
+    assert recalled["called"] is True
 
 
 @pytest.mark.anyio

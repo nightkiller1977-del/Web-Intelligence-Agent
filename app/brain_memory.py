@@ -22,6 +22,11 @@ _SEARCH_DOMAIN = "brain-memory-http-search-v1"
 _INGEST_DOMAIN = "brain-memory-http-ingest-v1"
 _MAX_RESPONSE_BYTES = 64 * 1024
 _MAX_CONTEXT_BYTES = 6000
+_MAX_RETAINED_FINDINGS = 10
+_MAX_FINDING_BYTES = 400
+_MAX_SOURCE_URL_BYTES = 300
+_MAX_SOURCE_TYPE_BYTES = 40
+_MAX_INGEST_TEXT_BYTES = 8000
 
 
 def _truncate_utf8(value: str, maximum_bytes: int) -> str:
@@ -34,6 +39,124 @@ def _truncate_utf8(value: str, maximum_bytes: int) -> str:
         result.append(character)
         used += size
     return "".join(result)
+
+
+def _bounded_lines(raw: str, maximum_bytes: int, indent: str = "") -> str:
+    """Fit text to a byte budget by keeping whole lines.
+
+    The retained artifact is multi-line prose with one finding per line, so
+    collapsing it and cutting at a byte offset would slice the last finding
+    mid-sentence — the same inversion the ingest side avoids by dropping whole
+    findings. A line that does not fit is dropped, never shortened.
+    """
+    kept: list[str] = []
+    used = 0
+    for line in raw.splitlines():
+        line = " ".join(line.split())
+        if not line:
+            continue
+        candidate = indent + line
+        size = len(candidate.encode("utf-8")) + 1
+        if used + size > maximum_bytes:
+            break
+        kept.append(candidate)
+        used += size
+    return "\n".join(kept)
+
+
+def _render_outcome_text(
+    *,
+    status: str,
+    mode: str,
+    source_count: int,
+    verified_claim_count: int,
+    source_types: list[str],
+    findings: list[dict],
+    captured_at: str,
+    withheld_findings: int = 0,
+    secret_bearing_findings: int = 0,
+) -> str:
+    """Render the outcome as prose so Brain's embeddings can match it later.
+
+    The counters alone embed to nothing useful, so a repeat of the same question
+    never recalled a prior answer and re-researched it. The claim text is what
+    makes the record semantically recallable; the counters stay on the trailing
+    line so nothing that read them is lost. Retained text is source-derived
+    (web, document or repository) — the recall path is what marks it untrusted,
+    so it must not be replayed as instructions.
+    """
+    header = f"Web research outcome: {status} (mode={mode})."
+    observed = ", ".join(sorted({str(value) for value in source_types if value})) or "none"
+    footer = (
+        f"Sources consulted: {max(0, int(source_count))} ({observed}). "
+        f"Verified claims: {max(0, int(verified_claim_count))}."
+    )
+    # "Source-supported", never "true": verification is passage token overlap
+    # plus a negation check. It establishes that a source said this — not that
+    # the statement is correct, and not that the source is reliable. Stamped
+    # with retrieval time, since even that is only evidence of what was said
+    # then.
+    heading = f"Source-supported findings (passage-matched, not fact-checked), retrieved {captured_at}:"
+
+    candidates, omitted = [], 0
+    for finding in findings[:_MAX_RETAINED_FINDINGS]:
+        text = " ".join(str(finding.get("text") or "").split())
+        if not text:
+            continue
+        if len(text.encode("utf-8")) > _MAX_FINDING_BYTES:
+            # Cutting a claim can strip a trailing qualifier or negation
+            # ("...however, this is not approved") and invert what the source
+            # actually supported. A mangled claim is worse than an absent one.
+            omitted += 1
+            continue
+        url = " ".join(str(finding.get("url") or "").split())
+        if len(url.encode("utf-8")) > _MAX_SOURCE_URL_BYTES:
+            # Same reasoning: a cut path segment or percent-escape yields an
+            # invalid URL, or a valid one for a different resource.
+            url = ""
+        source_type = " ".join(str(finding.get("sourceType") or "").split())
+        if len(source_type.encode("utf-8")) > _MAX_SOURCE_TYPE_BYTES:
+            source_type = ""
+        # Provenance is per-finding because a run can mix web, document and
+        # repository sources; a blanket "web-sourced" label would misreport
+        # first-party material, and a redacted locator leaves the type as the
+        # only provenance left to carry.
+        provenance = [value for value in (source_type, url) if value]
+        candidates.append(f"- {text}" + (f" [{': '.join(provenance)}]" if provenance else ""))
+
+    # Fit by dropping whole findings rather than truncating the joined text,
+    # which would cut the last claim mid-sentence for the same reason.
+    used = len(header.encode("utf-8")) + len(footer.encode("utf-8")) + 2
+    kept = []
+    if candidates:
+        used += len(heading.encode("utf-8")) + 1
+        for line in candidates:
+            size = len(line.encode("utf-8")) + 1
+            if used + size > _MAX_INGEST_TEXT_BYTES:
+                omitted += 1
+                continue
+            kept.append(line)
+            used += size
+
+    lines = [header]
+    if kept:
+        lines.append(heading)
+        lines.extend(kept)
+    notes = []
+    if omitted:
+        notes.append(f"{omitted} finding(s) omitted rather than truncated: shortening a claim or locator can change its meaning.")
+    if withheld_findings > 0:
+        # The counters below still report every verified claim, so without this
+        # line the gap between them and the findings listed would be unexplained.
+        notes.append(f"{withheld_findings} finding(s) withheld: local-source evidence without explicit external-use consent.")
+    if secret_bearing_findings > 0:
+        notes.append(f"{secret_bearing_findings} finding(s) withheld: claim text embedded a credential-bearing URL.")
+    for note in notes:
+        if used + len(note.encode("utf-8")) + 1 <= _MAX_INGEST_TEXT_BYTES:
+            lines.append(note)
+            used += len(note.encode("utf-8")) + 1
+    lines.append(footer)
+    return "\n".join(lines)
 
 
 class _NoRedirect(HTTPRedirectHandler):
@@ -117,7 +240,7 @@ class BrainMemoryClient:
         for result in results[:3]:
             if not isinstance(result, dict) or not isinstance(result.get("text"), str):
                 continue
-            text = _truncate_utf8(" ".join(result["text"].split()), 1600)
+            text = _bounded_lines(result["text"], 1600)
             if not text:
                 continue
             provenance = result.get("provenance") if isinstance(result.get("provenance"), dict) else {}
@@ -127,11 +250,14 @@ class BrainMemoryClient:
             # Brain artifact instead of only a coarse sourceType.
             artifact_id = provenance.get("artifactId") or provenance.get("sourceId")
             reference = f" artifact:{_truncate_utf8(str(artifact_id), 128)}" if artifact_id else ""
-            prefix = f"- [historical source: {source_type}{reference}] "
-            text = _truncate_utf8(text, max(0, remaining - len(prefix.encode("utf-8")) - 1))
-            if not text:
+            prefix = f"- [historical source: {source_type}{reference}]"
+            # The record's own lines are kept intact beneath the provenance
+            # header rather than flattened into it, so a recalled finding is
+            # either present whole or absent.
+            body = _bounded_lines(text, max(0, remaining - len(prefix.encode("utf-8")) - 1), indent="  ")
+            if not body:
                 break
-            items.append(f"{prefix}{text}")
+            items.append(f"{prefix}\n{body}")
             remaining -= len(items[-1].encode("utf-8")) + 1
             if remaining <= 0:
                 break
@@ -139,15 +265,19 @@ class BrainMemoryClient:
             return ""
         return heading + "\n".join(items)
 
-    def ingest_verified_outcome(self, *, operation_id: str, status: str, mode: str, source_count: int, verified_claim_count: int, source_types: list[str]) -> bool:
-        outcome = {
-            "kind": "outcome",
-            "mode": mode,
-            "status": status,
-            "sourceCount": max(0, int(source_count)),
-            "verifiedClaimCount": max(0, int(verified_claim_count)),
-            "sourceTypes": sorted({str(value) for value in source_types if value}),
-        }
+    def ingest_verified_outcome(
+        self,
+        *,
+        operation_id: str,
+        status: str,
+        mode: str,
+        source_count: int,
+        verified_claim_count: int,
+        source_types: list[str],
+        findings: list[dict] | None = None,
+        withheld_findings: int = 0,
+        secret_bearing_findings: int = 0,
+    ) -> bool:
         opaque_id = hashlib.sha256(f"web-intelligence-outcome:{operation_id}".encode("utf-8")).hexdigest()
         now = datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
         envelope = {
@@ -155,8 +285,11 @@ class BrainMemoryClient:
                 "artifactId": opaque_id,
                 "sourceType": "web-intelligence-outcome",
                 "sourceId": opaque_id,
-                "fileName": "outcome.json",
-                "mimeType": "application/json",
+                # Prose, not JSON: Brain routes an application/json artifact (or a
+                # .json fileName) through its provider-export importers, which this
+                # record is not.
+                "fileName": "outcome.txt",
+                "mimeType": "text/plain",
                 "ownerId": "web-intelligence",
                 "personaId": "web-intelligence",
                 "scope": "web-intelligence",
@@ -164,7 +297,17 @@ class BrainMemoryClient:
             },
             "sensitivity": "private",
             "permittedAgents": ["brain"],
-            "sourceText": json.dumps(outcome, separators=(",", ":")),
+            "sourceText": _render_outcome_text(
+                status=status,
+                mode=mode,
+                source_count=source_count,
+                verified_claim_count=verified_claim_count,
+                source_types=source_types,
+                findings=findings or [],
+                captured_at=now,
+                withheld_findings=withheld_findings,
+                secret_bearing_findings=secret_bearing_findings,
+            ),
         }
         try:
             receipt = self._request(_INGEST_PATH, json.dumps(envelope, separators=(",", ":")), _INGEST_DOMAIN)
