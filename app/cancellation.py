@@ -70,8 +70,23 @@ class CancellationManager:
             # that polls the result, sees it terminal, and then calls cancel
             # during that cleanup window flips an immutable, already-
             # persisted result to a spurious "cancelled" response.
+            # Bounded: the Redis client has no socket timeout (app/storage.py's
+            # aioredis.from_url call), so a connection that accepts but never
+            # answers could otherwise stall this lookup forever - and unlike
+            # the cross-instance branch below, cancelling a task this replica
+            # already owns needs nothing from Redis at all. A hung status
+            # check must never be the reason a cancel request for your own
+            # task never reaches task.cancel(); on timeout, proceed exactly
+            # as if the lookup had found nothing to refuse on.
             if operation_lookup:
-                op = await operation_lookup(op_id)
+                try:
+                    op = await asyncio.wait_for(operation_lookup(op_id), timeout=DEFAULT_INGEST_WAIT_TIMEOUT_S)
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "Timed out checking stored status before cancelling operation %s; proceeding with cancellation.",
+                        op_id
+                    )
+                    op = None
                 if op and op.get("status") in TERMINAL_STATUSES:
                     logger.info(
                         "Refusing local cancel for already finalized operation %s with status %s",
@@ -122,8 +137,23 @@ class CancellationManager:
             # either the cancellation arrived too late or this worker lost
             # ownership without it, and the real state belongs to whoever
             # wrote (or will write) that status.
+            #
+            # Bounded for the same reason the pre-cancel check above is: the
+            # cancellation itself already happened (or didn't need to,
+            # task.cancel() having raced past a task that already finished)
+            # by this point, purely in-process - a hung Redis read here must
+            # not turn a cancel this replica actually carried out into a
+            # hang. On timeout, fall back to reporting what we're actually
+            # sure of: the local task was cancelled and awaited.
             if operation_lookup:
-                op = await operation_lookup(op_id)
+                try:
+                    op = await asyncio.wait_for(operation_lookup(op_id), timeout=DEFAULT_INGEST_WAIT_TIMEOUT_S)
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "Timed out checking stored status after cancelling operation %s; reporting cancelled based on the local task alone.",
+                        op_id
+                    )
+                    op = None
                 if op and op.get("status") != "cancelled":
                     logger.info(
                         "Operation %s is %s (not cancelled) after awaiting its task; reporting that instead",
@@ -135,18 +165,36 @@ class CancellationManager:
 
         # Task not on this instance — broadcast via Redis pub/sub
         if self._redis:
+            # Bounded, same reason as the local branch above. Unlike there,
+            # though, a timeout here can't fall back to "proceed exactly as
+            # if nothing was found" - that already means something specific
+            # (refuse, since the operation is unknown) for a lookup that
+            # actually ran. On timeout we genuinely don't know either way,
+            # so skip the refusal entirely rather than either answer: this
+            # instance has no task of its own at stake here, only whether to
+            # publish a broadcast, and a redundant or unnecessary one is
+            # harmless (the receiving instance only acts if it actually owns
+            # a still-running task for this op_id) - unlike silently
+            # dropping a cancel request because Redis happened to be slow.
             if operation_lookup:
-                op = await operation_lookup(op_id)
-                if not op:
-                    logger.warning("Refusing cross-instance cancel for unknown operation: %s", op_id)
-                    return False
-                if op.get("status") in TERMINAL_STATUSES:
-                    logger.info(
-                        "Refusing cross-instance cancel for already finalized operation %s with status %s",
-                        op_id,
-                        op.get("status")
+                try:
+                    op = await asyncio.wait_for(operation_lookup(op_id), timeout=DEFAULT_INGEST_WAIT_TIMEOUT_S)
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "Timed out checking stored status before broadcasting cancel for operation %s; broadcasting anyway.",
+                        op_id
                     )
-                    return False
+                else:
+                    if not op:
+                        logger.warning("Refusing cross-instance cancel for unknown operation: %s", op_id)
+                        return False
+                    if op.get("status") in TERMINAL_STATUSES:
+                        logger.info(
+                            "Refusing cross-instance cancel for already finalized operation %s with status %s",
+                            op_id,
+                            op.get("status")
+                        )
+                        return False
             logger.info("Broadcasting cancel for operation %s to other instances", op_id)
             await self._redis.publish(CANCEL_CHANNEL, op_id)
             return True
