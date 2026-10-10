@@ -107,18 +107,17 @@ async def test_cross_instance_cancel_refuses_already_terminal_operation():
 
 @pytest.mark.anyio
 async def test_local_cancel_refuses_already_terminal_operation():
-    """Regression for a Codex P2 finding on PR #32 (web-intelligence-agent):
-    a task that has already produced a durable terminal result can stay
+    """A task that has already produced a durable terminal result can stay
     registered in active_tasks for a while afterward (its own post-result
     cleanup, deliberately - see app/api.py's background_research_task,
     which keeps itself registered through cleanup so shutdown's
-    quiesce_tasks() can still find it). Without this check, the local
-    branch below cancelled and reported "cancelled" for any op_id still
-    registered, with no regard for what was actually stored - unlike the
-    cross-instance branch above, which already checked this. A client that
-    polls the result, sees it terminal, and then calls /cancel while the
-    task is merely still finishing cleanup must get the real stored status
-    back, not a spurious "cancelled"."""
+    quiesce_tasks() can still find it). Without a stored-status check, the
+    local branch below would cancel and report "cancelled" for any op_id
+    still registered, with no regard for what was actually stored - unlike
+    the cross-instance branch above, which already checks this. A client
+    that polls the result, sees it terminal, and then calls /cancel while
+    the task is merely still finishing cleanup must get the real stored
+    status back, not a spurious "cancelled"."""
     manager = CancellationManager()
 
     started = asyncio.Event()
@@ -179,16 +178,15 @@ async def test_local_cancel_still_works_for_a_genuinely_running_operation():
 
 @pytest.mark.anyio
 async def test_local_cancel_reports_real_status_when_task_finishes_before_cancellation_takes_effect():
-    """Regression for a Codex finding on PR #32: the stored-status check
-    above is read before task.cancel(), so it can be stale by the time
-    cancel_task() actually acts - the task can race ahead and persist its
-    own terminal result in between. task.cancel() is then either a no-op
-    (the task already finished) or a cancellation its own cancellation-safe
-    cleanup absorbs, and either way the task completes normally rather than
-    raising CancelledError - so without a second, race-free check after
-    `task` has actually finished, cancel_task() returned True
-    unconditionally, and /cancel reported "cancelled" for an operation
-    that is really "completed"."""
+    """The stored-status check above is read before task.cancel(), so it
+    can be stale by the time cancel_task() actually acts - the task can
+    race ahead and persist its own terminal result in between.
+    task.cancel() is then either a no-op (the task already finished) or a
+    cancellation its own cancellation-safe cleanup absorbs, and either way
+    the task completes normally rather than raising CancelledError - so
+    without a second, race-free check after `task` has actually finished,
+    cancel_task() would return True unconditionally, and /cancel would
+    report "cancelled" for an operation that is really "completed"."""
     manager = CancellationManager()
     stored_status = {"value": "running"}
 
@@ -261,11 +259,9 @@ async def test_quiesce_tasks_returns_zero_when_idle():
     assert await manager.quiesce_tasks() == 0
 
 
-@pytest.mark.timeout(2)
 @pytest.mark.anyio
-async def test_quiesce_tasks_default_covers_a_tasks_full_serial_cleanup(monkeypatch):
-    """Regression for a ninth-round Codex P2 finding on PR #32: the previous
-    5s default here was shorter than a single bounded cleanup step
+async def test_quiesce_tasks_default_timeout_tracks_three_times_the_ingest_constant(monkeypatch):
+    """A flat 5s default here is shorter than a single bounded cleanup step
     (DEFAULT_INGEST_WAIT_TIMEOUT_S = 6s), let alone the three such steps
     background_research_task's own `finally` block (app/api.py) can run
     through serially on either path it takes - ingest, lease, concurrency
@@ -273,41 +269,48 @@ async def test_quiesce_tasks_default_covers_a_tasks_full_serial_cleanup(monkeypa
     cancellation. Shutdown could call quiesce_tasks(), get back control
     after its timeout, and go on to drain ingests and close storage
     connections while a task was still mid-cleanup - abandoning its
-    owner-lease/concurrency-slot/spend-hold release exactly as this PR fixed
-    for the outcome ingest. The fix raises the default to
-    3 * DEFAULT_INGEST_WAIT_TIMEOUT_S, covering that worst case.
+    owner-lease/concurrency-slot/spend-hold release exactly as this cleanup
+    path otherwise protects for the outcome ingest. Raising the default to
+    3 * DEFAULT_INGEST_WAIT_TIMEOUT_S is what covers that worst case.
 
-    Monkeypatches DEFAULT_INGEST_WAIT_TIMEOUT_S to a tiny value and runs a
-    task through three serial cancellation-absorbing steps scaled to that
-    same constant - standing in for the three real cleanup steps - so the
-    test is fast and still proves the relationship: without the fix
-    (a flat 5s default unrelated to that constant), this would either hang
-    relative to a tiny constant or fail for a realistic one; this proves the
-    default actually tracks 3x the constant rather than a fixed number."""
+    Timing how long quiesce_tasks() takes to return against a task driven
+    through three serial cleanup steps scaled to a tiny monkeypatched
+    DEFAULT_INGEST_WAIT_TIMEOUT_S does not actually discriminate this
+    relationship: a total of ~0.12s fits comfortably within *both* the new
+    3x default (0.15s) and the old flat 5.0s default it should catch a
+    regression of, so it would pass unchanged either way and prove nothing
+    - reproducible standalone with a fixed timeout=5.0, yielding the
+    identical done=True/steps=3 result. Racing real elapsed time against a
+    5-second baseline isn't practical at test speed, so this instead spies
+    on the exact timeout value quiesce_tasks() passes to asyncio.wait() and
+    asserts it against the monkeypatched constant directly - deterministic,
+    fast, and immune to how long any task's own cleanup happens to take."""
     monkeypatch.setattr(cancellation, "DEFAULT_INGEST_WAIT_TIMEOUT_S", 0.05)
+
+    captured = {}
+    real_wait = asyncio.wait
+
+    async def capturing_wait(tasks, timeout=None):
+        captured["timeout"] = timeout
+        return await real_wait(tasks, timeout=timeout)
+
+    monkeypatch.setattr(cancellation.asyncio, "wait", capturing_wait)
 
     manager = CancellationManager()
     started = asyncio.Event()
-    steps_completed = 0
 
-    async def three_step_cleanup_after_cancel():
-        nonlocal steps_completed
+    async def long_running():
         started.set()
-        try:
-            await asyncio.Event().wait()
-        except asyncio.CancelledError:
-            for _ in range(3):
-                await asyncio.sleep(0.04)  # stands in for one bounded, cancellation-absorbing release call
-                steps_completed += 1
-            raise
+        await asyncio.Event().wait()
 
-    task = asyncio.create_task(three_step_cleanup_after_cancel())
-    manager.register_task("op-three-step-cleanup", task)
+    task = asyncio.create_task(long_running())
+    manager.register_task("op-capture-quiesce-timeout", task)
     await started.wait()
 
-    quiesced = await manager.quiesce_tasks()
+    await manager.quiesce_tasks()
 
-    assert quiesced == 1
-    assert task.done(), "quiesce_tasks() must wait out the task's full serial cleanup, not give up partway through"
-    assert steps_completed == 3
+    assert captured["timeout"] == pytest.approx(0.15), (
+        "quiesce_tasks()'s default must track 3x DEFAULT_INGEST_WAIT_TIMEOUT_S "
+        f"(0.15 here), not a flat number unrelated to it - got {captured.get('timeout')!r}"
+    )
 

@@ -97,6 +97,17 @@ class CancellationManager:
             # task has returned - so this result is authoritative. A
             # non-"cancelled" terminal status here means the cancellation
             # simply arrived too late to take effect.
+            #
+            # That "nothing else writes it" guarantee depends on an ordering
+            # invariant in background_research_task (app/api.py), not
+            # anything enforced here: it always persists this operation's
+            # terminal status, if it persists one at all, before any of its
+            # own cleanup (ingest wait, releases, unregistration) and before
+            # returning - so the owning task's return implies its final
+            # status write, if any, already happened. Moving a status write
+            # to after cleanup there - or adding a second writer for the
+            # same op_id - would silently reopen the race this check exists
+            # to close.
             if operation_lookup:
                 op = await operation_lookup(op_id)
                 if op and op.get("status") in TERMINAL_STATUSES and op.get("status") != "cancelled":

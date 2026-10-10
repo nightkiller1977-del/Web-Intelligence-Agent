@@ -214,29 +214,52 @@ async def _release_cancellation_safe(awaitable, op_id: str, description: str, ti
     ambiguous as any other failure case here, falling back on the same TTL
     expiry already relied on elsewhere.
 
-    `task` itself is never cancelled by anything in this loop - only the
-    outer `wait_for`/`shield` wrapper is, which is what lets it survive the
-    calling task being cancelled repeatedly. If `task` nonetheless ends up
-    cancelled (nothing does this today; it would take an external, direct
-    `task.cancel()` on this exact object), `while not task.done()` would
-    otherwise exit silently and this would return as if the release had
-    settled normally, when it never actually ran to completion - the same
-    ambiguity this helper exists to close for every other failure mode.
+    While waiting, `task` itself is never cancelled by anything in this
+    loop - only the outer `wait_for`/`shield` wrapper is, which is what lets
+    it survive the calling task being cancelled repeatedly. On giving up
+    (wall-clock timeout), though, `task` *is* cancelled rather than left
+    running: nothing else tracks it (unlike the per-operation outcome
+    ingest, which stays in the module-global pending set for a later
+    shutdown-time drain), so an abandoned-but-still-pending release would
+    otherwise leak its in-flight Redis call indefinitely. Cancelling it here
+    is safe for the same reason re-awaiting it was: the release is
+    idempotent, so losing this one attempt is no worse than any other
+    failure case this helper already treats as ambiguous and falls back on
+    the reservation's TTL for.
+
+    If `task` nonetheless ends up cancelled some other way (an external,
+    direct `task.cancel()` on this exact object, from outside this
+    function), `while not task.done()` would otherwise exit silently and
+    this would return as if the release had settled normally, when it
+    never actually ran to completion. The check after the loop catches that
+    too.
     """
     if timeout is None:
         timeout = DEFAULT_INGEST_WAIT_TIMEOUT_S
     task = asyncio.ensure_future(awaitable)
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout
+
+    def _abandon():
+        task.cancel()
+
+        def _reap(finished_task):
+            if not finished_task.cancelled():
+                finished_task.exception()  # retrieve and discard so it isn't logged as unhandled
+
+        task.add_done_callback(_reap)
+
     while not task.done():
         remaining = deadline - loop.time()
         if remaining <= 0:
             logger.warning("Timed out waiting to %s for operation %s.", description, op_id)
+            _abandon()
             return
         try:
             await asyncio.wait_for(asyncio.shield(task), timeout=remaining)
         except asyncio.TimeoutError:
             logger.warning("Timed out waiting to %s for operation %s.", description, op_id)
+            _abandon()
             return
         except asyncio.CancelledError:
             continue
@@ -394,9 +417,10 @@ async def background_research_task(
         # what it awaits, so without the shield this function would move on
         # and release the owner lease/concurrency slot while the ingest it
         # already scheduled is still mid-flight, now with nothing tracking
-        # it. Shielding lets that ingest keep running to completion
-        # independently of whether this task itself gets cancelled again
-        # right here.
+        # it. Shielding keeps that ingest running rather than cancelling it
+        # out from under this wait when this task itself gets cancelled
+        # again right here - this function's own wait on it is still only up
+        # to the bound below, not a guarantee of running it to completion.
         #
         # Shielding alone does not make this wait durable against repeated
         # cancellation, though: the outer await still raises CancelledError

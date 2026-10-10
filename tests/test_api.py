@@ -197,13 +197,12 @@ async def test_background_task_waits_for_brain_ingest_before_returning(monkeypat
 
 @pytest.mark.anyio
 async def test_cancellation_right_after_scheduling_ingest_still_lets_it_complete(monkeypatch):
-    """Regression for a finding from an automated review on PR #32. The first
-    version of this fix put `await flush_pending_ingest_tasks()` inline right
-    after schedule_outcome_ingest(), inside the try block - a CancelledError
-    delivered while suspended exactly there was caught by the
-    `except asyncio.CancelledError` block below it, which never retried the
-    flush, reproducing the scale-to-zero ingest loss through cancellation
-    instead of normal completion.
+    """A CancelledError delivered the instant after the outcome ingest is
+    scheduled must not reproduce the scale-to-zero ingest loss this whole
+    cleanup path exists to close. Awaiting the flush inline, inside the try
+    block right after scheduling, would let a CancelledError landing exactly
+    there be caught by the `except asyncio.CancelledError` block below it,
+    which never retries the flush.
 
     Moving the flush into `finally` alone is not sufficient: cancelling the
     task while it is suspended on a bare (unshielded) await interrupts the
@@ -259,17 +258,16 @@ async def test_cancellation_right_after_scheduling_ingest_still_lets_it_complete
 
 @pytest.mark.anyio
 async def test_cancellation_landing_on_the_shield_itself_still_waits_for_the_ingest(monkeypatch):
-    """Regression for a second-round finding from the automated review on
-    PR #32 (Codex). asyncio.shield() protects the ingest task from being
-    cancelled alongside the outer await, but the outer await still raises
-    CancelledError immediately when the cancellation lands exactly on it. An
-    earlier version of this fix caught that CancelledError and simply moved
-    on without re-awaiting the ingest task - which meant it kept running
-    fully unawaited from that point on, right back to the original
-    detached, scale-to-zero-vulnerable state the whole PR targets, just one
-    level down. The fix re-awaits the same ingest task (not shield again -
-    the one pending cancellation was already consumed) after catching that
-    CancelledError.
+    """asyncio.shield() protects the ingest task from being cancelled
+    alongside the outer await, but the outer await still raises
+    CancelledError immediately when the cancellation lands exactly on it.
+    Catching that CancelledError and simply moving on without re-awaiting
+    the ingest task would mean it keeps running fully unawaited from that
+    point on - right back to the original detached, scale-to-zero-
+    vulnerable state this whole cleanup path exists to close, just one
+    level down. Re-awaiting the same ingest task (not shield again - the
+    one pending cancellation was already consumed) after catching that
+    CancelledError is what closes it.
 
     This is the companion to the test above, with the same cancellation
     timing (requested synchronously inside schedule_outcome_ingest_task, so
@@ -319,14 +317,13 @@ async def test_cancellation_landing_on_the_shield_itself_still_waits_for_the_ing
 
 @pytest.mark.anyio
 async def test_only_this_operations_ingest_is_awaited_not_every_pending_one(monkeypatch):
-    """Regression for the other Codex P2 finding on PR #32: the fix's first
-    draft awaited flush_pending_ingest_tasks(), which drains the
-    module-global set of every operation's pending ingest - so one
-    operation's own completion path waited on unrelated concurrent
+    """Awaiting flush_pending_ingest_tasks() here would drain the
+    module-global set of every operation's pending ingest, so one
+    operation's own completion path would wait on unrelated concurrent
     operations' Brain requests too, holding its lease/concurrency slot for
     up to flush's own 6s timeout over work that had nothing to do with it.
-    The fix captures and awaits only the task schedule_outcome_ingest_task()
-    returns for this operation.
+    Capturing and awaiting only the task schedule_outcome_ingest_task()
+    returns for this operation is what keeps that scoped to its own work.
 
     Simulates a slow, unrelated operation's ingest already pending in the
     global set - exactly what flush_pending_ingest_tasks() would have
@@ -361,16 +358,17 @@ async def test_only_this_operations_ingest_is_awaited_not_every_pending_one(monk
     req = ResearchRequestInput(**_payload(operation_id))
     reporter = ProgressReporter(operation_id)
 
-    start = time.monotonic()
     await api.background_research_task(req, reporter, headers={})
-    elapsed = time.monotonic() - start
 
-    assert elapsed < 0.1, (
-        f"waited {elapsed:.3f}s - an operation with no ingest of its own must not be held up "
-        "by an unrelated operation's still-pending one"
-    )
+    # Deterministic rather than a wall-clock bound, which would be flaky on
+    # a slow/loaded CI runner: if the bug were present - awaiting
+    # flush_pending_ingest_tasks(), which drains every pending ingest, not
+    # just this operation's own - background_research_task would not
+    # return until the unrelated ingest's 0.2s sleep finishes, so this
+    # event would already be set by the time we check, regardless of how
+    # long that actually took on this runner.
     assert not unrelated_ingest_done.is_set(), (
-        "the unrelated ingest should still be running - this just proves we really didn't wait for it"
+        "the unrelated ingest should still be running - this proves we really didn't wait for it"
     )
 
     await unrelated_task  # let it finish cleanly before the test ends
@@ -378,21 +376,19 @@ async def test_only_this_operations_ingest_is_awaited_not_every_pending_one(monk
 
 @pytest.mark.anyio
 async def test_stays_registered_through_its_own_cleanup_until_fully_done(monkeypatch):
-    """Regression for a fourth-round Codex P2 finding on PR #32. An earlier
-    version of this fix unregistered the task as soon as its result was
-    persisted, before the ingest-await ran at all - closing the
-    terminal-cancellation window below, but at the cost of removing the
-    task from cancellation_manager.active_tasks while it still had real
-    cleanup left (the ingest-await, then spend/lease/concurrency-slot
-    release). quiesce_tasks() (shutdown) only cancels/awaits tasks still in
+    """Unregistering the task as soon as its result is persisted, before the
+    ingest-await runs at all, would remove it from
+    cancellation_manager.active_tasks while it still has real cleanup left
+    (the ingest-await, then spend/lease/concurrency-slot release).
+    quiesce_tasks() (shutdown) only cancels/awaits tasks still in
     active_tasks, so shutdown landing in that window would race past this
     one, tearing the event loop down with its lease, concurrency slot, or
     spend hold never released - left pinned until their TTLs expire.
 
-    The fix keeps the task registered through all of its own cleanup,
-    unregistering only once that is actually done, and instead closes the
-    terminal-cancellation window with a stored-status check in
-    cancel_task() itself (see test_cancellation.py for that half).
+    The task must instead stay registered through all of its own cleanup,
+    unregistering only once that is actually done; the terminal-cancellation
+    window that opens as a result is closed separately, by a stored-status
+    check in cancel_task() itself (see test_cancellation.py for that half).
 
     Asserts the task is still registered while its slow ingest is in
     flight - not unregistered early - confirming shutdown could still find
@@ -492,14 +488,14 @@ async def test_cancel_refuses_already_terminal_operation_during_post_completion_
 
 @pytest.mark.anyio
 async def test_repeated_cancellation_never_reaches_the_ingest_task(monkeypatch):
-    """Regression for the first Codex P2 finding on PR #32: a second
-    cancellation landing while the fix's own re-await was suspended would
-    propagate straight into `ingest_task` - asyncio.to_thread cancellation
-    marks the wrapping task done while the underlying HTTP thread may still
-    be running, orphaning it from both _pending_ingest_tasks and shutdown's
-    drain. The fix loops back into asyncio.shield() on every cancellation
-    instead of ever bare-awaiting `ingest_task` directly, so no number of
-    repeated cancellations of this task can cancel the ingest it protects.
+    """A second cancellation landing while a bare re-await of `ingest_task`
+    was suspended would propagate straight into it - asyncio.to_thread
+    cancellation marks the wrapping task done while the underlying HTTP
+    thread may still be running, orphaning it from both
+    _pending_ingest_tasks and shutdown's drain. Looping back into
+    asyncio.shield() on every cancellation, instead of ever bare-awaiting
+    `ingest_task` directly, is what keeps no number of repeated
+    cancellations of this task from cancelling the ingest it protects.
 
     A separate task repeatedly cancels background_research_task throughout
     the ingest's own sleep, so the fix's while-loop is genuinely re-entered
@@ -552,15 +548,15 @@ async def test_repeated_cancellation_never_reaches_the_ingest_task(monkeypatch):
 @pytest.mark.timeout(2)
 @pytest.mark.anyio
 async def test_ingest_wait_is_bounded_so_a_stalled_ingest_cannot_pin_cleanup(monkeypatch):
-    """Regression for a fifth-round Codex P1 finding on PR #32: the
-    per-operation ingest-wait loop had no overall wall-clock bound, unlike
-    flush_pending_ingest_tasks()'s timeout it replaced. The Brain Memory
-    HTTP call's own per-socket-operation timeout resets on every partial
-    read, so an endpoint that accepts a connection and trickles data just
-    fast enough never trips it - without an outer bound, this operation's
-    lease/concurrency-slot release would wait indefinitely, and enough
-    stalled ingests could block all new research admissions. The fix wraps
-    the shielded wait in asyncio.wait_for against DEFAULT_INGEST_WAIT_TIMEOUT_S.
+    """The per-operation ingest-wait loop must have an overall wall-clock
+    bound, the same way flush_pending_ingest_tasks()'s timeout did. The
+    Brain Memory HTTP call's own per-socket-operation timeout resets on
+    every partial read, so an endpoint that accepts a connection and
+    trickles data just fast enough never trips it - without an outer bound,
+    this operation's lease/concurrency-slot release would wait
+    indefinitely, and enough stalled ingests could block all new research
+    admissions. Wrapping the shielded wait in asyncio.wait_for against
+    DEFAULT_INGEST_WAIT_TIMEOUT_S is what closes that.
 
     Monkeypatches that timeout to a tiny value and uses an ingest that never
     finishes on its own, so the test is fast and still proves the bound:
@@ -602,28 +598,27 @@ async def test_ingest_wait_is_bounded_so_a_stalled_ingest_cannot_pin_cleanup(mon
 
 @pytest.mark.anyio
 async def test_cancellation_during_lease_release_does_not_skip_remaining_cleanup(monkeypatch):
-    """Regression for the companion Codex P2 finding on the same round as
-    the test above: unregister_task() running last (deliberately - see its
-    own comment in app/api.py) means the task stays registered through
+    """unregister_task() running last (deliberately - see its own comment
+    in app/api.py) means the task stays registered through
     release_daily_spend/release_operation_lease/release_concurrency_slot, so
     a cancellation landing on any one of those plain awaits - for example
-    quiesce_tasks() cancelling it again during shutdown - would, without
-    catching CancelledError there too, propagate out of `finally` uncaught
-    and skip every cleanup step after it, including unregistration itself.
-    Fixed by catching CancelledError alongside Exception on each of those
-    awaits, same as the ingest-wait already does.
+    quiesce_tasks() cancelling it again during shutdown - must not,
+    uncaught, propagate out of `finally` and skip every cleanup step after
+    it, including unregistration itself. Catching CancelledError alongside
+    Exception on each of those awaits, same as the ingest-wait already
+    does, is what closes that.
 
     Cancels background_research_task's own task via a closed-over
-    reference, not asyncio.current_task(): an OpenHands finding on this same
-    round's head caught the original version of this test calling
-    current_task() inside fake_release_operation_lease, which - now that
+    reference, not asyncio.current_task(): now that
     _release_cancellation_safe wraps the release in its own task via
-    asyncio.ensure_future - resolves to that inner wrapper task, not
-    background_research_task. Cancelling it self-cancels the very release
-    this test means to protect instead of exercising an outer cancellation
-    landing on it, so the test passed without ever proving the lease release
-    completes; it only happened to pass because the next release step ran
-    regardless of how the one before it ended.
+    asyncio.ensure_future, asyncio.current_task() inside
+    fake_release_operation_lease resolves to that inner wrapper task, not
+    background_research_task. Cancelling it would self-cancel the very
+    release this test means to protect instead of exercising an outer
+    cancellation landing on it, which would let the test pass without ever
+    proving the lease release completes - it would only happen to pass
+    because the next release step runs regardless of how the one before it
+    ended.
 
     Asserts both that the lease release itself actually ran past its
     cancellation (lease_released, set only after the fake's own suspension
@@ -679,18 +674,21 @@ async def test_cancellation_during_lease_release_does_not_skip_remaining_cleanup
 
 @pytest.mark.anyio
 async def test_release_cancellation_safe_logs_when_the_release_task_itself_is_cancelled(caplog):
-    """Regression for an OpenHands finding on this same round's head:
-    `while not task.done()` exits silently regardless of *how* `task`
-    finished, so a release task that ends up cancelled - rather than
-    completing or raising - was treated exactly like a successful release:
-    no warning, no retry, even though the idempotent release it wraps never
+    """`while not task.done()` exits regardless of *how* `task` finished,
+    so a release task that ends up cancelled - rather than completing or
+    raising - must not be treated exactly like a successful release: no
+    warning, no retry, even though the idempotent release it wraps never
     actually ran to completion. Not reachable through the normal
     cancel-the-caller path (shield protects `task` from that cancellation
     specifically) - it takes a direct `task.cancel()` on this exact object,
-    which is exactly what the fixed test bug in
+    which is exactly what calling asyncio.current_task().cancel() from
+    inside a release call wrapped by this helper does, since current_task()
+    there resolves to this helper's own wrapper task rather than its
+    caller's (see
     test_cancellation_during_lease_release_does_not_skip_remaining_cleanup
-    did by accident before this round. The fix logs a warning when the loop
-    exits on a cancelled task instead of returning silently.
+    for where that distinction matters for a test's own correctness, not
+    just this one). Logging a warning when the loop exits on a cancelled
+    task, instead of returning silently, is what closes it.
 
     Drives this directly against the helper rather than through
     background_research_task: asyncio.ensure_future's returned Task isn't
@@ -713,16 +711,15 @@ async def test_release_cancellation_safe_logs_when_the_release_task_itself_is_ca
 
 @pytest.mark.anyio
 async def test_cancellation_during_spend_release_still_lets_it_complete(monkeypatch):
-    """Regression for a sixth-round Codex P2 finding on PR #32: catching
-    CancelledError around each release call (the previous round's fix) and
-    just logging it leaves that release's own outcome ambiguous - the call
-    could abort before it ever reached Redis, or could have completed there
-    with the response simply never observed here - without ever retrying or
+    """Catching CancelledError around each release call and just logging it
+    would leave that release's own outcome ambiguous - the call could abort
+    before it ever reached Redis, or could have completed there with the
+    response simply never observed here - without ever retrying or
     reconciling it, potentially leaving the spend reservation (equally the
-    owner lease or concurrency slot) pinned until its TTL expires. The fix
-    (_release_cancellation_safe) shields and re-awaits the same release call
-    until it actually settles, which is safe specifically because every
-    release it protects is idempotent.
+    owner lease or concurrency slot) pinned until its TTL expires.
+    _release_cancellation_safe shields and re-awaits the same release call
+    until it actually settles instead, which is safe specifically because
+    every release it protects is idempotent.
 
     release_daily_spend is only reached when research itself failed with
     spend still reserved (the normal-completion path reconciles the spend
@@ -770,26 +767,33 @@ async def test_cancellation_during_spend_release_still_lets_it_complete(monkeypa
 @pytest.mark.timeout(2)
 @pytest.mark.anyio
 async def test_cancellation_safe_release_is_bounded_so_a_stalled_release_cannot_pin_cleanup(monkeypatch):
-    """Regression for an eighth-round Codex P2 finding on PR #32:
-    _release_cancellation_safe's shield-and-retry loop (the previous round's
-    fix) had no overall wall-clock bound, unlike the per-operation ingest
-    wait right above it. The Redis client is created without a socket
+    """_release_cancellation_safe's shield-and-retry loop must have an
+    overall wall-clock bound, the same way the per-operation ingest wait
+    right above it does. The Redis client is created without a socket
     timeout (app/storage.py's aioredis.from_url call), so a connection that
-    accepts but never answers would let this loop wait forever - and with
-    the previous round's fix in place, a cancellation landing on it no
-    longer breaks that wait either, since it is unconditionally re-entered
-    on every CancelledError. That left the task pinned mid-cleanup, never
-    unregistering, until the platform killed the process. The fix wraps the
-    same shielded wait in asyncio.wait_for against a deadline, exactly like
-    the ingest wait already does, giving up (and falling back on the
-    reservation's own TTL expiry) rather than hanging indefinitely.
+    accepts but never answers would let this loop wait forever - and once
+    a cancellation landing on it no longer breaks that wait either (since
+    it is unconditionally re-entered on every CancelledError), that leaves
+    the task pinned mid-cleanup, never unregistering, until the platform
+    kills the process. Wrapping the same shielded wait in asyncio.wait_for
+    against a deadline, exactly like the ingest wait already does, giving
+    up (and falling back on the reservation's own TTL expiry) rather than
+    hanging indefinitely, is what closes that.
 
     Monkeypatches DEFAULT_INGEST_WAIT_TIMEOUT_S (the shared bound both waits
     use) to a tiny value and makes release_operation_lease never finish on
     its own, so the test is fast and still proves the bound: without the
     fix, this would hang rather than merely run slowly (the class 2s timeout
-    above is the backstop in case something regresses the fix entirely)."""
+    above is the backstop in case something regresses the fix entirely).
+
+    Also asserts the abandoned release task itself actually gets cancelled
+    rather than left pending: giving up on the wait without also cancelling
+    `task` would leave its in-flight Redis call running forever, untracked
+    by anything (unlike the per-operation ingest, which stays in the
+    module-global pending set for shutdown to drain later)."""
     monkeypatch.setattr(api, "DEFAULT_INGEST_WAIT_TIMEOUT_S", 0.05)
+
+    lease_release_cancelled = asyncio.Event()
 
     async def fake_conduct_web_research(**kwargs):
         return {
@@ -801,7 +805,11 @@ async def test_cancellation_safe_release_is_bounded_so_a_stalled_release_cannot_
         }
 
     async def fake_release_operation_lease(op_id):
-        await asyncio.Event().wait()  # stands in for a Redis call that never answers
+        try:
+            await asyncio.Event().wait()  # stands in for a Redis call that never answers
+        except asyncio.CancelledError:
+            lease_release_cancelled.set()
+            raise
 
     monkeypatch.setattr(api, "conduct_web_research", fake_conduct_web_research)
     monkeypatch.setattr(api, "schedule_outcome_ingest_task", lambda *a, **k: None)
@@ -825,6 +833,7 @@ async def test_cancellation_safe_release_is_bounded_so_a_stalled_release_cannot_
     assert operation_id not in api.cancellation_manager.active_tasks, (
         "the task must still unregister after giving up on a stalled release"
     )
+    await asyncio.wait_for(lease_release_cancelled.wait(), timeout=1.0)
 
 
 def test_research_submission_returns_passage_backed_claims(monkeypatch):

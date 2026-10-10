@@ -967,16 +967,6 @@ def schedule_outcome_ingest_task(result: Dict[str, Any], op_id: str, mode: str, 
     return _schedule_outcome_ingest(client, result, op_id, mode, (inputs or {}).get("allowExternalUse") is True)
 
 
-def schedule_outcome_ingest(result: Dict[str, Any], op_id: str, mode: str, inputs: Dict[str, Any] | None = None) -> bool:
-    """Back-compat bool-returning wrapper around schedule_outcome_ingest_task().
-
-    Returns True only when a task was scheduled. Callers that need to await
-    this specific operation's ingest (rather than just know one was fired)
-    should call schedule_outcome_ingest_task() directly instead.
-    """
-    return schedule_outcome_ingest_task(result, op_id, mode, inputs) is not None
-
-
 async def conduct_web_research(
     op_id: str,
     query: str,
@@ -1102,8 +1092,9 @@ async def conduct_web_research(
         )
     # Outcome ingestion is intentionally NOT scheduled here. The caller
     # (app/api.py background_research_task) persists the result durably first
-    # and only then calls schedule_outcome_ingest(), so Brain can never record a
-    # completed/partial outcome for a result that was never durably stored.
+    # and only then calls schedule_outcome_ingest_task(), so Brain can never
+    # record a completed/partial outcome for a result that was never durably
+    # stored.
     return result
 
 async def _run_research(env_manager, callbacks, reporter, op_id, query, display_query, mode, profile, report_type, max_duration, max_searches, max_pages, max_sources, max_memory, query_domains, limits, require_claim_verification, headers, input_chunks, input_limitations, start_time):
