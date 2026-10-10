@@ -18,7 +18,7 @@ from app.storage import storage
 from app.schemas import ResearchRequestInput, ResearchResultResponse, CapabilitiesInfo
 from app.cancellation import cancellation_manager
 from app.progress_adapter import ProgressReporter
-from app.researcher_adapter import conduct_web_research, _LeaseLostError, schedule_outcome_ingest
+from app.researcher_adapter import conduct_web_research, _LeaseLostError, schedule_outcome_ingest_task, DEFAULT_INGEST_WAIT_TIMEOUT_S
 from app.security import is_gateway_destination_allowed, is_safe_url
 from app.metrics import observe_research_result, record_operation_spend
 
@@ -188,6 +188,88 @@ async def _report_progress_best_effort(
         logger.warning("Failed to publish progress event for stage %s.", stage, exc_info=True)
 
 
+async def _release_cancellation_safe(awaitable, op_id: str, description: str, timeout=None) -> None:
+    """Run a single idempotent release call to completion, surviving any
+    number of cancellations of the calling task without ever cancelling the
+    release itself.
+
+    A bare `try/except CancelledError: log and move on` leaves the release's
+    own outcome ambiguous - the call could have been aborted before it ever
+    reached Redis, or it could have completed there with the response simply
+    never observed here - and never retries or reconciles it, potentially
+    leaving the spend reservation, owner lease, or concurrency slot pinned
+    until its TTL expires. Shielding and re-awaiting the same call (rather
+    than issuing a fresh one on every retry) is safe here specifically
+    because every caller of this helper releases something idempotent:
+    removing an already-removed reservation/lease/slot is a no-op, not an
+    error, so settling on the one in-flight call is enough.
+
+    Bounded by `timeout` (defaulting to DEFAULT_INGEST_WAIT_TIMEOUT_S, looked
+    up fresh on each call so tests can monkeypatch it the same way they do
+    for the ingest wait): the Redis client is created without a socket
+    timeout (see app/storage.py's `aioredis.from_url` call), so a connection
+    that accepts but never answers would otherwise let this loop absorb
+    cancellations forever, pinning the task mid-cleanup so it never
+    unregisters. Giving up after the deadline leaves this release exactly as
+    ambiguous as any other failure case here, falling back on the same TTL
+    expiry already relied on elsewhere.
+
+    While waiting, `task` itself is never cancelled by anything in this
+    loop - only the outer `wait_for`/`shield` wrapper is, which is what lets
+    it survive the calling task being cancelled repeatedly. On giving up
+    (wall-clock timeout), though, `task` *is* cancelled rather than left
+    running: nothing else tracks it (unlike the per-operation outcome
+    ingest, which stays in the module-global pending set for a later
+    shutdown-time drain), so an abandoned-but-still-pending release would
+    otherwise leak its in-flight Redis call indefinitely. Cancelling it here
+    is safe for the same reason re-awaiting it was: the release is
+    idempotent, so losing this one attempt is no worse than any other
+    failure case this helper already treats as ambiguous and falls back on
+    the reservation's TTL for.
+
+    If `task` nonetheless ends up cancelled some other way (an external,
+    direct `task.cancel()` on this exact object, from outside this
+    function), `while not task.done()` would otherwise exit silently and
+    this would return as if the release had settled normally, when it
+    never actually ran to completion. The check after the loop catches that
+    too.
+    """
+    if timeout is None:
+        timeout = DEFAULT_INGEST_WAIT_TIMEOUT_S
+    task = asyncio.ensure_future(awaitable)
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+
+    def _abandon():
+        task.cancel()
+
+        def _reap(finished_task):
+            if not finished_task.cancelled():
+                finished_task.exception()  # retrieve and discard so it isn't logged as unhandled
+
+        task.add_done_callback(_reap)
+
+    while not task.done():
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            logger.warning("Timed out waiting to %s for operation %s.", description, op_id)
+            _abandon()
+            return
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=remaining)
+        except asyncio.TimeoutError:
+            logger.warning("Timed out waiting to %s for operation %s.", description, op_id)
+            _abandon()
+            return
+        except asyncio.CancelledError:
+            continue
+        except Exception:
+            logger.warning("Failed to %s for operation %s.", description, op_id, exc_info=True)
+            return
+    if task.cancelled():
+        logger.warning("Release task was cancelled rather than completed to %s for operation %s.", description, op_id)
+
+
 async def background_research_task(
     req: ResearchRequestInput,
     reporter: ProgressReporter,
@@ -197,6 +279,7 @@ async def background_research_task(
 ):
     op_id = req.operationId
     spend_reconciled = False
+    ingest_task = None
 
     try:
         # Ownership was claimed at admission time (before any queued state was
@@ -264,7 +347,7 @@ async def background_research_task(
         # Only after the result is durable may the optional Brain outcome ingest
         # be scheduled; otherwise Brain could record a completed/partial outcome
         # for a result that was never stored.
-        schedule_outcome_ingest(result, op_id, req.mode, inputs=req.inputs)
+        ingest_task = schedule_outcome_ingest_task(result, op_id, req.mode, inputs=req.inputs)
 
     except asyncio.CancelledError:
         logger.warning(f"Operation {op_id} was cancelled during execution.")
@@ -310,27 +393,112 @@ async def background_research_task(
         observe_research_result(failed_state)
 
     finally:
-        # Cleanup steps are independent: a failure in one (for example a
+        # This task's own HTTP request (POST /v1/research) already returned
+        # 202 before this coroutine started, so Azure Container Apps' request
+        # concurrency scaler has no open connection tying this replica to this
+        # operation; the replica is free to scale toward zero once the SSE
+        # consumer disconnects. A detached Brain Memory ingest task has no
+        # such protection and can be killed mid-flight before it completes.
+        # Running the await here, in `finally`, covers both the normal-return
+        # and cancellation exit paths uniformly: inline right after
+        # schedule_outcome_ingest_task() would be skipped if cancellation
+        # landed on exactly that await, since it is inside the `try` whose
+        # `except asyncio.CancelledError` above never retries it.
+        #
+        # Awaits `ingest_task` directly - this operation's own task - rather
+        # than draining every operation's pending ingest: the per-operation
+        # task is what this function actually needs to wait for, and nothing
+        # else's unrelated in-flight Brain request should hold up this
+        # operation's own lease/concurrency-slot release.
+        #
+        # asyncio.shield, not a bare await: a cancellation landing exactly
+        # while suspended here would otherwise interrupt only the *waiting*,
+        # not `ingest_task` itself - a bare await propagates cancellation into
+        # what it awaits, so without the shield this function would move on
+        # and release the owner lease/concurrency slot while the ingest it
+        # already scheduled is still mid-flight, now with nothing tracking
+        # it. Shielding keeps that ingest running rather than cancelling it
+        # out from under this wait when this task itself gets cancelled
+        # again right here - this function's own wait on it is still only up
+        # to the bound below, not a guarantee of running it to completion.
+        #
+        # Shielding alone does not make this wait durable against repeated
+        # cancellation, though: the outer await still raises CancelledError
+        # immediately when a cancellation lands exactly on it - shield does
+        # not change *this* function's own cancellation semantics, only
+        # whether `ingest_task` survives being cancelled out from under it.
+        # Looped rather than a single retry, so no number of repeated
+        # cancellations of this task - including quiesce_tasks() cancelling
+        # it again during shutdown, harmlessly, while it waits here (this
+        # task stays registered through its own cleanup; see the
+        # unregister_task() call at the end of this block) - can ever
+        # actually cancel the ingest it is protecting.
+        #
+        # Bounded to DEFAULT_INGEST_WAIT_TIMEOUT_S overall, not just per
+        # cancellation: the Brain Memory HTTP call's own 5s socket timeout
+        # resets on every partial read, so a connection that trickles data
+        # slowly enough can run far longer than that without ever tripping
+        # it. asyncio.wait_for's own timeout only cancels the *outer* shield
+        # wrapper it is given, exactly like an external cancellation would -
+        # ingest_task itself keeps running, still tracked for the eventual
+        # shutdown-time drain, just no longer blocking this operation's own
+        # lease/concurrency-slot release.
+        if ingest_task is not None:
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + DEFAULT_INGEST_WAIT_TIMEOUT_S
+            while not ingest_task.done():
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    logger.warning(
+                        "Brain Memory ingest for operation %s did not finish within %.1fs; releasing cleanup without it.",
+                        op_id, DEFAULT_INGEST_WAIT_TIMEOUT_S,
+                    )
+                    break
+                try:
+                    await asyncio.wait_for(asyncio.shield(ingest_task), timeout=remaining)
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "Brain Memory ingest for operation %s did not finish within %.1fs; releasing cleanup without it.",
+                        op_id, DEFAULT_INGEST_WAIT_TIMEOUT_S,
+                    )
+                    break
+                except asyncio.CancelledError:
+                    continue
+                except Exception:
+                    logger.warning("Brain Memory ingest failed for operation %s.", op_id, exc_info=True)
+                    break
+        # Cleanup steps below are independent: a failure in one (for example a
         # transient Redis error releasing the spend hold) must not skip the
         # others, or the owner lease and concurrency slot would stay pinned for
         # the full lease TTL and the task would leak in the local registry.
+        # Each one also survives cancellation rather than treating it as
+        # failure, through to unregistration: the task stays registered for
+        # quiesce_tasks() to find throughout this whole phase (deliberately -
+        # see the unregister_task() comment below), so a cancellation landing
+        # on any one of these awaits must not propagate out and skip the rest
+        # the same way an uncaught one would - nor leave that one release's
+        # own outcome ambiguous, which is what _release_cancellation_safe is
+        # for.
         if spend_reserved and not spend_reconciled:
-            try:
-                await storage.release_daily_spend(spend_reserved, op_id)
-            except Exception:
-                logger.warning("Failed to release spend hold for operation %s.", op_id, exc_info=True)
+            await _release_cancellation_safe(
+                storage.release_daily_spend(spend_reserved, op_id), op_id, "release spend hold"
+            )
+        await _release_cancellation_safe(storage.release_operation_lease(op_id), op_id, "release owner lease")
+        await _release_cancellation_safe(storage.release_concurrency_slot(op_id), op_id, "release concurrency slot")
+        # Unregistered last, once every cleanup step above has actually run:
+        # quiesce_tasks() (shutdown) only cancels/awaits tasks still in
+        # active_tasks, so unregistering any earlier would let shutdown race
+        # past this task while it still has cleanup left - losing the lease,
+        # concurrency slot, or spend-hold release and leaving them pinned
+        # until their TTLs expire. cancel_task()'s own terminal-status check
+        # is what keeps a merely-registered, already-finished operation from
+        # being spuriously cancelled in the meantime, so unregistration
+        # timing does not have to do that job too. Synchronous, so it cannot
+        # itself be interrupted by cancellation - only Exception applies.
         try:
             cancellation_manager.unregister_task(op_id)
         except Exception:
             logger.warning("Failed to unregister task for operation %s.", op_id, exc_info=True)
-        try:
-            await storage.release_operation_lease(op_id)
-        except Exception:
-            logger.warning("Failed to release owner lease for operation %s.", op_id, exc_info=True)
-        try:
-            await storage.release_concurrency_slot(op_id)
-        except Exception:
-            logger.warning("Failed to release concurrency slot for operation %s.", op_id, exc_info=True)
 
 @router.post("/v1/research", status_code=status.HTTP_202_ACCEPTED)
 async def start_research(

@@ -18,6 +18,7 @@ import asyncio
 import fakeredis.aioredis as fakeredis_aioredis
 import pytest
 
+import app.cancellation as cancellation
 from app.cancellation import CancellationManager
 
 
@@ -105,6 +106,258 @@ async def test_cross_instance_cancel_refuses_already_terminal_operation():
 
 
 @pytest.mark.anyio
+async def test_local_cancel_refuses_already_terminal_operation():
+    """A task that has already produced a durable terminal result can stay
+    registered in active_tasks for a while afterward (its own post-result
+    cleanup, deliberately - see app/api.py's background_research_task,
+    which keeps itself registered through cleanup so shutdown's
+    quiesce_tasks() can still find it). Without a stored-status check, the
+    local branch below would cancel and report "cancelled" for any op_id
+    still registered, with no regard for what was actually stored - unlike
+    the cross-instance branch above, which already checks this. A client
+    that polls the result, sees it terminal, and then calls /cancel while
+    the task is merely still finishing cleanup must get the real stored
+    status back, not a spurious "cancelled"."""
+    manager = CancellationManager()
+
+    started = asyncio.Event()
+
+    async def still_registered_but_already_done():
+        started.set()
+        await asyncio.Event().wait()  # stands in for post-result cleanup still in flight
+
+    task = asyncio.create_task(still_registered_but_already_done())
+    manager.register_task("op-already-terminal", task)
+    await started.wait()
+
+    try:
+        async def lookup_completed(op_id):
+            return {"status": "completed"}
+
+        result = await manager.cancel_task("op-already-terminal", operation_lookup=lookup_completed)
+        assert result is False
+        assert not task.cancelled()
+        assert "op-already-terminal" in manager.active_tasks
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+
+@pytest.mark.anyio
+async def test_local_cancel_still_works_for_a_genuinely_running_operation():
+    """Companion to the refusal test above: the new stored-status check must
+    not block a legitimate cancel of an operation that is actually still
+    running."""
+    manager = CancellationManager()
+
+    started = asyncio.Event()
+    was_cancelled = asyncio.Event()
+    stored_status = {"value": "running"}
+
+    async def long_running_work():
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            # Mirrors background_research_task's own cancellation handler,
+            # which persists "cancelled" before this task returns.
+            stored_status["value"] = "cancelled"
+            was_cancelled.set()
+            raise
+
+    task = asyncio.create_task(long_running_work())
+    manager.register_task("op-still-running", task)
+    await started.wait()
+
+    async def lookup_running(op_id):
+        return {"status": stored_status["value"]}
+
+    result = await manager.cancel_task("op-still-running", operation_lookup=lookup_running)
+    assert result is True
+    await asyncio.wait_for(was_cancelled.wait(), timeout=2)
+
+
+@pytest.mark.anyio
+async def test_local_cancel_reports_real_status_when_task_finishes_before_cancellation_takes_effect():
+    """The stored-status check above is read before task.cancel(), so it
+    can be stale by the time cancel_task() actually acts - the task can
+    race ahead and persist its own terminal result in between.
+    task.cancel() is then either a no-op (the task already finished) or a
+    cancellation its own cancellation-safe cleanup absorbs, and either way
+    the task completes normally rather than raising CancelledError - so
+    without a second, race-free check after `task` has actually finished,
+    cancel_task() would return True unconditionally, and /cancel would
+    report "cancelled" for an operation that is really "completed"."""
+    manager = CancellationManager()
+    stored_status = {"value": "running"}
+
+    async def finishes_on_its_own_right_after_being_cancelled():
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            # Stands in for background_research_task's own cancellation-safe
+            # cleanup absorbing a cancellation that arrived after its real
+            # result was already persisted - it does not re-raise, so this
+            # task completes normally, not with CancelledError.
+            stored_status["value"] = "completed"
+
+    task = asyncio.create_task(finishes_on_its_own_right_after_being_cancelled())
+    manager.register_task("op-race", task)
+    await asyncio.sleep(0)
+
+    async def lookup(op_id):
+        return {"status": stored_status["value"]}
+
+    result = await manager.cancel_task("op-race", operation_lookup=lookup)
+    assert result is False, (
+        "cancel_task() must report the operation's real terminal status, not a blanket "
+        "cancelled, when the task actually finished on its own instead of being genuinely cancelled"
+    )
+
+
+@pytest.mark.anyio
+async def test_local_cancel_does_not_report_success_after_a_lost_lease_exit():
+    """A lost-lease exit (_LeaseLostError in app/api.py's
+    background_research_task) deliberately persists no status at all, so
+    the task its lease moved away from can be done - and absorb a
+    cancellation exactly the way a genuinely cancelled task does - while
+    storage still shows whatever status the new owner left (here,
+    "running"), never "cancelled". A check that only looks for an
+    unexpected *terminal* status after awaiting the task would miss this:
+    "running" is neither terminal nor "cancelled", so it would fall through
+    to a false cancel_task() success, telling the caller "cancelled" for an
+    operation that is really still running under a different owner."""
+    manager = CancellationManager()
+    stored_status = {"value": "running"}
+
+    async def absorbs_cancellation_without_persisting_anything():
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            # Stands in for a lost-lease exit: the task's own cancellation-
+            # safe cleanup absorbs the cancellation and returns normally,
+            # but nothing here writes a terminal status - the new owner's
+            # write (or lack of one yet) is what storage still reflects.
+            pass
+
+    task = asyncio.create_task(absorbs_cancellation_without_persisting_anything())
+    manager.register_task("op-lease-lost", task)
+    await asyncio.sleep(0)
+
+    async def lookup(op_id):
+        return {"status": stored_status["value"]}
+
+    result = await manager.cancel_task("op-lease-lost", operation_lookup=lookup)
+    assert result is False, (
+        "cancel_task() must not report success when the operation it awaited is still "
+        "non-terminal after a lost-lease exit that persisted nothing - the real status "
+        "belongs to whichever worker now owns it"
+    )
+
+
+@pytest.mark.timeout(2)
+@pytest.mark.anyio
+async def test_local_cancel_proceeds_when_the_pre_check_status_lookup_hangs(monkeypatch):
+    """The Redis client has no socket timeout (app/storage.py's
+    aioredis.from_url call), so a connection that accepts but never answers
+    could stall the pre-cancel status check forever - and cancelling a task
+    this replica already owns needs nothing from Redis at all, so a hung
+    status check must never be the reason task.cancel() never runs. The fix
+    bounds that lookup and, on timeout, proceeds exactly as if nothing was
+    found to refuse on.
+
+    Monkeypatches DEFAULT_INGEST_WAIT_TIMEOUT_S (the shared bound) to a tiny
+    value and makes operation_lookup never finish on its own, so the test
+    is fast and still proves the bound: without the fix, this would hang
+    rather than merely run slowly (the class 2s timeout above is the
+    backstop in case something regresses the fix entirely)."""
+    monkeypatch.setattr(cancellation, "DEFAULT_INGEST_WAIT_TIMEOUT_S", 0.05)
+    manager = CancellationManager()
+
+    started = asyncio.Event()
+    was_cancelled = asyncio.Event()
+
+    async def long_running_work():
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            was_cancelled.set()
+            raise
+
+    task = asyncio.create_task(long_running_work())
+    manager.register_task("op-pre-check-hangs", task)
+    await started.wait()
+
+    async def hangs_forever(op_id):
+        await asyncio.Event().wait()
+
+    result = await manager.cancel_task("op-pre-check-hangs", operation_lookup=hangs_forever)
+    assert result is True, "a hung pre-cancel status lookup must not prevent a legitimate local cancel"
+    await asyncio.wait_for(was_cancelled.wait(), timeout=1.0)
+
+
+@pytest.mark.timeout(2)
+@pytest.mark.anyio
+async def test_local_cancel_reports_success_when_the_post_check_status_lookup_hangs(monkeypatch):
+    """Companion to the pre-check test above: a hung Redis read in the
+    second, post-await status check must not turn a cancel this replica
+    actually carried out - purely in-process, already complete by this
+    point - into a hang either. On timeout, the fix falls back to
+    reporting what it's actually sure of: the local task was cancelled and
+    awaited."""
+    monkeypatch.setattr(cancellation, "DEFAULT_INGEST_WAIT_TIMEOUT_S", 0.05)
+    manager = CancellationManager()
+
+    started = asyncio.Event()
+
+    async def long_running_work():
+        started.set()
+        await asyncio.Event().wait()
+
+    task = asyncio.create_task(long_running_work())
+    manager.register_task("op-post-check-hangs", task)
+    await started.wait()
+
+    async def hangs_forever(op_id):
+        await asyncio.Event().wait()
+
+    result = await manager.cancel_task("op-post-check-hangs", operation_lookup=hangs_forever)
+    assert result is True, (
+        "a hung post-cancel status lookup must not turn a completed local cancellation into a failure"
+    )
+
+
+@pytest.mark.timeout(2)
+@pytest.mark.anyio
+async def test_cross_instance_cancel_broadcasts_when_the_status_lookup_hangs(monkeypatch):
+    """Same bound as the local branch, but a hung lookup here can't fall
+    back to the local branch's "proceed as if nothing was found" answer -
+    that already means something specific (refuse) for a lookup that
+    genuinely ran. On timeout we don't know either way, so the fix skips
+    the refusal and broadcasts anyway: this instance has no task of its own
+    at stake, and a redundant broadcast is harmless, unlike silently
+    dropping a cancel request because Redis happened to be slow."""
+    monkeypatch.setattr(cancellation, "DEFAULT_INGEST_WAIT_TIMEOUT_S", 0.05)
+    fake_redis = fakeredis_aioredis.FakeRedis(decode_responses=True)
+    manager = CancellationManager()
+    await manager.init(fake_redis)
+
+    try:
+        async def hangs_forever(op_id):
+            await asyncio.Event().wait()
+
+        result = await manager.cancel_task("op-cross-instance-lookup-hangs", operation_lookup=hangs_forever)
+        assert result is True, "a hung pre-broadcast status lookup must not prevent the cross-instance broadcast"
+    finally:
+        await manager.shutdown()
+        await fake_redis.aclose()
+
+
+@pytest.mark.anyio
 async def test_cancel_task_with_no_redis_and_no_local_task_returns_false():
     """Without Redis wired up and no locally-registered task, there's
     nothing this instance can do about the cancel request."""
@@ -147,4 +400,68 @@ async def test_quiesce_tasks_cancels_and_awaits_active_tasks():
 async def test_quiesce_tasks_returns_zero_when_idle():
     manager = CancellationManager()
     assert await manager.quiesce_tasks() == 0
+
+
+@pytest.mark.anyio
+async def test_quiesce_tasks_default_timeout_tracks_four_times_the_ingest_constant(monkeypatch):
+    """A flat 5s default here is shorter than a single bounded cleanup step
+    (DEFAULT_INGEST_WAIT_TIMEOUT_S = 6s), let alone the three such steps
+    background_research_task's own `finally` block (app/api.py) can run
+    through serially on either path it takes - ingest, lease, concurrency
+    slot on success, or spend, lease, concurrency slot on failure/
+    cancellation. Shutdown could call quiesce_tasks(), get back control
+    after its timeout, and go on to drain ingests and close storage
+    connections while a task was still mid-cleanup - abandoning its
+    owner-lease/concurrency-slot/spend-hold release exactly as this cleanup
+    path otherwise protects for the outcome ingest.
+
+    The default is 4x that per-step bound, not exactly 3x: this wait's own
+    deadline starts counting before each task's own cancellation is
+    actually delivered and its cleanup loop computes its own three per-step
+    deadlines, and scheduling/logging overhead across three sequential
+    waits adds more on top of that - so a flat 3x multiple leaves zero
+    margin against both effects, and real headroom (a fourth step's worth)
+    is needed to reliably cover a task's full serial cleanup rather than
+    racing it almost exactly.
+
+    Timing how long quiesce_tasks() takes to return against a task driven
+    through three serial cleanup steps scaled to a tiny monkeypatched
+    DEFAULT_INGEST_WAIT_TIMEOUT_S does not actually discriminate this
+    relationship: a total of ~0.12s fits comfortably within both the new
+    default and the old flat 5.0s default it should catch a regression of,
+    so it would pass unchanged either way and prove nothing - reproducible
+    standalone with a fixed timeout=5.0, yielding the identical
+    done=True/steps=3 result. Racing real elapsed time against a 5-second
+    baseline isn't practical at test speed, so this instead spies on the
+    exact timeout value quiesce_tasks() passes to asyncio.wait() and
+    asserts it against the monkeypatched constant directly - deterministic,
+    fast, and immune to how long any task's own cleanup happens to take."""
+    monkeypatch.setattr(cancellation, "DEFAULT_INGEST_WAIT_TIMEOUT_S", 0.05)
+
+    captured = {}
+    real_wait = asyncio.wait
+
+    async def capturing_wait(tasks, timeout=None):
+        captured["timeout"] = timeout
+        return await real_wait(tasks, timeout=timeout)
+
+    monkeypatch.setattr(cancellation.asyncio, "wait", capturing_wait)
+
+    manager = CancellationManager()
+    started = asyncio.Event()
+
+    async def long_running():
+        started.set()
+        await asyncio.Event().wait()
+
+    task = asyncio.create_task(long_running())
+    manager.register_task("op-capture-quiesce-timeout", task)
+    await started.wait()
+
+    await manager.quiesce_tasks()
+
+    assert captured["timeout"] == pytest.approx(0.2), (
+        "quiesce_tasks()'s default must track 4x DEFAULT_INGEST_WAIT_TIMEOUT_S "
+        f"(0.2 here), not a flat number unrelated to it - got {captured.get('timeout')!r}"
+    )
 
