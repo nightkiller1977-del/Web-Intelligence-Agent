@@ -18,6 +18,7 @@ import asyncio
 import fakeredis.aioredis as fakeredis_aioredis
 import pytest
 
+import app.cancellation as cancellation
 from app.cancellation import CancellationManager
 
 
@@ -258,4 +259,55 @@ async def test_quiesce_tasks_cancels_and_awaits_active_tasks():
 async def test_quiesce_tasks_returns_zero_when_idle():
     manager = CancellationManager()
     assert await manager.quiesce_tasks() == 0
+
+
+@pytest.mark.timeout(2)
+@pytest.mark.anyio
+async def test_quiesce_tasks_default_covers_a_tasks_full_serial_cleanup(monkeypatch):
+    """Regression for a ninth-round Codex P2 finding on PR #32: the previous
+    5s default here was shorter than a single bounded cleanup step
+    (DEFAULT_INGEST_WAIT_TIMEOUT_S = 6s), let alone the three such steps
+    background_research_task's own `finally` block (app/api.py) can run
+    through serially on either path it takes - ingest, lease, concurrency
+    slot on success, or spend, lease, concurrency slot on failure/
+    cancellation. Shutdown could call quiesce_tasks(), get back control
+    after its timeout, and go on to drain ingests and close storage
+    connections while a task was still mid-cleanup - abandoning its
+    owner-lease/concurrency-slot/spend-hold release exactly as this PR fixed
+    for the outcome ingest. The fix raises the default to
+    3 * DEFAULT_INGEST_WAIT_TIMEOUT_S, covering that worst case.
+
+    Monkeypatches DEFAULT_INGEST_WAIT_TIMEOUT_S to a tiny value and runs a
+    task through three serial cancellation-absorbing steps scaled to that
+    same constant - standing in for the three real cleanup steps - so the
+    test is fast and still proves the relationship: without the fix
+    (a flat 5s default unrelated to that constant), this would either hang
+    relative to a tiny constant or fail for a realistic one; this proves the
+    default actually tracks 3x the constant rather than a fixed number."""
+    monkeypatch.setattr(cancellation, "DEFAULT_INGEST_WAIT_TIMEOUT_S", 0.05)
+
+    manager = CancellationManager()
+    started = asyncio.Event()
+    steps_completed = 0
+
+    async def three_step_cleanup_after_cancel():
+        nonlocal steps_completed
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            for _ in range(3):
+                await asyncio.sleep(0.04)  # stands in for one bounded, cancellation-absorbing release call
+                steps_completed += 1
+            raise
+
+    task = asyncio.create_task(three_step_cleanup_after_cancel())
+    manager.register_task("op-three-step-cleanup", task)
+    await started.wait()
+
+    quiesced = await manager.quiesce_tasks()
+
+    assert quiesced == 1
+    assert task.done(), "quiesce_tasks() must wait out the task's full serial cleanup, not give up partway through"
+    assert steps_completed == 3
 

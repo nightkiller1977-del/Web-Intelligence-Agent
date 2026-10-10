@@ -3,6 +3,8 @@ import asyncio
 import logging
 from typing import Awaitable, Callable, Dict, Optional
 
+from app.researcher_adapter import DEFAULT_INGEST_WAIT_TIMEOUT_S
+
 logger = logging.getLogger("web-intelligence")
 
 CANCEL_CHANNEL = "research:cancel"
@@ -127,14 +129,30 @@ class CancellationManager:
         logger.warning("No active task found to cancel for operation: %s", op_id)
         return False
 
-    async def quiesce_tasks(self, timeout: float = 5.0) -> int:
+    async def quiesce_tasks(self, timeout=None) -> int:
         """Cancel and await in-flight research tasks before shutdown proceeds.
 
         Shutdown must not let a still-running research task finish after the
         pending-ingest snapshot was taken, or its outcome ingest would be
         scheduled into a closing event loop. Cancelling and awaiting the active
         tasks first makes that snapshot complete.
+
+        The default must cover a task's own worst-case cleanup time, not just
+        a nominal grace period: background_research_task's `finally` block
+        (app/api.py) runs exactly three cancellation-safe waits serially on
+        either path it can take - ingest, lease, concurrency slot on success,
+        or spend, lease, concurrency slot on failure/cancellation when a
+        spend hold was reserved - each individually bounded by
+        DEFAULT_INGEST_WAIT_TIMEOUT_S. A shorter timeout here would let this
+        call return, and shutdown proceed to drain ingests and close storage
+        connections, while a task is still mid-cleanup - abandoning its
+        owner-lease/concurrency-slot/spend-hold release exactly as this PR is
+        fixing for the outcome ingest. Looked up fresh on each call (rather
+        than bound as a literal default) so tests can monkeypatch
+        DEFAULT_INGEST_WAIT_TIMEOUT_S the same way they do elsewhere.
         """
+        if timeout is None:
+            timeout = 3 * DEFAULT_INGEST_WAIT_TIMEOUT_S
         pending = [task for task in self.active_tasks.values() if not task.done()]
         if not pending:
             return 0
