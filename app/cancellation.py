@@ -108,11 +108,25 @@ class CancellationManager:
             # to after cleanup there - or adding a second writer for the
             # same op_id - would silently reopen the race this check exists
             # to close.
+            #
+            # "If it persists one at all" matters here too: on a lost-lease
+            # exit (_LeaseLostError in app/api.py), this task deliberately
+            # persists nothing, so a status this stale (still "running",
+            # left by whichever worker now actually owns it) can be exactly
+            # what storage still shows once this await returns - the status
+            # is neither "cancelled" nor one of TERMINAL_STATUSES, so the
+            # narrower check below would fall through to a false "cancelled"
+            # if it only looked for an unexpected *terminal* status. Cancel
+            # really took effect only when the authoritative post-await
+            # status is "cancelled" - anything else, terminal or not, means
+            # either the cancellation arrived too late or this worker lost
+            # ownership without it, and the real state belongs to whoever
+            # wrote (or will write) that status.
             if operation_lookup:
                 op = await operation_lookup(op_id)
-                if op and op.get("status") in TERMINAL_STATUSES and op.get("status") != "cancelled":
+                if op and op.get("status") != "cancelled":
                     logger.info(
-                        "Operation %s reached %s on its own before cancellation took effect; reporting that instead",
+                        "Operation %s is %s (not cancelled) after awaiting its task; reporting that instead",
                         op_id,
                         op.get("status")
                     )
@@ -158,12 +172,24 @@ class CancellationManager:
         call return, and shutdown proceed to drain ingests and close storage
         connections, while a task is still mid-cleanup - abandoning its
         owner-lease/concurrency-slot/spend-hold release exactly as this PR is
-        fixing for the outcome ingest. Looked up fresh on each call (rather
-        than bound as a literal default) so tests can monkeypatch
-        DEFAULT_INGEST_WAIT_TIMEOUT_S the same way they do elsewhere.
+        fixing for the outcome ingest.
+
+        Set to 4x, not exactly 3x, that per-step bound: this wait's own
+        deadline starts counting the moment it is called, strictly before
+        each task's own cancellation is actually delivered and its cleanup
+        loop computes its own three per-step deadlines - so even with zero
+        added overhead, a task's full serial cleanup can run past this
+        wait's deadline if the two were set to the exact same multiple.
+        Scheduling and logging overhead across three sequential waits adds
+        more on top of that. The extra step's worth of headroom is enough
+        to absorb both without needing to measure or tune the exact gap.
+
+        Looked up fresh on each call (rather than bound as a literal
+        default) so tests can monkeypatch DEFAULT_INGEST_WAIT_TIMEOUT_S the
+        same way they do elsewhere.
         """
         if timeout is None:
-            timeout = 3 * DEFAULT_INGEST_WAIT_TIMEOUT_S
+            timeout = 4 * DEFAULT_INGEST_WAIT_TIMEOUT_S
         pending = [task for task in self.active_tasks.values() if not task.done()]
         if not pending:
             return 0
