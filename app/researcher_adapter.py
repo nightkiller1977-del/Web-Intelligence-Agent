@@ -929,8 +929,8 @@ async def flush_pending_ingest_tasks(timeout: float = 6.0) -> int:
     is NOT what a single operation's own completion path should call: that
     would wait on other concurrent operations' ingests too, holding this
     operation's lease/concurrency slot for up to `timeout` over work that
-    has nothing to do with it (Codex P2 on PR #32). Use
-    schedule_outcome_ingest_task()'s returned task for that instead.
+    has nothing to do with it. Use schedule_outcome_ingest_task()'s
+    returned task for that instead.
     """
     pending = [task for task in _pending_ingest_tasks if not task.done()]
     if not pending:

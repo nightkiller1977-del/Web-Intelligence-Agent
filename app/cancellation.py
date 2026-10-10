@@ -67,8 +67,7 @@ class CancellationManager:
             # cross-instance branch below already does - otherwise a client
             # that polls the result, sees it terminal, and then calls cancel
             # during that cleanup window flips an immutable, already-
-            # persisted result to a spurious "cancelled" response (Codex P2
-            # on PR #32).
+            # persisted result to a spurious "cancelled" response.
             if operation_lookup:
                 op = await operation_lookup(op_id)
                 if op and op.get("status") in TERMINAL_STATUSES:

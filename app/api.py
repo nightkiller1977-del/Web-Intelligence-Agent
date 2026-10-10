@@ -314,48 +314,42 @@ async def background_research_task(
         # This task's own HTTP request (POST /v1/research) already returned
         # 202 before this coroutine started, so Azure Container Apps' request
         # concurrency scaler has no open connection tying this replica to this
-        # operation. Once the SSE consumer disconnects, the replica is free to
-        # scale toward zero at any point. A detached Brain Memory ingest task
-        # has no such protection and can be killed mid-flight before it ever
-        # completes. This belongs in `finally`, not inline after
-        # schedule_outcome_ingest_task(), specifically so cancellation also
-        # waits: a CancelledError delivered while suspended on an inline await
-        # is caught by the except block below it and never retried, so the
-        # already-scheduled ingest task kept running detached while the
-        # operation reported "cancelled" - the same race this whole fix
-        # targets, just reachable through cancellation instead of normal
-        # completion. Running it here covers every exit path uniformly.
+        # operation; the replica is free to scale toward zero once the SSE
+        # consumer disconnects. A detached Brain Memory ingest task has no
+        # such protection and can be killed mid-flight before it completes.
+        # Running the await here, in `finally`, covers both the normal-return
+        # and cancellation exit paths uniformly: inline right after
+        # schedule_outcome_ingest_task() would be skipped if cancellation
+        # landed on exactly that await, since it is inside the `try` whose
+        # `except asyncio.CancelledError` above never retries it.
         #
-        # Awaits `ingest_task` directly - this operation's own task, captured
-        # from schedule_outcome_ingest_task()'s return value - rather than
-        # flush_pending_ingest_tasks(), which drains the module-global set of
-        # every operation's pending ingest. Under concurrent load that made
-        # this operation's lease/concurrency-slot release wait on unrelated
-        # operations' Brain requests too, for up to flush's own 6s timeout,
-        # even when this operation scheduled no ingest of its own (Codex P2 on
-        # PR #32).
+        # Awaits `ingest_task` directly - this operation's own task - rather
+        # than draining every operation's pending ingest: the per-operation
+        # task is what this function actually needs to wait for, and nothing
+        # else's unrelated in-flight Brain request should hold up this
+        # operation's own lease/concurrency-slot release.
         #
         # asyncio.shield, not a bare await: a cancellation landing exactly
         # while suspended here would otherwise interrupt only the *waiting*,
         # not `ingest_task` itself - a bare await propagates cancellation into
         # what it awaits, so without the shield this function would move on
         # and release the owner lease/concurrency slot while the ingest it
-        # already scheduled is still mid-flight and now has nothing left
-        # tracking it: the exact race this whole fix targets, just moved one
-        # line down instead of closed. Shielding lets that ingest keep running
-        # to completion independently of whether this task itself gets
-        # cancelled again right here.
+        # already scheduled is still mid-flight, now with nothing tracking
+        # it. Shielding lets that ingest keep running to completion
+        # independently of whether this task itself gets cancelled again
+        # right here.
         #
-        # Shielding alone is not the whole fix, though: the outer await still
-        # raises CancelledError immediately when a cancellation lands exactly
-        # on it - shield does not change *this* function's own cancellation
-        # semantics, only whether `ingest_task` survives being cancelled out
-        # from under it. Looped rather than a single retry, so no number of
-        # repeated cancellations of this task - including quiesce_tasks()
-        # cancelling it again during shutdown, harmlessly, while it waits
-        # here (this task stays registered through its own cleanup; see the
+        # Shielding alone does not make this wait durable against repeated
+        # cancellation, though: the outer await still raises CancelledError
+        # immediately when a cancellation lands exactly on it - shield does
+        # not change *this* function's own cancellation semantics, only
+        # whether `ingest_task` survives being cancelled out from under it.
+        # Looped rather than a single retry, so no number of repeated
+        # cancellations of this task - including quiesce_tasks() cancelling
+        # it again during shutdown, harmlessly, while it waits here (this
+        # task stays registered through its own cleanup; see the
         # unregister_task() call at the end of this block) - can ever
-        # actually cancel the ingest it is protecting (Codex P2 on PR #32).
+        # actually cancel the ingest it is protecting.
         if ingest_task is not None:
             while not ingest_task.done():
                 try:
@@ -387,10 +381,10 @@ async def background_research_task(
         # active_tasks, so unregistering any earlier would let shutdown race
         # past this task while it still has cleanup left - losing the lease,
         # concurrency slot, or spend-hold release and leaving them pinned
-        # until their TTLs expire (Codex P2 on PR #32; cancel_task()'s own
-        # terminal-status check above is what keeps a merely-registered,
-        # already-finished operation from being spuriously cancelled in the
-        # meantime, so unregistration timing no longer has to do that job).
+        # until their TTLs expire. cancel_task()'s own terminal-status check
+        # is what keeps a merely-registered, already-finished operation from
+        # being spuriously cancelled in the meantime, so unregistration
+        # timing does not have to do that job too.
         try:
             cancellation_manager.unregister_task(op_id)
         except Exception:
