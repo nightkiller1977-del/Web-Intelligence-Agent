@@ -712,6 +712,66 @@ async def test_cancellation_during_spend_release_still_lets_it_complete(monkeypa
     )
 
 
+@pytest.mark.timeout(2)
+@pytest.mark.anyio
+async def test_cancellation_safe_release_is_bounded_so_a_stalled_release_cannot_pin_cleanup(monkeypatch):
+    """Regression for an eighth-round Codex P2 finding on PR #32:
+    _release_cancellation_safe's shield-and-retry loop (the previous round's
+    fix) had no overall wall-clock bound, unlike the per-operation ingest
+    wait right above it. The Redis client is created without a socket
+    timeout (app/storage.py's aioredis.from_url call), so a connection that
+    accepts but never answers would let this loop wait forever - and with
+    the previous round's fix in place, a cancellation landing on it no
+    longer breaks that wait either, since it is unconditionally re-entered
+    on every CancelledError. That left the task pinned mid-cleanup, never
+    unregistering, until the platform killed the process. The fix wraps the
+    same shielded wait in asyncio.wait_for against a deadline, exactly like
+    the ingest wait already does, giving up (and falling back on the
+    reservation's own TTL expiry) rather than hanging indefinitely.
+
+    Monkeypatches DEFAULT_INGEST_WAIT_TIMEOUT_S (the shared bound both waits
+    use) to a tiny value and makes release_operation_lease never finish on
+    its own, so the test is fast and still proves the bound: without the
+    fix, this would hang rather than merely run slowly (the class 2s timeout
+    above is the backstop in case something regresses the fix entirely)."""
+    monkeypatch.setattr(api, "DEFAULT_INGEST_WAIT_TIMEOUT_S", 0.05)
+
+    async def fake_conduct_web_research(**kwargs):
+        return {
+            "operationId": kwargs["op_id"], "status": "completed", "mode": kwargs["mode"],
+            "profile": kwargs["profile"], "answer": "Mock answer", "sources": [], "evidence": [],
+            "claims": [], "citations": [], "searchesPerformed": [],
+            "metrics": {"startedAt": "2026-01-01T00:00:00+00:00", "completedAt": "2026-01-01T00:00:01+00:00",
+                        "durationMs": 1, "searchesPerformed": 0, "pagesRead": 0, "sourcesConsidered": 0, "sourcesUsed": 0},
+        }
+
+    async def fake_release_operation_lease(op_id):
+        await asyncio.Event().wait()  # stands in for a Redis call that never answers
+
+    monkeypatch.setattr(api, "conduct_web_research", fake_conduct_web_research)
+    monkeypatch.setattr(api, "schedule_outcome_ingest_task", lambda *a, **k: None)
+    monkeypatch.setattr(api.storage, "release_operation_lease", fake_release_operation_lease)
+
+    operation_id = "op-stalled-release"
+    req = ResearchRequestInput(**_payload(operation_id))
+    reporter = ProgressReporter(operation_id)
+
+    task = asyncio.create_task(api.background_research_task(req, reporter, headers={}))
+    api.cancellation_manager.register_task(operation_id, task)
+
+    start = time.monotonic()
+    await task
+    elapsed = time.monotonic() - start
+
+    assert elapsed < 1.0, (
+        f"waited {elapsed:.3f}s - a cancellation-safe release must be bounded, "
+        "not allowed to wait indefinitely on a stalled Redis call"
+    )
+    assert operation_id not in api.cancellation_manager.active_tasks, (
+        "the task must still unregister after giving up on a stalled release"
+    )
+
+
 def test_research_submission_returns_passage_backed_claims(monkeypatch):
     async def fake_conduct_web_research(**kwargs):
         return {

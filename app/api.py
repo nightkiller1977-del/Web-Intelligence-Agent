@@ -188,7 +188,7 @@ async def _report_progress_best_effort(
         logger.warning("Failed to publish progress event for stage %s.", stage, exc_info=True)
 
 
-async def _release_cancellation_safe(awaitable, op_id: str, description: str) -> None:
+async def _release_cancellation_safe(awaitable, op_id: str, description: str, timeout=None) -> None:
     """Run a single idempotent release call to completion, surviving any
     number of cancellations of the calling task without ever cancelling the
     release itself.
@@ -203,11 +203,32 @@ async def _release_cancellation_safe(awaitable, op_id: str, description: str) ->
     because every caller of this helper releases something idempotent:
     removing an already-removed reservation/lease/slot is a no-op, not an
     error, so settling on the one in-flight call is enough.
+
+    Bounded by `timeout` (defaulting to DEFAULT_INGEST_WAIT_TIMEOUT_S, looked
+    up fresh on each call so tests can monkeypatch it the same way they do
+    for the ingest wait): the Redis client is created without a socket
+    timeout (see app/storage.py's `aioredis.from_url` call), so a connection
+    that accepts but never answers would otherwise let this loop absorb
+    cancellations forever, pinning the task mid-cleanup so it never
+    unregisters. Giving up after the deadline leaves this release exactly as
+    ambiguous as any other failure case here, falling back on the same TTL
+    expiry already relied on elsewhere.
     """
+    if timeout is None:
+        timeout = DEFAULT_INGEST_WAIT_TIMEOUT_S
     task = asyncio.ensure_future(awaitable)
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
     while not task.done():
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            logger.warning("Timed out waiting to %s for operation %s.", description, op_id)
+            return
         try:
-            await asyncio.shield(task)
+            await asyncio.wait_for(asyncio.shield(task), timeout=remaining)
+        except asyncio.TimeoutError:
+            logger.warning("Timed out waiting to %s for operation %s.", description, op_id)
+            return
         except asyncio.CancelledError:
             continue
         except Exception:
