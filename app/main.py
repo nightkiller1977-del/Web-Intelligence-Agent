@@ -23,6 +23,21 @@ logger = logging.getLogger("web-intelligence")
 PUBLIC_PATHS = {"/health/live", "/health/ready", "/capabilities", "/version", "/metrics"}
 DOCS_PATHS = {"/docs", "/redoc", "/openapi.json", "/docs/oauth2-redirect"}
 
+# Azure Container Apps (and Kubernetes-style platforms generally) default to
+# a 30s SIGTERM-to-SIGKILL grace period. quiesce_tasks()'s own wait and
+# flush_pending_ingest_tasks()'s backstop are each sized independently for
+# their own purpose - the former to reliably outlast a single task's own
+# worst-case serial cleanup, the latter for a slow-but-not-hung Brain Memory
+# response - with nothing keeping their *sum* under the platform's actual
+# limit; today they happen to add up to exactly that default, leaving zero
+# margin. Wrapping the whole drain sequence in one hard ceiling with real
+# margin under that assumed default means shutdown always leaves the
+# platform time to finish its own termination handling cleanly. In the rare
+# case this ceiling cuts a task's cleanup short, that is the same
+# already-accepted TTL-based fallback this cleanup path relies on
+# elsewhere (a stuck reservation expires on its own), not a new kind of loss.
+SHUTDOWN_DRAIN_BUDGET_S = 20.0
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Initializing storage backend lifecycle...")
@@ -73,11 +88,28 @@ async def lifespan(app: FastAPI):
     # Quiesce in-flight research first: a research task that finished after the
     # ingest snapshot below would schedule an untracked ingest into a closing
     # loop. Cancel/await active tasks, then drain the ingests they produced.
-    await cancellation_manager.quiesce_tasks()
-    # Best-effort Brain outcome ingests are tracked tasks. Await them before
-    # the loop tears down, otherwise a graceful shutdown can close the loop
-    # mid-flight and lose the outcome despite scheduling it.
-    await flush_pending_ingest_tasks()
+    #
+    # Bounded as one sequence by SHUTDOWN_DRAIN_BUDGET_S (see its own comment
+    # above): a timeout here only cancels this wrapper, not the individual
+    # background tasks quiesce_tasks() already cancelled - asyncio.wait()
+    # does not cancel its own members when the wait around it is cancelled,
+    # so they keep running to their own completion independently; this just
+    # stops them from blocking shutdown past the platform's own patience.
+    async def _drain_in_flight_work():
+        await cancellation_manager.quiesce_tasks()
+        # Best-effort Brain outcome ingests are tracked tasks. Await them
+        # before the loop tears down, otherwise a graceful shutdown can
+        # close the loop mid-flight and lose the outcome despite scheduling
+        # it.
+        await flush_pending_ingest_tasks()
+
+    try:
+        await asyncio.wait_for(_drain_in_flight_work(), timeout=SHUTDOWN_DRAIN_BUDGET_S)
+    except asyncio.TimeoutError:
+        logger.warning(
+            "Shutdown drain did not finish within %.1fs; proceeding with teardown anyway.",
+            SHUTDOWN_DRAIN_BUDGET_S,
+        )
     await cancellation_manager.shutdown()
     logger.info("Shutting down storage backend connections...")
 
