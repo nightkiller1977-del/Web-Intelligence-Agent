@@ -188,6 +188,33 @@ async def _report_progress_best_effort(
         logger.warning("Failed to publish progress event for stage %s.", stage, exc_info=True)
 
 
+async def _release_cancellation_safe(awaitable, op_id: str, description: str) -> None:
+    """Run a single idempotent release call to completion, surviving any
+    number of cancellations of the calling task without ever cancelling the
+    release itself.
+
+    A bare `try/except CancelledError: log and move on` leaves the release's
+    own outcome ambiguous - the call could have been aborted before it ever
+    reached Redis, or it could have completed there with the response simply
+    never observed here - and never retries or reconciles it, potentially
+    leaving the spend reservation, owner lease, or concurrency slot pinned
+    until its TTL expires. Shielding and re-awaiting the same call (rather
+    than issuing a fresh one on every retry) is safe here specifically
+    because every caller of this helper releases something idempotent:
+    removing an already-removed reservation/lease/slot is a no-op, not an
+    error, so settling on the one in-flight call is enough.
+    """
+    task = asyncio.ensure_future(awaitable)
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            continue
+        except Exception:
+            logger.warning("Failed to %s for operation %s.", description, op_id, exc_info=True)
+            return
+
+
 async def background_research_task(
     req: ResearchRequestInput,
     reporter: ProgressReporter,
@@ -388,25 +415,20 @@ async def background_research_task(
         # transient Redis error releasing the spend hold) must not skip the
         # others, or the owner lease and concurrency slot would stay pinned for
         # the full lease TTL and the task would leak in the local registry.
-        # Each one also catches CancelledError alongside Exception, not just
-        # here but through to unregistration: the task stays registered for
+        # Each one also survives cancellation rather than treating it as
+        # failure, through to unregistration: the task stays registered for
         # quiesce_tasks() to find throughout this whole phase (deliberately -
         # see the unregister_task() comment below), so a cancellation landing
-        # on any one of these plain awaits must not propagate out and skip
-        # the rest the same way an uncaught one would.
+        # on any one of these awaits must not propagate out and skip the rest
+        # the same way an uncaught one would - nor leave that one release's
+        # own outcome ambiguous, which is what _release_cancellation_safe is
+        # for.
         if spend_reserved and not spend_reconciled:
-            try:
-                await storage.release_daily_spend(spend_reserved, op_id)
-            except (Exception, asyncio.CancelledError):
-                logger.warning("Failed to release spend hold for operation %s.", op_id, exc_info=True)
-        try:
-            await storage.release_operation_lease(op_id)
-        except (Exception, asyncio.CancelledError):
-            logger.warning("Failed to release owner lease for operation %s.", op_id, exc_info=True)
-        try:
-            await storage.release_concurrency_slot(op_id)
-        except (Exception, asyncio.CancelledError):
-            logger.warning("Failed to release concurrency slot for operation %s.", op_id, exc_info=True)
+            await _release_cancellation_safe(
+                storage.release_daily_spend(spend_reserved, op_id), op_id, "release spend hold"
+            )
+        await _release_cancellation_safe(storage.release_operation_lease(op_id), op_id, "release owner lease")
+        await _release_cancellation_safe(storage.release_concurrency_slot(op_id), op_id, "release concurrency slot")
         # Unregistered last, once every cleanup step above has actually run:
         # quiesce_tasks() (shutdown) only cancels/awaits tasks still in
         # active_tasks, so unregistering any earlier would let shutdown race

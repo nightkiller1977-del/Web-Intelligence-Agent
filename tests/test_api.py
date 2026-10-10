@@ -656,6 +656,62 @@ async def test_cancellation_during_lease_release_does_not_skip_remaining_cleanup
     )
 
 
+@pytest.mark.anyio
+async def test_cancellation_during_spend_release_still_lets_it_complete(monkeypatch):
+    """Regression for a sixth-round Codex P2 finding on PR #32: catching
+    CancelledError around each release call (the previous round's fix) and
+    just logging it leaves that release's own outcome ambiguous - the call
+    could abort before it ever reached Redis, or could have completed there
+    with the response simply never observed here - without ever retrying or
+    reconciling it, potentially leaving the spend reservation (equally the
+    owner lease or concurrency slot) pinned until its TTL expires. The fix
+    (_release_cancellation_safe) shields and re-awaits the same release call
+    until it actually settles, which is safe specifically because every
+    release it protects is idempotent.
+
+    release_daily_spend is only reached when research itself failed with
+    spend still reserved (the normal-completion path reconciles the spend
+    instead, always marking it handled regardless of outcome) - so this
+    drives that path via a raising conduct_web_research, then cancels the
+    task from inside a fake release_daily_spend with a real internal
+    suspension point, and asserts the release still completes.
+
+    Cancels via a closed-over reference to background_research_task's own
+    task, not asyncio.current_task(): by the time release_daily_spend's
+    coroutine actually runs, _release_cancellation_safe has already wrapped
+    it in its own Task via asyncio.ensure_future, so current_task() inside
+    it resolves to that release-call task, not the outer one."""
+    spend_released = asyncio.Event()
+    bg_task_ref = {}
+
+    async def fake_conduct_web_research(**kwargs):
+        raise RuntimeError("simulated research failure")
+
+    async def fake_release_daily_spend(amount_usd, op_id):
+        bg_task_ref["task"].cancel()
+        await asyncio.sleep(0.02)  # a real suspension point for the pending cancellation to land on
+        spend_released.set()
+
+    monkeypatch.setattr(api, "conduct_web_research", fake_conduct_web_research)
+    monkeypatch.setattr(api.storage, "release_daily_spend", fake_release_daily_spend)
+
+    operation_id = "op-cancel-during-spend-release"
+    req = ResearchRequestInput(**_payload(operation_id))
+    reporter = ProgressReporter(operation_id)
+
+    task = asyncio.create_task(
+        api.background_research_task(req, reporter, headers={}, spend_reserved=0.01, accounting_delegated=False)
+    )
+    bg_task_ref["task"] = task
+    api.cancellation_manager.register_task(operation_id, task)
+
+    await task  # raises if the cancellation propagated out instead of being absorbed
+
+    assert spend_released.is_set(), (
+        "release_daily_spend must still run to completion even though a cancellation landed while it was in flight"
+    )
+
+
 def test_research_submission_returns_passage_backed_claims(monkeypatch):
     async def fake_conduct_web_research(**kwargs):
         return {
