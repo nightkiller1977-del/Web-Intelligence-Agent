@@ -18,7 +18,7 @@ from app.storage import storage
 from app.schemas import ResearchRequestInput, ResearchResultResponse, CapabilitiesInfo
 from app.cancellation import cancellation_manager
 from app.progress_adapter import ProgressReporter
-from app.researcher_adapter import conduct_web_research, _LeaseLostError, schedule_outcome_ingest_task
+from app.researcher_adapter import conduct_web_research, _LeaseLostError, schedule_outcome_ingest_task, DEFAULT_INGEST_WAIT_TIMEOUT_S
 from app.security import is_gateway_destination_allowed, is_safe_url
 from app.metrics import observe_research_result, record_operation_spend
 
@@ -350,10 +350,35 @@ async def background_research_task(
         # task stays registered through its own cleanup; see the
         # unregister_task() call at the end of this block) - can ever
         # actually cancel the ingest it is protecting.
+        #
+        # Bounded to DEFAULT_INGEST_WAIT_TIMEOUT_S overall, not just per
+        # cancellation: the Brain Memory HTTP call's own 5s socket timeout
+        # resets on every partial read, so a connection that trickles data
+        # slowly enough can run far longer than that without ever tripping
+        # it. asyncio.wait_for's own timeout only cancels the *outer* shield
+        # wrapper it is given, exactly like an external cancellation would -
+        # ingest_task itself keeps running, still tracked for the eventual
+        # shutdown-time drain, just no longer blocking this operation's own
+        # lease/concurrency-slot release.
         if ingest_task is not None:
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + DEFAULT_INGEST_WAIT_TIMEOUT_S
             while not ingest_task.done():
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    logger.warning(
+                        "Brain Memory ingest for operation %s did not finish within %.1fs; releasing cleanup without it.",
+                        op_id, DEFAULT_INGEST_WAIT_TIMEOUT_S,
+                    )
+                    break
                 try:
-                    await asyncio.shield(ingest_task)
+                    await asyncio.wait_for(asyncio.shield(ingest_task), timeout=remaining)
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "Brain Memory ingest for operation %s did not finish within %.1fs; releasing cleanup without it.",
+                        op_id, DEFAULT_INGEST_WAIT_TIMEOUT_S,
+                    )
+                    break
                 except asyncio.CancelledError:
                     continue
                 except Exception:
@@ -363,18 +388,24 @@ async def background_research_task(
         # transient Redis error releasing the spend hold) must not skip the
         # others, or the owner lease and concurrency slot would stay pinned for
         # the full lease TTL and the task would leak in the local registry.
+        # Each one also catches CancelledError alongside Exception, not just
+        # here but through to unregistration: the task stays registered for
+        # quiesce_tasks() to find throughout this whole phase (deliberately -
+        # see the unregister_task() comment below), so a cancellation landing
+        # on any one of these plain awaits must not propagate out and skip
+        # the rest the same way an uncaught one would.
         if spend_reserved and not spend_reconciled:
             try:
                 await storage.release_daily_spend(spend_reserved, op_id)
-            except Exception:
+            except (Exception, asyncio.CancelledError):
                 logger.warning("Failed to release spend hold for operation %s.", op_id, exc_info=True)
         try:
             await storage.release_operation_lease(op_id)
-        except Exception:
+        except (Exception, asyncio.CancelledError):
             logger.warning("Failed to release owner lease for operation %s.", op_id, exc_info=True)
         try:
             await storage.release_concurrency_slot(op_id)
-        except Exception:
+        except (Exception, asyncio.CancelledError):
             logger.warning("Failed to release concurrency slot for operation %s.", op_id, exc_info=True)
         # Unregistered last, once every cleanup step above has actually run:
         # quiesce_tasks() (shutdown) only cancels/awaits tasks still in
@@ -384,7 +415,8 @@ async def background_research_task(
         # until their TTLs expire. cancel_task()'s own terminal-status check
         # is what keeps a merely-registered, already-finished operation from
         # being spuriously cancelled in the meantime, so unregistration
-        # timing does not have to do that job too.
+        # timing does not have to do that job too. Synchronous, so it cannot
+        # itself be interrupted by cancellation - only Exception applies.
         try:
             cancellation_manager.unregister_task(op_id)
         except Exception:

@@ -548,6 +548,114 @@ async def test_repeated_cancellation_never_reaches_the_ingest_task(monkeypatch):
     )
 
 
+@pytest.mark.timeout(2)
+@pytest.mark.anyio
+async def test_ingest_wait_is_bounded_so_a_stalled_ingest_cannot_pin_cleanup(monkeypatch):
+    """Regression for a fifth-round Codex P1 finding on PR #32: the
+    per-operation ingest-wait loop had no overall wall-clock bound, unlike
+    flush_pending_ingest_tasks()'s timeout it replaced. The Brain Memory
+    HTTP call's own per-socket-operation timeout resets on every partial
+    read, so an endpoint that accepts a connection and trickles data just
+    fast enough never trips it - without an outer bound, this operation's
+    lease/concurrency-slot release would wait indefinitely, and enough
+    stalled ingests could block all new research admissions. The fix wraps
+    the shielded wait in asyncio.wait_for against DEFAULT_INGEST_WAIT_TIMEOUT_S.
+
+    Monkeypatches that timeout to a tiny value and uses an ingest that never
+    finishes on its own, so the test is fast and still proves the bound:
+    without the fix, this test would hang rather than merely run slowly (the
+    class 2s timeout above is the backstop in case something regresses the
+    fix entirely)."""
+    monkeypatch.setattr(api, "DEFAULT_INGEST_WAIT_TIMEOUT_S", 0.05)
+
+    async def fake_conduct_web_research(**kwargs):
+        return {
+            "operationId": kwargs["op_id"], "status": "completed", "mode": kwargs["mode"],
+            "profile": kwargs["profile"], "answer": "Mock answer", "sources": [], "evidence": [],
+            "claims": [], "citations": [], "searchesPerformed": [],
+            "metrics": {"startedAt": "2026-01-01T00:00:00+00:00", "completedAt": "2026-01-01T00:00:01+00:00",
+                        "durationMs": 1, "searchesPerformed": 0, "pagesRead": 0, "sourcesConsidered": 0, "sourcesUsed": 0},
+        }
+
+    def fake_schedule_outcome_ingest_task(result, op_id, mode, inputs=None):
+        async def never_finishes():
+            await asyncio.Event().wait()
+        return asyncio.create_task(never_finishes())
+
+    monkeypatch.setattr(api, "conduct_web_research", fake_conduct_web_research)
+    monkeypatch.setattr(api, "schedule_outcome_ingest_task", fake_schedule_outcome_ingest_task)
+
+    operation_id = "op-stalled-ingest"
+    req = ResearchRequestInput(**_payload(operation_id))
+    reporter = ProgressReporter(operation_id)
+
+    start = time.monotonic()
+    await api.background_research_task(req, reporter, headers={})
+    elapsed = time.monotonic() - start
+
+    assert elapsed < 1.0, (
+        f"waited {elapsed:.3f}s - the per-operation ingest wait must be bounded, "
+        "not allowed to run indefinitely against a stalled endpoint"
+    )
+
+
+@pytest.mark.anyio
+async def test_cancellation_during_lease_release_does_not_skip_remaining_cleanup(monkeypatch):
+    """Regression for the companion Codex P2 finding on the same round as
+    the test above: unregister_task() running last (deliberately - see its
+    own comment in app/api.py) means the task stays registered through
+    release_daily_spend/release_operation_lease/release_concurrency_slot, so
+    a cancellation landing on any one of those plain awaits - for example
+    quiesce_tasks() cancelling it again during shutdown - would, without
+    catching CancelledError there too, propagate out of `finally` uncaught
+    and skip every cleanup step after it, including unregistration itself.
+    Fixed by catching CancelledError alongside Exception on each of those
+    awaits, same as the ingest-wait already does.
+
+    Cancels the task while it is suspended specifically inside
+    release_operation_lease and asserts the steps after it - concurrency-
+    slot release and unregistration - still ran, and that
+    background_research_task completed normally rather than propagating
+    the cancellation out to its own caller."""
+    slot_released = asyncio.Event()
+
+    async def fake_conduct_web_research(**kwargs):
+        return {
+            "operationId": kwargs["op_id"], "status": "completed", "mode": kwargs["mode"],
+            "profile": kwargs["profile"], "answer": "Mock answer", "sources": [], "evidence": [],
+            "claims": [], "citations": [], "searchesPerformed": [],
+            "metrics": {"startedAt": "2026-01-01T00:00:00+00:00", "completedAt": "2026-01-01T00:00:01+00:00",
+                        "durationMs": 1, "searchesPerformed": 0, "pagesRead": 0, "sourcesConsidered": 0, "sourcesUsed": 0},
+        }
+
+    async def fake_release_operation_lease(op_id):
+        asyncio.current_task().cancel()
+        await asyncio.sleep(0)  # a real suspension point for the pending cancellation to land on
+
+    async def fake_release_concurrency_slot(op_id):
+        slot_released.set()
+
+    monkeypatch.setattr(api, "conduct_web_research", fake_conduct_web_research)
+    monkeypatch.setattr(api.storage, "release_operation_lease", fake_release_operation_lease)
+    monkeypatch.setattr(api.storage, "release_concurrency_slot", fake_release_concurrency_slot)
+
+    operation_id = "op-cancel-during-lease-release"
+    req = ResearchRequestInput(**_payload(operation_id))
+    reporter = ProgressReporter(operation_id)
+
+    task = asyncio.create_task(api.background_research_task(req, reporter, headers={}))
+    api.cancellation_manager.register_task(operation_id, task)
+
+    await task  # raises if the cancellation propagated out instead of being absorbed
+
+    assert slot_released.is_set(), (
+        "concurrency-slot release must still run even after a cancellation interrupted the lease release before it"
+    )
+    assert operation_id not in api.cancellation_manager.active_tasks, (
+        "unregister_task must still run after a cancellation lands on an earlier cleanup step"
+    )
+
+
 def test_research_submission_returns_passage_backed_claims(monkeypatch):
     async def fake_conduct_web_research(**kwargs):
         return {

@@ -636,6 +636,15 @@ def append_input_sources(op_id: str, input_chunks: list[dict], sources: list[dic
 
 _pending_ingest_tasks: set = set()
 
+# Each Brain Memory HTTP call bounds its own socket operations (connect, each
+# send/recv) to 5s, which is not a bound on the call's total wall-clock time:
+# a connection that keeps sending some data, slowly, resets that per-operation
+# timeout on every partial read without the overall request ever finishing.
+# Callers that wait on an ingest task bound the wait itself to this, so a
+# stalled-but-still-trickling endpoint cannot hold a lease/concurrency slot or
+# the shutdown drain open indefinitely.
+DEFAULT_INGEST_WAIT_TIMEOUT_S = 6.0
+
 
 def _public_locator(raw: str) -> str:
     """Reduce a source locator to something safe to persist in shared memory.
@@ -921,7 +930,7 @@ def _schedule_outcome_ingest(client, result: Dict[str, Any], op_id: str, mode: s
     return task
 
 
-async def flush_pending_ingest_tasks(timeout: float = 6.0) -> int:
+async def flush_pending_ingest_tasks(timeout: float = DEFAULT_INGEST_WAIT_TIMEOUT_S) -> int:
     """Await every outstanding ingest task, across every operation.
 
     This drains the module-global set, so it is correct for actual shutdown
