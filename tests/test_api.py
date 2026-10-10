@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import time
 
 import httpx
@@ -612,12 +613,27 @@ async def test_cancellation_during_lease_release_does_not_skip_remaining_cleanup
     Fixed by catching CancelledError alongside Exception on each of those
     awaits, same as the ingest-wait already does.
 
-    Cancels the task while it is suspended specifically inside
-    release_operation_lease and asserts the steps after it - concurrency-
-    slot release and unregistration - still ran, and that
-    background_research_task completed normally rather than propagating
-    the cancellation out to its own caller."""
+    Cancels background_research_task's own task via a closed-over
+    reference, not asyncio.current_task(): an OpenHands finding on this same
+    round's head caught the original version of this test calling
+    current_task() inside fake_release_operation_lease, which - now that
+    _release_cancellation_safe wraps the release in its own task via
+    asyncio.ensure_future - resolves to that inner wrapper task, not
+    background_research_task. Cancelling it self-cancels the very release
+    this test means to protect instead of exercising an outer cancellation
+    landing on it, so the test passed without ever proving the lease release
+    completes; it only happened to pass because the next release step ran
+    regardless of how the one before it ended.
+
+    Asserts both that the lease release itself actually ran past its
+    cancellation (lease_released, set only after the fake's own suspension
+    point resolves) and that the steps after it - concurrency-slot release
+    and unregistration - still ran, and that background_research_task
+    completed normally rather than propagating the cancellation out to its
+    own caller."""
+    lease_released = asyncio.Event()
     slot_released = asyncio.Event()
+    bg_task_ref = {}
 
     async def fake_conduct_web_research(**kwargs):
         return {
@@ -629,8 +645,9 @@ async def test_cancellation_during_lease_release_does_not_skip_remaining_cleanup
         }
 
     async def fake_release_operation_lease(op_id):
-        asyncio.current_task().cancel()
-        await asyncio.sleep(0)  # a real suspension point for the pending cancellation to land on
+        bg_task_ref["task"].cancel()
+        await asyncio.sleep(0.02)  # a real suspension point for the pending cancellation to land on
+        lease_released.set()
 
     async def fake_release_concurrency_slot(op_id):
         slot_released.set()
@@ -644,15 +661,53 @@ async def test_cancellation_during_lease_release_does_not_skip_remaining_cleanup
     reporter = ProgressReporter(operation_id)
 
     task = asyncio.create_task(api.background_research_task(req, reporter, headers={}))
+    bg_task_ref["task"] = task
     api.cancellation_manager.register_task(operation_id, task)
 
     await task  # raises if the cancellation propagated out instead of being absorbed
 
+    assert lease_released.is_set(), (
+        "release_operation_lease must still run to completion even though a cancellation landed while it was in flight"
+    )
     assert slot_released.is_set(), (
         "concurrency-slot release must still run even after a cancellation interrupted the lease release before it"
     )
     assert operation_id not in api.cancellation_manager.active_tasks, (
         "unregister_task must still run after a cancellation lands on an earlier cleanup step"
+    )
+
+
+@pytest.mark.anyio
+async def test_release_cancellation_safe_logs_when_the_release_task_itself_is_cancelled(caplog):
+    """Regression for an OpenHands finding on this same round's head:
+    `while not task.done()` exits silently regardless of *how* `task`
+    finished, so a release task that ends up cancelled - rather than
+    completing or raising - was treated exactly like a successful release:
+    no warning, no retry, even though the idempotent release it wraps never
+    actually ran to completion. Not reachable through the normal
+    cancel-the-caller path (shield protects `task` from that cancellation
+    specifically) - it takes a direct `task.cancel()` on this exact object,
+    which is exactly what the fixed test bug in
+    test_cancellation_during_lease_release_does_not_skip_remaining_cleanup
+    did by accident before this round. The fix logs a warning when the loop
+    exits on a cancelled task instead of returning silently.
+
+    Drives this directly against the helper rather than through
+    background_research_task: asyncio.ensure_future's returned Task isn't
+    observable from outside, so the awaitable passed in cancels the task
+    that is currently running it via asyncio.current_task() - which, once
+    _release_cancellation_safe wraps it via ensure_future, resolves to that
+    same wrapper task."""
+
+    async def cancels_itself():
+        asyncio.current_task().cancel()
+        await asyncio.sleep(0.02)  # a real suspension point for the pending cancellation to land on
+
+    with caplog.at_level(logging.WARNING, logger="web-intelligence"):
+        await api._release_cancellation_safe(cancels_itself(), "op-release-self-cancelled", "release something")
+
+    assert any("cancelled rather than completed" in record.getMessage() for record in caplog.records), (
+        "a release task that ends up cancelled rather than completed must be logged, not treated as settled"
     )
 
 

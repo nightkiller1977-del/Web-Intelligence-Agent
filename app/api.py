@@ -213,6 +213,15 @@ async def _release_cancellation_safe(awaitable, op_id: str, description: str, ti
     unregisters. Giving up after the deadline leaves this release exactly as
     ambiguous as any other failure case here, falling back on the same TTL
     expiry already relied on elsewhere.
+
+    `task` itself is never cancelled by anything in this loop - only the
+    outer `wait_for`/`shield` wrapper is, which is what lets it survive the
+    calling task being cancelled repeatedly. If `task` nonetheless ends up
+    cancelled (nothing does this today; it would take an external, direct
+    `task.cancel()` on this exact object), `while not task.done()` would
+    otherwise exit silently and this would return as if the release had
+    settled normally, when it never actually ran to completion - the same
+    ambiguity this helper exists to close for every other failure mode.
     """
     if timeout is None:
         timeout = DEFAULT_INGEST_WAIT_TIMEOUT_S
@@ -234,6 +243,8 @@ async def _release_cancellation_safe(awaitable, op_id: str, description: str, ti
         except Exception:
             logger.warning("Failed to %s for operation %s.", description, op_id, exc_info=True)
             return
+    if task.cancelled():
+        logger.warning("Release task was cancelled rather than completed to %s for operation %s.", description, op_id)
 
 
 async def background_research_task(
