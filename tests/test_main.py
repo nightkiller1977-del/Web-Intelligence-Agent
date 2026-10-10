@@ -26,24 +26,45 @@ async def test_shutdown_drain_is_bounded_so_a_stuck_task_cannot_block_teardown(m
     is what keeps shutdown from ever running past the platform's own patience,
     even when an individual task is genuinely stuck.
 
-    Monkeypatches that ceiling to a tiny value and registers a task that
-    never finishes on its own, so the test is fast and still proves the
-    bound: without the fix, lifespan's shutdown phase would hang on
-    quiesce_tasks()'s own (much larger) timeout instead of respecting this
-    outer ceiling."""
+    A first version of this test registered a task that simply never
+    finishes on its own and monkeypatched only SHUTDOWN_DRAIN_BUDGET_S -
+    but quiesce_tasks() cancels that task exactly once, and a task that
+    does nothing to resist that single cancellation leaves
+    asyncio.Event().wait() and finishes immediately, so quiesce_tasks()'s
+    own asyncio.wait() returns quickly on its own. That made the test pass
+    even with the asyncio.wait_for ceiling removed entirely - it only
+    discriminated whether SHUTDOWN_DRAIN_BUDGET_S the *constant* existed,
+    not whether the ceiling it names actually bounds anything.
+
+    This version absorbs quiesce_tasks()'s one cancellation (mirroring how
+    a real cancellation-safe cleanup step elsewhere in this codebase
+    survives a single cancellation without finishing) and keeps running,
+    so quiesce_tasks()'s own wait cannot return on its own within the
+    monkeypatched ceiling - only the outer asyncio.wait_for actually bounds
+    this test. It resists exactly once, so this test's own teardown can
+    still cancel it a second time to clean up."""
     monkeypatch.setattr(main_module, "SHUTDOWN_DRAIN_BUDGET_S", 0.1)
 
     started = asyncio.Event()
+    absorbed_once = False
 
-    async def never_finishes():
+    async def resists_one_cancellation():
+        nonlocal absorbed_once
         started.set()
-        await asyncio.Event().wait()
+        while True:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                if not absorbed_once:
+                    absorbed_once = True
+                    continue
+                raise
 
     task = None
     start = None
     try:
         async with main_module.lifespan(main_module.app):
-            task = asyncio.create_task(never_finishes())
+            task = asyncio.create_task(resists_one_cancellation())
             cancellation_manager.register_task("op-stuck-at-shutdown", task)
             await started.wait()
             start = time.monotonic()
