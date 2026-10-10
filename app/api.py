@@ -18,7 +18,7 @@ from app.storage import storage
 from app.schemas import ResearchRequestInput, ResearchResultResponse, CapabilitiesInfo
 from app.cancellation import cancellation_manager
 from app.progress_adapter import ProgressReporter
-from app.researcher_adapter import conduct_web_research, _LeaseLostError, schedule_outcome_ingest, flush_pending_ingest_tasks
+from app.researcher_adapter import conduct_web_research, _LeaseLostError, schedule_outcome_ingest_task
 from app.security import is_gateway_destination_allowed, is_safe_url
 from app.metrics import observe_research_result, record_operation_spend
 
@@ -197,6 +197,7 @@ async def background_research_task(
 ):
     op_id = req.operationId
     spend_reconciled = False
+    ingest_task = None
 
     try:
         # Ownership was claimed at admission time (before any queued state was
@@ -264,7 +265,7 @@ async def background_research_task(
         # Only after the result is durable may the optional Brain outcome ingest
         # be scheduled; otherwise Brain could record a completed/partial outcome
         # for a result that was never stored.
-        schedule_outcome_ingest(result, op_id, req.mode, inputs=req.inputs)
+        ingest_task = schedule_outcome_ingest_task(result, op_id, req.mode, inputs=req.inputs)
 
     except asyncio.CancelledError:
         logger.warning(f"Operation {op_id} was cancelled during execution.")
@@ -317,38 +318,65 @@ async def background_research_task(
         # scale toward zero at any point. A detached Brain Memory ingest task
         # has no such protection and can be killed mid-flight before it ever
         # completes. This belongs in `finally`, not inline after
-        # schedule_outcome_ingest(), specifically so cancellation also waits:
-        # a CancelledError delivered while suspended on an inline await is
-        # caught by the except block below it and never retried, so the
+        # schedule_outcome_ingest_task(), specifically so cancellation also
+        # waits: a CancelledError delivered while suspended on an inline await
+        # is caught by the except block below it and never retried, so the
         # already-scheduled ingest task kept running detached while the
         # operation reported "cancelled" - the same race this whole fix
         # targets, just reachable through cancellation instead of normal
         # completion. Running it here covers every exit path uniformly.
         #
+        # Awaits `ingest_task` directly - this operation's own task, captured
+        # from schedule_outcome_ingest_task()'s return value - rather than
+        # flush_pending_ingest_tasks(), which drains the module-global set of
+        # every operation's pending ingest. Under concurrent load that made
+        # this operation's lease/concurrency-slot release wait on unrelated
+        # operations' Brain requests too, for up to flush's own 6s timeout,
+        # even when this operation scheduled no ingest of its own (Codex P2 on
+        # PR #32).
+        #
         # asyncio.shield, not a bare await: a cancellation landing exactly
         # while suspended here would otherwise interrupt only the *waiting*,
-        # not the pending ingest task(s) themselves (asyncio.wait, inside
-        # flush_pending_ingest_tasks, does not cancel its own members when
-        # the wait around it is cancelled) - so without the shield, this
-        # function would move on and release the owner lease/concurrency
-        # slot while an ingest it already scheduled is still mid-flight and
-        # now has nothing left tracking it: the exact race this whole fix
-        # targets, just moved one line down instead of closed. Shielding
-        # lets that ingest keep running to completion (or its own internal
-        # timeout) independently of whether this task itself gets cancelled
-        # again right here. The outer await still raises CancelledError
-        # immediately either way - shield does not change this function's
-        # own cancellation semantics, only whether the awaited work survives
-        # being cancelled out from under it - so the except below is still
-        # needed, both for that and because asyncio.CancelledError is a
-        # BaseException (not an Exception), so the broader `except
-        # Exception` guards later in this block would not catch it; letting
-        # it propagate from here would skip every cleanup step after it and
-        # leak the owner lease and concurrency slot.
-        try:
-            await asyncio.shield(flush_pending_ingest_tasks())
-        except (Exception, asyncio.CancelledError):
-            logger.warning("Failed to flush pending Brain Memory ingest for operation %s.", op_id, exc_info=True)
+        # not `ingest_task` itself - a bare await propagates cancellation into
+        # what it awaits, so without the shield this function would move on
+        # and release the owner lease/concurrency slot while the ingest it
+        # already scheduled is still mid-flight and now has nothing left
+        # tracking it: the exact race this whole fix targets, just moved one
+        # line down instead of closed. Shielding lets that ingest keep running
+        # to completion independently of whether this task itself gets
+        # cancelled again right here.
+        #
+        # Shielding alone is not the whole fix, though: the outer await still
+        # raises CancelledError immediately when a cancellation lands exactly
+        # on it - shield does not change *this* function's own cancellation
+        # semantics, only whether `ingest_task` survives being cancelled out
+        # from under it. Catching that CancelledError and simply moving on, as
+        # an earlier version of this fix did, left `ingest_task` running
+        # fully unawaited from that point - back to the original detached,
+        # scale-to-zero-vulnerable state the whole PR targets, just one level
+        # down (Codex P2 on PR #32). So the except branch re-awaits
+        # `ingest_task` itself (not shield again: the one cancellation already
+        # landed and was consumed) before moving on, which is also why it is
+        # caught here rather than by the broader `except Exception` guards
+        # later in this block - asyncio.CancelledError is a BaseException,
+        # not an Exception, and letting it propagate from here would skip
+        # every cleanup step after it and leak the owner lease and
+        # concurrency slot.
+        if ingest_task is not None:
+            try:
+                await asyncio.shield(ingest_task)
+            except asyncio.CancelledError:
+                try:
+                    await ingest_task
+                except asyncio.CancelledError:
+                    logger.warning(
+                        "Brain Memory ingest for operation %s could not be confirmed complete after a second cancellation.",
+                        op_id,
+                    )
+                except Exception:
+                    logger.warning("Brain Memory ingest failed for operation %s.", op_id, exc_info=True)
+            except Exception:
+                logger.warning("Brain Memory ingest failed for operation %s.", op_id, exc_info=True)
         # Cleanup steps below are independent: a failure in one (for example a
         # transient Redis error releasing the spend hold) must not skip the
         # others, or the owner lease and concurrency slot would stay pinned for

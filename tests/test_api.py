@@ -176,17 +176,14 @@ async def test_background_task_waits_for_brain_ingest_before_returning(monkeypat
                         "durationMs": 1, "searchesPerformed": 0, "pagesRead": 0, "sourcesConsidered": 0, "sourcesUsed": 0},
         }
 
-    def fake_schedule_outcome_ingest(result, op_id, mode, inputs=None):
+    def fake_schedule_outcome_ingest_task(result, op_id, mode, inputs=None):
         async def slow_ingest():
             await asyncio.sleep(0.1)  # simulate a real outbound HTTP call to Brain Memory
             ingest_done.set()
-        task = asyncio.create_task(slow_ingest())
-        researcher_adapter._pending_ingest_tasks.add(task)
-        task.add_done_callback(researcher_adapter._pending_ingest_tasks.discard)
-        return True
+        return asyncio.create_task(slow_ingest())
 
     monkeypatch.setattr(api, "conduct_web_research", fake_conduct_web_research)
-    monkeypatch.setattr(api, "schedule_outcome_ingest", fake_schedule_outcome_ingest)
+    monkeypatch.setattr(api, "schedule_outcome_ingest_task", fake_schedule_outcome_ingest_task)
 
     operation_id = "op-api-ingest-ordering"
     req = ResearchRequestInput(**_payload(operation_id))
@@ -217,10 +214,12 @@ async def test_cancellation_right_after_scheduling_ingest_still_lets_it_complete
     independently of whether this task is cancelled again right here.
 
     This simulates the exact timing: cancel the current task from inside
-    schedule_outcome_ingest, i.e. the instant after an ingest is scheduled,
-    before any further await gives the fix a chance to run. The fake flush
-    has its own internal await so a real suspension point exists for the
-    pending cancellation to land on."""
+    schedule_outcome_ingest_task, i.e. the instant after an ingest task is
+    created, before any further await gives the fix a chance to run. The
+    fake ingest has its own internal await so a real suspension point exists
+    for the pending cancellation to land on."""
+    ingest_calls = []
+
     async def fake_conduct_web_research(**kwargs):
         return {
             "operationId": kwargs["op_id"], "status": "completed", "mode": kwargs["mode"],
@@ -230,40 +229,150 @@ async def test_cancellation_right_after_scheduling_ingest_still_lets_it_complete
                         "durationMs": 1, "searchesPerformed": 0, "pagesRead": 0, "sourcesConsidered": 0, "sourcesUsed": 0},
         }
 
-    def fake_schedule_outcome_ingest(result, op_id, mode, inputs=None):
+    def fake_schedule_outcome_ingest_task(result, op_id, mode, inputs=None):
+        async def slow_ingest():
+            ingest_calls.append("started")
+            await asyncio.sleep(0.05)  # a real suspension point, like the Brain Memory HTTP call it stands in for
+            ingest_calls.append("completed")
+        task = asyncio.create_task(slow_ingest())
         asyncio.current_task().cancel()
-        return True
-
-    flush_calls = []
-
-    async def fake_flush_pending_ingest_tasks():
-        flush_calls.append("started")
-        await asyncio.sleep(0.05)  # a real suspension point, like the Brain Memory HTTP call it stands in for
-        flush_calls.append("completed")
-        return 0
+        return task
 
     monkeypatch.setattr(api, "conduct_web_research", fake_conduct_web_research)
-    monkeypatch.setattr(api, "schedule_outcome_ingest", fake_schedule_outcome_ingest)
-    monkeypatch.setattr(api, "flush_pending_ingest_tasks", fake_flush_pending_ingest_tasks)
+    monkeypatch.setattr(api, "schedule_outcome_ingest_task", fake_schedule_outcome_ingest_task)
 
     operation_id = "op-cancel-after-ingest"
     req = ResearchRequestInput(**_payload(operation_id))
     reporter = ProgressReporter(operation_id)
 
     # background_research_task must not propagate this cancellation: it is
-    # consumed by `finally`'s own try/except around the shielded flush,
+    # consumed by `finally`'s own try/except around the shielded ingest task,
     # specifically so a second cancellation there cannot skip the lease/slot
     # cleanup that follows it.
     await api.background_research_task(req, reporter, headers={})
 
-    # The shield means the flush survives as its own task even after
-    # background_research_task itself has returned; give the event loop a
-    # turn to actually run it to completion before asserting on it.
-    await asyncio.sleep(0.1)
-
-    assert flush_calls == ["started", "completed"], (
-        "the shielded flush must run to completion even though the task awaiting it was cancelled"
+    assert ingest_calls == ["started", "completed"], (
+        "background_research_task returned before the ingest task it shielded actually finished"
     )
+
+
+@pytest.mark.anyio
+async def test_cancellation_landing_on_the_shield_itself_still_waits_for_the_ingest(monkeypatch):
+    """Regression for a second-round finding from the automated review on
+    PR #32 (Codex). asyncio.shield() protects the ingest task from being
+    cancelled alongside the outer await, but the outer await still raises
+    CancelledError immediately when the cancellation lands exactly on it. An
+    earlier version of this fix caught that CancelledError and simply moved
+    on without re-awaiting the ingest task - which meant it kept running
+    fully unawaited from that point on, right back to the original
+    detached, scale-to-zero-vulnerable state the whole PR targets, just one
+    level down. The fix re-awaits the same ingest task (not shield again -
+    the one pending cancellation was already consumed) after catching that
+    CancelledError.
+
+    This is the companion to the test above, with the same cancellation
+    timing (requested synchronously inside schedule_outcome_ingest_task, so
+    it lands on the first await reached afterward - `asyncio.shield(ingest_task)`
+    in `finally`) but a stricter assertion: no sleep after
+    background_research_task returns. The old (shield-but-don't-reawait)
+    code would still pass the previous test's assertion if it slept
+    afterward - the bug is only visible by checking immediately, which is
+    the whole point of this test."""
+    ingest_done = asyncio.Event()
+
+    async def fake_conduct_web_research(**kwargs):
+        return {
+            "operationId": kwargs["op_id"], "status": "completed", "mode": kwargs["mode"],
+            "profile": kwargs["profile"], "answer": "Mock answer", "sources": [], "evidence": [],
+            "claims": [], "citations": [], "searchesPerformed": [],
+            "metrics": {"startedAt": "2026-01-01T00:00:00+00:00", "completedAt": "2026-01-01T00:00:01+00:00",
+                        "durationMs": 1, "searchesPerformed": 0, "pagesRead": 0, "sourcesConsidered": 0, "sourcesUsed": 0},
+        }
+
+    def fake_schedule_outcome_ingest_task(result, op_id, mode, inputs=None):
+        async def slow_ingest():
+            await asyncio.sleep(0.05)  # a real suspension point, like the Brain Memory HTTP call it stands in for
+            ingest_done.set()
+        task = asyncio.create_task(slow_ingest())
+        asyncio.current_task().cancel()
+        return task
+
+    monkeypatch.setattr(api, "conduct_web_research", fake_conduct_web_research)
+    monkeypatch.setattr(api, "schedule_outcome_ingest_task", fake_schedule_outcome_ingest_task)
+
+    operation_id = "op-cancel-on-shield"
+    req = ResearchRequestInput(**_payload(operation_id))
+    reporter = ProgressReporter(operation_id)
+
+    await api.background_research_task(req, reporter, headers={})
+
+    # No sleep here on purpose: if this fix only shields without re-awaiting
+    # after catching the cancellation, background_research_task returns
+    # before the 0.05s sleep inside slow_ingest() elapses, and this
+    # assertion catches that - unlike checking it after a sleep, which the
+    # bug would also pass.
+    assert ingest_done.is_set(), (
+        "background_research_task returned before the ingest task it shielded actually finished"
+    )
+
+
+@pytest.mark.anyio
+async def test_only_this_operations_ingest_is_awaited_not_every_pending_one(monkeypatch):
+    """Regression for the other Codex P2 finding on PR #32: the fix's first
+    draft awaited flush_pending_ingest_tasks(), which drains the
+    module-global set of every operation's pending ingest - so one
+    operation's own completion path waited on unrelated concurrent
+    operations' Brain requests too, holding its lease/concurrency slot for
+    up to flush's own 6s timeout over work that had nothing to do with it.
+    The fix captures and awaits only the task schedule_outcome_ingest_task()
+    returns for this operation.
+
+    Simulates a slow, unrelated operation's ingest already pending in the
+    global set - exactly what flush_pending_ingest_tasks() would have
+    drained - while this operation's own result is not eligible for ingest
+    at all (schedule_outcome_ingest_task returns None for a non-completed,
+    non-partial status), so it has nothing of its own to await."""
+    unrelated_ingest_done = asyncio.Event()
+
+    async def slow_unrelated_ingest():
+        await asyncio.sleep(0.2)
+        unrelated_ingest_done.set()
+
+    unrelated_task = asyncio.create_task(slow_unrelated_ingest())
+    researcher_adapter._pending_ingest_tasks.add(unrelated_task)
+    unrelated_task.add_done_callback(researcher_adapter._pending_ingest_tasks.discard)
+
+    async def fake_conduct_web_research(**kwargs):
+        return {
+            # "failed" returned here (not raised) purely to make this
+            # operation's own result ineligible for ingest, without
+            # exercising the separate exception-handling path.
+            "operationId": kwargs["op_id"], "status": "failed", "mode": kwargs["mode"],
+            "profile": kwargs["profile"], "answer": "", "sources": [], "evidence": [],
+            "claims": [], "citations": [], "searchesPerformed": [],
+            "metrics": {"startedAt": "2026-01-01T00:00:00+00:00", "completedAt": "2026-01-01T00:00:01+00:00",
+                        "durationMs": 1, "searchesPerformed": 0, "pagesRead": 0, "sourcesConsidered": 0, "sourcesUsed": 0},
+        }
+
+    monkeypatch.setattr(api, "conduct_web_research", fake_conduct_web_research)
+
+    operation_id = "op-no-ingest-of-its-own"
+    req = ResearchRequestInput(**_payload(operation_id))
+    reporter = ProgressReporter(operation_id)
+
+    start = time.monotonic()
+    await api.background_research_task(req, reporter, headers={})
+    elapsed = time.monotonic() - start
+
+    assert elapsed < 0.1, (
+        f"waited {elapsed:.3f}s - an operation with no ingest of its own must not be held up "
+        "by an unrelated operation's still-pending one"
+    )
+    assert not unrelated_ingest_done.is_set(), (
+        "the unrelated ingest should still be running - this just proves we really didn't wait for it"
+    )
+
+    await unrelated_task  # let it finish cleanly before the test ends
 
 
 def test_research_submission_returns_passage_backed_claims(monkeypatch):
