@@ -105,6 +105,78 @@ async def test_cross_instance_cancel_refuses_already_terminal_operation():
 
 
 @pytest.mark.anyio
+async def test_local_cancel_refuses_already_terminal_operation():
+    """Regression for a Codex P2 finding on PR #32 (web-intelligence-agent):
+    a task that has already produced a durable terminal result can stay
+    registered in active_tasks for a while afterward (its own post-result
+    cleanup, deliberately - see app/api.py's background_research_task,
+    which keeps itself registered through cleanup so shutdown's
+    quiesce_tasks() can still find it). Without this check, the local
+    branch below cancelled and reported "cancelled" for any op_id still
+    registered, with no regard for what was actually stored - unlike the
+    cross-instance branch above, which already checked this. A client that
+    polls the result, sees it terminal, and then calls /cancel while the
+    task is merely still finishing cleanup must get the real stored status
+    back, not a spurious "cancelled"."""
+    manager = CancellationManager()
+
+    started = asyncio.Event()
+
+    async def still_registered_but_already_done():
+        started.set()
+        await asyncio.Event().wait()  # stands in for post-result cleanup still in flight
+
+    task = asyncio.create_task(still_registered_but_already_done())
+    manager.register_task("op-already-terminal", task)
+    await started.wait()
+
+    try:
+        async def lookup_completed(op_id):
+            return {"status": "completed"}
+
+        result = await manager.cancel_task("op-already-terminal", operation_lookup=lookup_completed)
+        assert result is False
+        assert not task.cancelled()
+        assert "op-already-terminal" in manager.active_tasks
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+
+@pytest.mark.anyio
+async def test_local_cancel_still_works_for_a_genuinely_running_operation():
+    """Companion to the refusal test above: the new stored-status check must
+    not block a legitimate cancel of an operation that is actually still
+    running."""
+    manager = CancellationManager()
+
+    started = asyncio.Event()
+    was_cancelled = asyncio.Event()
+
+    async def long_running_work():
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            was_cancelled.set()
+            raise
+
+    task = asyncio.create_task(long_running_work())
+    manager.register_task("op-still-running", task)
+    await started.wait()
+
+    async def lookup_running(op_id):
+        return {"status": "running"}
+
+    result = await manager.cancel_task("op-still-running", operation_lookup=lookup_running)
+    assert result is True
+    await asyncio.wait_for(was_cancelled.wait(), timeout=2)
+
+
+@pytest.mark.anyio
 async def test_cancel_task_with_no_redis_and_no_local_task_returns_false():
     """Without Redis wired up and no locally-registered task, there's
     nothing this instance can do about the cancel request."""

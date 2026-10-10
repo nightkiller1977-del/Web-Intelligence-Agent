@@ -56,6 +56,28 @@ class CancellationManager:
     ) -> bool:
         task = self.active_tasks.get(op_id)
         if task and not task.done():
+            # A task stays registered for the whole of its own cleanup
+            # (ingest-await, then spend/lease/concurrency-slot release) so
+            # quiesce_tasks() can still find and await it if shutdown lands
+            # during that window - it only unregisters once that cleanup is
+            # actually done. That means a result can already be durably
+            # terminal (completed/partial/failed/cancelled) while the task
+            # is still registered here, so this local branch must check the
+            # stored status itself before cancelling, exactly as the
+            # cross-instance branch below already does - otherwise a client
+            # that polls the result, sees it terminal, and then calls cancel
+            # during that cleanup window flips an immutable, already-
+            # persisted result to a spurious "cancelled" response (Codex P2
+            # on PR #32).
+            if operation_lookup:
+                op = await operation_lookup(op_id)
+                if op and op.get("status") in TERMINAL_STATUSES:
+                    logger.info(
+                        "Refusing local cancel for already finalized operation %s with status %s",
+                        op_id,
+                        op.get("status")
+                    )
+                    return False
             task.cancel()
             try:
                 await task

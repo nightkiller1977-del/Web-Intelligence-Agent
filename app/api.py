@@ -311,30 +311,6 @@ async def background_research_task(
         observe_research_result(failed_state)
 
     finally:
-        # Unregistered first, before anything else in this block: this task's
-        # result (completed/cancelled/failed) is already durably persisted by
-        # the time any finally code runs, so cancellation_manager must stop
-        # treating this operation as live *now*, not after the ingest-await
-        # and cleanup below. cancel_task()'s local-task branch cancels and
-        # reports "cancelled" for any op_id still in active_tasks with no
-        # regard for what is actually stored - so leaving this registered
-        # while the steps below run let a client that polls the result,
-        # observes the already-completed/stored status, and then calls
-        # /cancel flip an immutable, already-persisted "completed" operation
-        # to a spurious "cancelled" response, violating the terminal-status
-        # contract tests/test_api.py::test_cancel_refuses_already_terminal_operation
-        # exists to guarantee. The window used to be small (nothing else ran
-        # in finally); it grew to multiple seconds once this PR added the
-        # ingest-await below, and unregistering first is what keeps it small
-        # again (Codex P2 on PR #32). This also forecloses the one way the
-        # ingest-await's own shield below could ever see a second
-        # cancellation in practice: cancellation_manager has nothing left to
-        # cancel once this line has run.
-        try:
-            cancellation_manager.unregister_task(op_id)
-        except Exception:
-            logger.warning("Failed to unregister task for operation %s.", op_id, exc_info=True)
-
         # This task's own HTTP request (POST /v1/research) already returned
         # 202 before this coroutine started, so Azure Container Apps' request
         # concurrency scaler has no open connection tying this replica to this
@@ -374,13 +350,12 @@ async def background_research_task(
         # raises CancelledError immediately when a cancellation lands exactly
         # on it - shield does not change *this* function's own cancellation
         # semantics, only whether `ingest_task` survives being cancelled out
-        # from under it. Looped rather than a single retry: unregistering
-        # first (above) forecloses every realistic way a second cancellation
-        # could land here, but a bare single re-await would still propagate a
-        # *third* one straight into `ingest_task` if it somehow did - looping
-        # keeps re-entering the shield instead, so no number of repeated
-        # cancellations of this task can ever cancel the ingest it is
-        # protecting (Codex P2 on PR #32).
+        # from under it. Looped rather than a single retry, so no number of
+        # repeated cancellations of this task - including quiesce_tasks()
+        # cancelling it again during shutdown, harmlessly, while it waits
+        # here (this task stays registered through its own cleanup; see the
+        # unregister_task() call at the end of this block) - can ever
+        # actually cancel the ingest it is protecting (Codex P2 on PR #32).
         if ingest_task is not None:
             while not ingest_task.done():
                 try:
@@ -407,6 +382,19 @@ async def background_research_task(
             await storage.release_concurrency_slot(op_id)
         except Exception:
             logger.warning("Failed to release concurrency slot for operation %s.", op_id, exc_info=True)
+        # Unregistered last, once every cleanup step above has actually run:
+        # quiesce_tasks() (shutdown) only cancels/awaits tasks still in
+        # active_tasks, so unregistering any earlier would let shutdown race
+        # past this task while it still has cleanup left - losing the lease,
+        # concurrency slot, or spend-hold release and leaving them pinned
+        # until their TTLs expire (Codex P2 on PR #32; cancel_task()'s own
+        # terminal-status check above is what keeps a merely-registered,
+        # already-finished operation from being spuriously cancelled in the
+        # meantime, so unregistration timing no longer has to do that job).
+        try:
+            cancellation_manager.unregister_task(op_id)
+        except Exception:
+            logger.warning("Failed to unregister task for operation %s.", op_id, exc_info=True)
 
 @router.post("/v1/research", status_code=status.HTTP_202_ACCEPTED)
 async def start_research(

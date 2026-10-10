@@ -376,22 +376,26 @@ async def test_only_this_operations_ingest_is_awaited_not_every_pending_one(monk
 
 
 @pytest.mark.anyio
-async def test_unregisters_before_waiting_for_the_post_completion_ingest(monkeypatch):
-    """Regression for a third-round Codex P2 finding on PR #32.
-    cancellation_manager.cancel_task()'s local-task branch cancels and
-    reports "cancelled" for any op_id still in active_tasks, with no regard
-    for what is actually durably stored. Unregistering only after the
-    ingest-await (the previous order in `finally`) meant a client that
-    polled the result, saw "completed", and then called /cancel while the
-    ingest was still in flight could flip an already-persisted "completed"
-    operation to a spurious "cancelled" response - the same contract
-    test_cancel_refuses_already_terminal_operation guards, reachable
-    through a window this PR's own ingest-await widened from effectively
-    zero to multiple seconds. The fix unregisters first, before the
-    ingest-await runs at all.
+async def test_stays_registered_through_its_own_cleanup_until_fully_done(monkeypatch):
+    """Regression for a fourth-round Codex P2 finding on PR #32. An earlier
+    version of this fix unregistered the task as soon as its result was
+    persisted, before the ingest-await ran at all - closing the
+    terminal-cancellation window below, but at the cost of removing the
+    task from cancellation_manager.active_tasks while it still had real
+    cleanup left (the ingest-await, then spend/lease/concurrency-slot
+    release). quiesce_tasks() (shutdown) only cancels/awaits tasks still in
+    active_tasks, so shutdown landing in that window would race past this
+    one, tearing the event loop down with its lease, concurrency slot, or
+    spend hold never released - left pinned until their TTLs expire.
 
-    Asserts the task is already unregistered from cancellation_manager -
-    not cancellable through it - well before its slow ingest finishes."""
+    The fix keeps the task registered through all of its own cleanup,
+    unregistering only once that is actually done, and instead closes the
+    terminal-cancellation window with a stored-status check in
+    cancel_task() itself (see test_cancellation.py for that half).
+
+    Asserts the task is still registered while its slow ingest is in
+    flight - not unregistered early - confirming shutdown could still find
+    and await it."""
     ingest_started = asyncio.Event()
     ingest_may_finish = asyncio.Event()
 
@@ -413,7 +417,7 @@ async def test_unregisters_before_waiting_for_the_post_completion_ingest(monkeyp
     monkeypatch.setattr(api, "conduct_web_research", fake_conduct_web_research)
     monkeypatch.setattr(api, "schedule_outcome_ingest_task", fake_schedule_outcome_ingest_task)
 
-    operation_id = "op-unregister-before-ingest-wait"
+    operation_id = "op-stays-registered-through-cleanup"
     req = ResearchRequestInput(**_payload(operation_id))
     reporter = ProgressReporter(operation_id)
 
@@ -422,9 +426,64 @@ async def test_unregisters_before_waiting_for_the_post_completion_ingest(monkeyp
 
     await asyncio.wait_for(ingest_started.wait(), timeout=2)
     # The ingest is deliberately still running at this point.
-    assert operation_id not in api.cancellation_manager.active_tasks, (
-        "the operation must be unregistered before the ingest-await begins, not after it finishes"
+    assert operation_id in api.cancellation_manager.active_tasks, (
+        "the operation must stay registered while its cleanup is still in flight, "
+        "so shutdown's quiesce_tasks() can find and await it"
     )
+
+    ingest_may_finish.set()
+    await task
+
+    assert operation_id not in api.cancellation_manager.active_tasks, (
+        "the operation must be unregistered once its cleanup has actually finished"
+    )
+
+
+@pytest.mark.anyio
+async def test_cancel_refuses_already_terminal_operation_during_post_completion_cleanup(monkeypatch):
+    """Companion to the test above: proves the terminal-cancellation window
+    this PR's ingest-await opened is closed by cancel_task()'s own
+    stored-status check (test_cancellation.py), not by unregistration
+    timing - the task above is confirmed to still be registered during
+    this exact window, so a /cancel landing here must be refused by content,
+    not by finding nothing to cancel."""
+    ingest_started = asyncio.Event()
+    ingest_may_finish = asyncio.Event()
+
+    async def fake_conduct_web_research(**kwargs):
+        return {
+            "operationId": kwargs["op_id"], "status": "completed", "mode": kwargs["mode"],
+            "profile": kwargs["profile"], "answer": "Mock answer", "sources": [], "evidence": [],
+            "claims": [], "citations": [], "searchesPerformed": [],
+            "metrics": {"startedAt": "2026-01-01T00:00:00+00:00", "completedAt": "2026-01-01T00:00:01+00:00",
+                        "durationMs": 1, "searchesPerformed": 0, "pagesRead": 0, "sourcesConsidered": 0, "sourcesUsed": 0},
+        }
+
+    def fake_schedule_outcome_ingest_task(result, op_id, mode, inputs=None):
+        async def slow_ingest():
+            ingest_started.set()
+            await ingest_may_finish.wait()
+        return asyncio.create_task(slow_ingest())
+
+    monkeypatch.setattr(api, "conduct_web_research", fake_conduct_web_research)
+    monkeypatch.setattr(api, "schedule_outcome_ingest_task", fake_schedule_outcome_ingest_task)
+
+    operation_id = "op-cancel-during-cleanup"
+    req = ResearchRequestInput(**_payload(operation_id))
+    reporter = ProgressReporter(operation_id)
+
+    task = asyncio.create_task(api.background_research_task(req, reporter, headers={}))
+    api.cancellation_manager.register_task(operation_id, task)
+
+    await asyncio.wait_for(ingest_started.wait(), timeout=2)
+    assert operation_id in api.cancellation_manager.active_tasks  # still registered, as above
+
+    cancelled = await api.cancellation_manager.cancel_task(operation_id, api.storage.get_operation)
+    assert cancelled is False, (
+        "cancel_task() must refuse to cancel an operation whose durable result is already terminal, "
+        "even while its task is still registered doing post-completion cleanup"
+    )
+    assert not task.cancelled()
 
     ingest_may_finish.set()
     await task
