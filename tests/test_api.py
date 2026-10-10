@@ -375,6 +375,120 @@ async def test_only_this_operations_ingest_is_awaited_not_every_pending_one(monk
     await unrelated_task  # let it finish cleanly before the test ends
 
 
+@pytest.mark.anyio
+async def test_unregisters_before_waiting_for_the_post_completion_ingest(monkeypatch):
+    """Regression for a third-round Codex P2 finding on PR #32.
+    cancellation_manager.cancel_task()'s local-task branch cancels and
+    reports "cancelled" for any op_id still in active_tasks, with no regard
+    for what is actually durably stored. Unregistering only after the
+    ingest-await (the previous order in `finally`) meant a client that
+    polled the result, saw "completed", and then called /cancel while the
+    ingest was still in flight could flip an already-persisted "completed"
+    operation to a spurious "cancelled" response - the same contract
+    test_cancel_refuses_already_terminal_operation guards, reachable
+    through a window this PR's own ingest-await widened from effectively
+    zero to multiple seconds. The fix unregisters first, before the
+    ingest-await runs at all.
+
+    Asserts the task is already unregistered from cancellation_manager -
+    not cancellable through it - well before its slow ingest finishes."""
+    ingest_started = asyncio.Event()
+    ingest_may_finish = asyncio.Event()
+
+    async def fake_conduct_web_research(**kwargs):
+        return {
+            "operationId": kwargs["op_id"], "status": "completed", "mode": kwargs["mode"],
+            "profile": kwargs["profile"], "answer": "Mock answer", "sources": [], "evidence": [],
+            "claims": [], "citations": [], "searchesPerformed": [],
+            "metrics": {"startedAt": "2026-01-01T00:00:00+00:00", "completedAt": "2026-01-01T00:00:01+00:00",
+                        "durationMs": 1, "searchesPerformed": 0, "pagesRead": 0, "sourcesConsidered": 0, "sourcesUsed": 0},
+        }
+
+    def fake_schedule_outcome_ingest_task(result, op_id, mode, inputs=None):
+        async def slow_ingest():
+            ingest_started.set()
+            await ingest_may_finish.wait()
+        return asyncio.create_task(slow_ingest())
+
+    monkeypatch.setattr(api, "conduct_web_research", fake_conduct_web_research)
+    monkeypatch.setattr(api, "schedule_outcome_ingest_task", fake_schedule_outcome_ingest_task)
+
+    operation_id = "op-unregister-before-ingest-wait"
+    req = ResearchRequestInput(**_payload(operation_id))
+    reporter = ProgressReporter(operation_id)
+
+    task = asyncio.create_task(api.background_research_task(req, reporter, headers={}))
+    api.cancellation_manager.register_task(operation_id, task)
+
+    await asyncio.wait_for(ingest_started.wait(), timeout=2)
+    # The ingest is deliberately still running at this point.
+    assert operation_id not in api.cancellation_manager.active_tasks, (
+        "the operation must be unregistered before the ingest-await begins, not after it finishes"
+    )
+
+    ingest_may_finish.set()
+    await task
+
+
+@pytest.mark.anyio
+async def test_repeated_cancellation_never_reaches_the_ingest_task(monkeypatch):
+    """Regression for the first Codex P2 finding on PR #32: a second
+    cancellation landing while the fix's own re-await was suspended would
+    propagate straight into `ingest_task` - asyncio.to_thread cancellation
+    marks the wrapping task done while the underlying HTTP thread may still
+    be running, orphaning it from both _pending_ingest_tasks and shutdown's
+    drain. The fix loops back into asyncio.shield() on every cancellation
+    instead of ever bare-awaiting `ingest_task` directly, so no number of
+    repeated cancellations of this task can cancel the ingest it protects.
+
+    A separate task repeatedly cancels background_research_task throughout
+    the ingest's own sleep, so the fix's while-loop is genuinely re-entered
+    multiple times under overlapping cancellation pressure, rather than
+    relying on one precisely-timed cancellation."""
+    ingest_done = asyncio.Event()
+
+    async def fake_conduct_web_research(**kwargs):
+        return {
+            "operationId": kwargs["op_id"], "status": "completed", "mode": kwargs["mode"],
+            "profile": kwargs["profile"], "answer": "Mock answer", "sources": [], "evidence": [],
+            "claims": [], "citations": [], "searchesPerformed": [],
+            "metrics": {"startedAt": "2026-01-01T00:00:00+00:00", "completedAt": "2026-01-01T00:00:01+00:00",
+                        "durationMs": 1, "searchesPerformed": 0, "pagesRead": 0, "sourcesConsidered": 0, "sourcesUsed": 0},
+        }
+
+    def fake_schedule_outcome_ingest_task(result, op_id, mode, inputs=None):
+        bg_task = asyncio.current_task()
+
+        async def slow_ingest():
+            await asyncio.sleep(0.05)  # a real suspension point, like the Brain Memory HTTP call it stands in for
+            ingest_done.set()
+        task = asyncio.create_task(slow_ingest())
+
+        async def hammer_cancellations():
+            for _ in range(5):
+                await asyncio.sleep(0.005)
+                if not bg_task.done():
+                    bg_task.cancel()
+        asyncio.create_task(hammer_cancellations())
+
+        bg_task.cancel()  # the first cancellation, delivered synchronously like the single-cancellation test above
+        return task
+
+    monkeypatch.setattr(api, "conduct_web_research", fake_conduct_web_research)
+    monkeypatch.setattr(api, "schedule_outcome_ingest_task", fake_schedule_outcome_ingest_task)
+
+    operation_id = "op-repeated-cancel"
+    req = ResearchRequestInput(**_payload(operation_id))
+    reporter = ProgressReporter(operation_id)
+
+    await api.background_research_task(req, reporter, headers={})
+
+    assert ingest_done.is_set(), (
+        "the ingest task must run to completion even when the task awaiting it "
+        "is cancelled repeatedly while it is in flight"
+    )
+
+
 def test_research_submission_returns_passage_backed_claims(monkeypatch):
     async def fake_conduct_web_research(**kwargs):
         return {
