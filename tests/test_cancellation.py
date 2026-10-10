@@ -177,6 +177,45 @@ async def test_local_cancel_still_works_for_a_genuinely_running_operation():
 
 
 @pytest.mark.anyio
+async def test_local_cancel_reports_real_status_when_task_finishes_before_cancellation_takes_effect():
+    """Regression for a Codex finding on PR #32: the stored-status check
+    above is read before task.cancel(), so it can be stale by the time
+    cancel_task() actually acts - the task can race ahead and persist its
+    own terminal result in between. task.cancel() is then either a no-op
+    (the task already finished) or a cancellation its own cancellation-safe
+    cleanup absorbs, and either way the task completes normally rather than
+    raising CancelledError - so without a second, race-free check after
+    `task` has actually finished, cancel_task() returned True
+    unconditionally, and /cancel reported "cancelled" for an operation
+    that is really "completed"."""
+    manager = CancellationManager()
+    stored_status = {"value": "running"}
+
+    async def finishes_on_its_own_right_after_being_cancelled():
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            # Stands in for background_research_task's own cancellation-safe
+            # cleanup absorbing a cancellation that arrived after its real
+            # result was already persisted - it does not re-raise, so this
+            # task completes normally, not with CancelledError.
+            stored_status["value"] = "completed"
+
+    task = asyncio.create_task(finishes_on_its_own_right_after_being_cancelled())
+    manager.register_task("op-race", task)
+    await asyncio.sleep(0)
+
+    async def lookup(op_id):
+        return {"status": stored_status["value"]}
+
+    result = await manager.cancel_task("op-race", operation_lookup=lookup)
+    assert result is False, (
+        "cancel_task() must report the operation's real terminal status, not a blanket "
+        "cancelled, when the task actually finished on its own instead of being genuinely cancelled"
+    )
+
+
+@pytest.mark.anyio
 async def test_cancel_task_with_no_redis_and_no_local_task_returns_false():
     """Without Redis wired up and no locally-registered task, there's
     nothing this instance can do about the cancel request."""

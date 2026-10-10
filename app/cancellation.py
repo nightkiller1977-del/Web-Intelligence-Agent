@@ -83,6 +83,27 @@ class CancellationManager:
             except asyncio.CancelledError:
                 logger.info("Task successfully cancelled for operation: %s", op_id)
             self.unregister_task(op_id)
+            # The check above can be stale by the time it matters: the task
+            # can race ahead and persist its own terminal result in the gap
+            # between that await and this point, making task.cancel() either
+            # a no-op (already done) or a cancellation its own cancellation-
+            # safe cleanup absorbs - either way it finishes normally, not
+            # with CancelledError, so the except above never fires. There is
+            # no further race to check against here, though: `task` has now
+            # fully finished (this await only returns once it has), and
+            # nothing else writes this operation's status once its owning
+            # task has returned - so this result is authoritative. A
+            # non-"cancelled" terminal status here means the cancellation
+            # simply arrived too late to take effect.
+            if operation_lookup:
+                op = await operation_lookup(op_id)
+                if op and op.get("status") in TERMINAL_STATUSES and op.get("status") != "cancelled":
+                    logger.info(
+                        "Operation %s reached %s on its own before cancellation took effect; reporting that instead",
+                        op_id,
+                        op.get("status")
+                    )
+                    return False
             return True
 
         # Task not on this instance — broadcast via Redis pub/sub
