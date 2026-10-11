@@ -8,6 +8,13 @@ on:
     branches:
       - main
 
+# One run per ref. A superseded run has nothing to prove -- and on a
+# self-hosted runner it occupies the only machine, so it delays the run that
+# does matter rather than just costing minutes.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     name: pytest (py${{ matrix.python-version }})
