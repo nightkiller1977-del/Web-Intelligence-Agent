@@ -780,18 +780,23 @@ async def test_cancellation_safe_release_is_bounded_so_a_stalled_release_cannot_
     up (and falling back on the reservation's own TTL expiry) rather than
     hanging indefinitely, is what closes that.
 
-    Monkeypatches DEFAULT_INGEST_WAIT_TIMEOUT_S (the shared bound both waits
-    use) to a tiny value and makes release_operation_lease never finish on
-    its own, so the test is fast and still proves the bound: without the
-    fix, this would hang rather than merely run slowly (the class 2s timeout
-    above is the backstop in case something regresses the fix entirely).
+    Monkeypatches STATUS_LOOKUP_TIMEOUT_S - _release_cancellation_safe's own
+    default bound, not DEFAULT_INGEST_WAIT_TIMEOUT_S (that one only bounds
+    the per-operation ingest wait right above this helper; reusing it here
+    would let three lightweight, normally-sub-millisecond Redis writes each
+    separately wait as long as a Brain Memory HTTP call for no reason - see
+    _release_cancellation_safe's own docstring) - to a tiny value, and makes
+    release_operation_lease never finish on its own, so the test is fast
+    and still proves the bound: without the fix, this would hang rather
+    than merely run slowly (the class 2s timeout above is the backstop in
+    case something regresses the fix entirely).
 
     Also asserts the abandoned release task itself actually gets cancelled
     rather than left pending: giving up on the wait without also cancelling
     `task` would leave its in-flight Redis call running forever, untracked
     by anything (unlike the per-operation ingest, which stays in the
     module-global pending set for shutdown to drain later)."""
-    monkeypatch.setattr(api, "DEFAULT_INGEST_WAIT_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(api, "STATUS_LOOKUP_TIMEOUT_S", 0.05)
 
     lease_release_cancelled = asyncio.Event()
 

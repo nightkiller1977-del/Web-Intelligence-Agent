@@ -11,7 +11,7 @@ from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from app.config import auth_is_configured, settings, unauthenticated_docs_allowed
 from app.storage import storage, StorageUnavailable
 from app.cancellation import cancellation_manager
-from app.researcher_adapter import flush_pending_ingest_tasks, DEFAULT_INGEST_WAIT_TIMEOUT_S
+from app.researcher_adapter import flush_pending_ingest_tasks
 from app.api import router
 from app.grafana_observability import ObserveASGI, emitter, emit as emit_observability
 
@@ -24,18 +24,32 @@ PUBLIC_PATHS = {"/health/live", "/health/ready", "/capabilities", "/version", "/
 DOCS_PATHS = {"/docs", "/redoc", "/openapi.json", "/docs/oauth2-redirect"}
 
 # Azure Container Apps (and Kubernetes-style platforms generally) default to
-# a 30s SIGTERM-to-SIGKILL grace period. quiesce_tasks()'s own wait and
-# flush_pending_ingest_tasks()'s backstop are each sized independently for
-# their own purpose - the former to reliably outlast a single task's own
-# worst-case serial cleanup, the latter for a slow-but-not-hung Brain Memory
-# response - with nothing keeping their *sum* under the platform's actual
-# limit; today they happen to add up to exactly that default, leaving zero
-# margin. Wrapping the whole drain sequence in one hard ceiling with real
-# margin under that assumed default means shutdown always leaves the
-# platform time to finish its own termination handling cleanly. In the rare
-# case this ceiling cuts a task's cleanup short, that is the same
-# already-accepted TTL-based fallback this cleanup path relies on
-# elsewhere (a stuck reservation expires on its own), not a new kind of loss.
+# a 30s SIGTERM-to-SIGKILL grace period.
+ASSUMED_PLATFORM_GRACE_PERIOD_S = 30.0
+
+# Reserved, after the drain sequence below returns (however it returns),
+# for cancellation_manager.shutdown() and the storage-backend teardown that
+# follows it - both already bounded elsewhere (shutdown() awaits one
+# already-cancelled listener task; storage teardown closes a connection
+# pool), but still real wall-clock time that must come out of the same
+# overall budget rather than being assumed free.
+SHUTDOWN_FINAL_STEPS_MARGIN_S = 3.0
+
+# quiesce_tasks()'s own wait and flush_pending_ingest_tasks()'s backstop are
+# each sized independently for their own purpose - the former to reliably
+# outlast a single task's own worst-case serial cleanup, the latter for a
+# slow-but-not-hung Brain Memory response. Earlier versions of this budget
+# tried to keep their *sum* under the platform's actual limit by picking
+# SHUTDOWN_DRAIN_BUDGET_S and a second, independent "one more bounded
+# attempt" timeout by hand - which quietly stopped adding up correctly the
+# moment either of the constants that second timeout was borrowed from
+# changed for its own, unrelated reason (see this PR's review history).
+# Anchoring every subsequent wait to the single ASSUMED_PLATFORM_GRACE_PERIOD_S
+# deadline set below, instead, keeps the total bounded regardless of how
+# any individual piece is retuned later. In the rare case this still cuts a
+# task's cleanup short, that is the same already-accepted TTL-based
+# fallback this cleanup path relies on elsewhere (a stuck reservation
+# expires on its own), not a new kind of loss.
 SHUTDOWN_DRAIN_BUDGET_S = 20.0
 
 @asynccontextmanager
@@ -103,6 +117,17 @@ async def lifespan(app: FastAPI):
         # it.
         await flush_pending_ingest_tasks()
 
+    # Anchored once, before the first attempt below even starts, so every
+    # subsequent wait in this sequence is bounded against the *same* single
+    # deadline rather than each adding its own independently-chosen
+    # timeout on top of the last - see the constants' own comments above
+    # for why that composition broke silently before.
+    shutdown_deadline = (
+        asyncio.get_running_loop().time()
+        + ASSUMED_PLATFORM_GRACE_PERIOD_S
+        - SHUTDOWN_FINAL_STEPS_MARGIN_S
+    )
+
     try:
         await asyncio.wait_for(_drain_in_flight_work(), timeout=SHUTDOWN_DRAIN_BUDGET_S)
     except asyncio.TimeoutError:
@@ -118,20 +143,33 @@ async def lifespan(app: FastAPI):
         # also awaiting it would return from this function while that
         # cleanup might still be genuinely, briefly in flight (its own
         # per-step deadline can still have a little real time left even
-        # after this outer ceiling gives up). Calling quiesce_tasks()
-        # again - it re-cancels and awaits in one step, which is exactly
-        # what is needed here too - bounded to one more step's worth of
-        # time (DEFAULT_INGEST_WAIT_TIMEOUT_S) rather than its own full
-        # default, adds at most that much to the total (20s + 6s = 26s),
-        # still with real margin under the platform's assumed 30s grace
-        # period, instead of granting an unbounded or repeated extension.
-        # flush_pending_ingest_tasks() does not get a second bounded pass
-        # here: its own ingest is the one thing each task's cleanup above
-        # already treats as best-effort and optional, unlike the owner
-        # lease and concurrency slot quiesce_tasks() itself protects, so
-        # losing it only in this already-degraded double-timeout case is
-        # the smaller, already-accepted loss.
-        await cancellation_manager.quiesce_tasks(timeout=DEFAULT_INGEST_WAIT_TIMEOUT_S)
+        # after this outer ceiling gives up). Calling quiesce_tasks() again
+        # - it re-cancels and awaits in one step, which is exactly what is
+        # needed here too - bounded to whatever time genuinely remains
+        # until shutdown_deadline (not a fresh, independently-sized
+        # allowance) is what keeps the total bounded against one single
+        # number no matter how long this first attempt actually ran: see
+        # quiesce_tasks()'s own comment (app/cancellation.py) for why a
+        # task's remaining cleanup from any point it is currently in can
+        # never exceed that function's own worst-case total, so a shorter
+        # remaining budget here is still making real progress, not just
+        # repeating a no-op. flush_pending_ingest_tasks() does not get a
+        # second bounded pass here: its own ingest is the one thing each
+        # task's cleanup above already treats as best-effort and optional,
+        # unlike the owner lease and concurrency slot quiesce_tasks()
+        # itself protects, so losing it only in this already-degraded
+        # double-timeout case is the smaller, already-accepted loss.
+        remaining = shutdown_deadline - asyncio.get_running_loop().time()
+        if remaining > 0:
+            await cancellation_manager.quiesce_tasks(timeout=remaining)
+        else:
+            logger.warning(
+                "No time left in the shutdown budget for a second quiesce attempt; "
+                "cancelling any still-running task once more without waiting further."
+            )
+            for leftover in list(cancellation_manager.active_tasks.values()):
+                if not leftover.done():
+                    leftover.cancel()
     await cancellation_manager.shutdown()
     logger.info("Shutting down storage backend connections...")
 

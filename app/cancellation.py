@@ -11,13 +11,17 @@ CANCEL_CHANNEL = "research:cancel"
 TERMINAL_STATUSES = {"completed", "partial", "failed", "cancelled"}
 
 # Bounds the operation_lookup() calls in cancel_task() below (and, for the
-# same reason, the /cancel endpoint's own fallback lookup in app/api.py).
-# A plain Redis HGET normally returns in milliseconds, so this is
+# same reason, the /cancel endpoint's own fallback lookup, and
+# _release_cancellation_safe's release calls, both in app/api.py). A plain
+# Redis read or write normally returns in milliseconds, so this is
 # deliberately its own, much smaller constant rather than reusing
 # DEFAULT_INGEST_WAIT_TIMEOUT_S (6s, tuned for a Brain Memory HTTP call) -
-# that constant is unrelated to how long a status check should ever
+# that constant is unrelated to how long a lightweight Redis op should ever
 # legitimately take, and reusing it would let a future retune of the
-# ingest wait silently change how long a /cancel request can stall.
+# ingest wait silently change how long a /cancel request, or a task's own
+# cleanup, can stall. quiesce_tasks() below sizes its own default against
+# both constants together, since it has to cover a task's full serial
+# cleanup, not just one call.
 STATUS_LOOKUP_TIMEOUT_S = 1.0
 
 
@@ -248,32 +252,50 @@ class CancellationManager:
 
         The default must cover a task's own worst-case cleanup time, not just
         a nominal grace period: background_research_task's `finally` block
-        (app/api.py) runs exactly three cancellation-safe waits serially on
-        either path it can take - ingest, lease, concurrency slot on success,
-        or spend, lease, concurrency slot on failure/cancellation when a
-        spend hold was reserved - each individually bounded by
-        DEFAULT_INGEST_WAIT_TIMEOUT_S. A shorter timeout here would let this
-        call return, and shutdown proceed to drain ingests and close storage
-        connections, while a task is still mid-cleanup - abandoning its
-        owner-lease/concurrency-slot/spend-hold release exactly as this PR is
-        fixing for the outcome ingest.
+        (app/api.py) runs exactly four cancellation-safe waits serially on
+        its failure/cancellation path (ingest, spend, lease, concurrency
+        slot), or three on the success path (ingest, lease, concurrency
+        slot; spend is always reconciled before cleanup on that path, not
+        released here) - only the first of which (the ingest wait) is
+        bounded by DEFAULT_INGEST_WAIT_TIMEOUT_S; the release steps are each
+        bounded by the much smaller STATUS_LOOKUP_TIMEOUT_S (see its own
+        comment above - they are plain Redis writes, not HTTP calls, so they
+        do not need the ingest wait's larger allowance). A shorter timeout
+        here would let this call return, and shutdown proceed to drain
+        ingests and close storage connections, while a task is still
+        mid-cleanup - abandoning its owner-lease/concurrency-slot/spend-hold
+        release exactly as this PR is fixing for the outcome ingest.
 
-        Set to 4x, not exactly 3x, that per-step bound: this wait's own
-        deadline starts counting the moment it is called, strictly before
-        each task's own cancellation is actually delivered and its cleanup
-        loop computes its own three per-step deadlines - so even with zero
-        added overhead, a task's full serial cleanup can run past this
-        wait's deadline if the two were set to the exact same multiple.
-        Scheduling and logging overhead across three sequential waits adds
-        more on top of that. The extra step's worth of headroom is enough
-        to absorb both without needing to measure or tune the exact gap.
+        Set to one extra STATUS_LOOKUP_TIMEOUT_S step beyond that real sum,
+        not exactly the sum itself: this wait's own deadline starts counting
+        the moment it is called, strictly before each task's own
+        cancellation is actually delivered and its cleanup loop computes its
+        own per-step deadlines - so even with zero added overhead, a task's
+        full serial cleanup can run past this wait's deadline if the two
+        were set to the exact same total. Scheduling and logging overhead
+        across four sequential waits adds a little more on top of that. One
+        extra step's worth of headroom is enough to absorb both without
+        needing to measure or tune the exact gap.
+
+        This same reasoning also bounds how much *more* time a task still
+        mid-cleanup can need from any point onward, not just from a cold
+        start: whichever step it is currently in, the time left in that step
+        plus every step after it can never exceed this function's own
+        worst-case sum, since elapsed time within a step only shrinks what
+        is left of it and no step is ever skipped by an extra cancellation -
+        a second, later call to this same function (passed whatever time
+        remains in its caller's own budget, however small) is therefore
+        still making genuine progress, not just repeating a no-op. See
+        app/main.py's shutdown sequence, which relies on exactly that for
+        its own bounded second attempt after a task survives the outer
+        SHUTDOWN_DRAIN_BUDGET_S ceiling once.
 
         Looked up fresh on each call (rather than bound as a literal
-        default) so tests can monkeypatch DEFAULT_INGEST_WAIT_TIMEOUT_S the
-        same way they do elsewhere.
+        default) so tests can monkeypatch DEFAULT_INGEST_WAIT_TIMEOUT_S and
+        STATUS_LOOKUP_TIMEOUT_S the same way they do elsewhere.
         """
         if timeout is None:
-            timeout = 4 * DEFAULT_INGEST_WAIT_TIMEOUT_S
+            timeout = DEFAULT_INGEST_WAIT_TIMEOUT_S + 4 * STATUS_LOOKUP_TIMEOUT_S
         pending = [task for task in self.active_tasks.values() if not task.done()]
         if not pending:
             return 0

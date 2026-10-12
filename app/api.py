@@ -204,15 +204,27 @@ async def _release_cancellation_safe(awaitable, op_id: str, description: str, ti
     removing an already-removed reservation/lease/slot is a no-op, not an
     error, so settling on the one in-flight call is enough.
 
-    Bounded by `timeout` (defaulting to DEFAULT_INGEST_WAIT_TIMEOUT_S, looked
-    up fresh on each call so tests can monkeypatch it the same way they do
-    for the ingest wait): the Redis client is created without a socket
-    timeout (see app/storage.py's `aioredis.from_url` call), so a connection
-    that accepts but never answers would otherwise let this loop absorb
-    cancellations forever, pinning the task mid-cleanup so it never
-    unregisters. Giving up after the deadline leaves this release exactly as
-    ambiguous as any other failure case here, falling back on the same TTL
-    expiry already relied on elsewhere.
+    Bounded by `timeout` (defaulting to STATUS_LOOKUP_TIMEOUT_S, looked up
+    fresh on each call so tests can monkeypatch it): the Redis client is
+    created without a socket timeout (see app/storage.py's
+    `aioredis.from_url` call), so a connection that accepts but never
+    answers would otherwise let this loop absorb cancellations forever,
+    pinning the task mid-cleanup so it never unregisters. Every call this
+    helper wraps (release_daily_spend/release_operation_lease/
+    release_concurrency_slot) is the same kind of plain Redis write the
+    status lookups in app/cancellation.py are plain reads of - normally
+    sub-millisecond, bounded here only to guard against that missing socket
+    timeout, not because the call itself is expected to take anywhere close
+    to this long. Reusing DEFAULT_INGEST_WAIT_TIMEOUT_S (tuned for a Brain
+    Memory HTTP call whose own socket timeout can legitimately keep
+    resetting on slow-but-real progress) here would let three of these
+    fast, local Redis writes each separately wait up to that much longer
+    than they ever need to, inflating this task's real worst-case cleanup
+    time for no benefit - see quiesce_tasks() (app/cancellation.py) and
+    SHUTDOWN_DRAIN_BUDGET_S (app/main.py), both of which size their own
+    bounds against that worst case. Giving up after the deadline leaves
+    this release exactly as ambiguous as any other failure case here,
+    falling back on the same TTL expiry already relied on elsewhere.
 
     While waiting, `task` itself is never cancelled by anything in this
     loop - only the outer `wait_for`/`shield` wrapper is, which is what lets
@@ -235,7 +247,7 @@ async def _release_cancellation_safe(awaitable, op_id: str, description: str, ti
     too.
     """
     if timeout is None:
-        timeout = DEFAULT_INGEST_WAIT_TIMEOUT_S
+        timeout = STATUS_LOOKUP_TIMEOUT_S
     task = asyncio.ensure_future(awaitable)
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout

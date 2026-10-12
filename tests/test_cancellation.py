@@ -510,40 +510,44 @@ async def test_quiesce_tasks_returns_zero_when_idle():
 
 
 @pytest.mark.anyio
-async def test_quiesce_tasks_default_timeout_tracks_four_times_the_ingest_constant(monkeypatch):
+async def test_quiesce_tasks_default_timeout_tracks_ingest_plus_four_release_steps(monkeypatch):
     """A flat 5s default here is shorter than a single bounded cleanup step
-    (DEFAULT_INGEST_WAIT_TIMEOUT_S = 6s), let alone the three such steps
-    background_research_task's own `finally` block (app/api.py) can run
-    through serially on either path it takes - ingest, lease, concurrency
-    slot on success, or spend, lease, concurrency slot on failure/
-    cancellation. Shutdown could call quiesce_tasks(), get back control
-    after its timeout, and go on to drain ingests and close storage
+    (DEFAULT_INGEST_WAIT_TIMEOUT_S = 6s), let alone that step plus the three
+    release steps background_research_task's own `finally` block
+    (app/api.py) can run through serially after it on either path it takes
+    - lease, concurrency slot on success, or spend, lease, concurrency slot
+    on failure/cancellation. Shutdown could call quiesce_tasks(), get back
+    control after its timeout, and go on to drain ingests and close storage
     connections while a task was still mid-cleanup - abandoning its
     owner-lease/concurrency-slot/spend-hold release exactly as this cleanup
     path otherwise protects for the outcome ingest.
 
-    The default is 4x that per-step bound, not exactly 3x: this wait's own
-    deadline starts counting before each task's own cancellation is
-    actually delivered and its cleanup loop computes its own three per-step
-    deadlines, and scheduling/logging overhead across three sequential
-    waits adds more on top of that - so a flat 3x multiple leaves zero
-    margin against both effects, and real headroom (a fourth step's worth)
+    Only the ingest wait is bounded by DEFAULT_INGEST_WAIT_TIMEOUT_S; the
+    three release steps are each bounded by the much smaller
+    STATUS_LOOKUP_TIMEOUT_S (see its own comment in app/cancellation.py -
+    they are plain Redis writes, not HTTP calls, so they do not need the
+    ingest wait's larger allowance). The default here is that real sum plus
+    one extra STATUS_LOOKUP_TIMEOUT_S step of headroom, not exactly the sum
+    itself: this wait's own deadline starts counting before each task's own
+    cancellation is actually delivered and its cleanup loop computes its
+    own per-step deadlines, and scheduling/logging overhead across four
+    sequential waits adds more on top of that - so the bare sum leaves zero
+    margin against both effects, and real headroom (one more step's worth)
     is needed to reliably cover a task's full serial cleanup rather than
     racing it almost exactly.
 
     Timing how long quiesce_tasks() takes to return against a task driven
-    through three serial cleanup steps scaled to a tiny monkeypatched
-    DEFAULT_INGEST_WAIT_TIMEOUT_S does not actually discriminate this
-    relationship: a total of ~0.12s fits comfortably within both the new
-    default and the old flat 5.0s default it should catch a regression of,
-    so it would pass unchanged either way and prove nothing - reproducible
-    standalone with a fixed timeout=5.0, yielding the identical
-    done=True/steps=3 result. Racing real elapsed time against a 5-second
-    baseline isn't practical at test speed, so this instead spies on the
-    exact timeout value quiesce_tasks() passes to asyncio.wait() and
-    asserts it against the monkeypatched constant directly - deterministic,
-    fast, and immune to how long any task's own cleanup happens to take."""
-    monkeypatch.setattr(cancellation, "DEFAULT_INGEST_WAIT_TIMEOUT_S", 0.05)
+    through its serial cleanup steps scaled to tiny monkeypatched constants
+    does not actually discriminate this relationship: a short total elapsed
+    time fits comfortably within both the correct default and a regressed
+    flat one, so it would pass unchanged either way and prove nothing.
+    Racing real elapsed time against a multi-second baseline isn't
+    practical at test speed either, so this instead spies on the exact
+    timeout value quiesce_tasks() passes to asyncio.wait() and asserts it
+    against the monkeypatched constants directly - deterministic, fast, and
+    immune to how long any task's own cleanup happens to take."""
+    monkeypatch.setattr(cancellation, "DEFAULT_INGEST_WAIT_TIMEOUT_S", 0.1)
+    monkeypatch.setattr(cancellation, "STATUS_LOOKUP_TIMEOUT_S", 0.02)
 
     captured = {}
     real_wait = asyncio.wait
@@ -567,8 +571,9 @@ async def test_quiesce_tasks_default_timeout_tracks_four_times_the_ingest_consta
 
     await manager.quiesce_tasks()
 
-    assert captured["timeout"] == pytest.approx(0.2), (
-        "quiesce_tasks()'s default must track 4x DEFAULT_INGEST_WAIT_TIMEOUT_S "
-        f"(0.2 here), not a flat number unrelated to it - got {captured.get('timeout')!r}"
+    assert captured["timeout"] == pytest.approx(0.18), (
+        "quiesce_tasks()'s default must track DEFAULT_INGEST_WAIT_TIMEOUT_S + "
+        "4 * STATUS_LOOKUP_TIMEOUT_S (0.18 here), not a flat number or a multiple "
+        f"of only one of the two constants - got {captured.get('timeout')!r}"
     )
 
