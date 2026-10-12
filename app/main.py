@@ -11,7 +11,7 @@ from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from app.config import auth_is_configured, settings, unauthenticated_docs_allowed
 from app.storage import storage, StorageUnavailable
 from app.cancellation import cancellation_manager
-from app.researcher_adapter import flush_pending_ingest_tasks
+from app.researcher_adapter import flush_pending_ingest_tasks, DEFAULT_INGEST_WAIT_TIMEOUT_S
 from app.api import router
 from app.grafana_observability import ObserveASGI, emitter, emit as emit_observability
 
@@ -107,22 +107,31 @@ async def lifespan(app: FastAPI):
         await asyncio.wait_for(_drain_in_flight_work(), timeout=SHUTDOWN_DRAIN_BUDGET_S)
     except asyncio.TimeoutError:
         logger.warning(
-            "Shutdown drain did not finish within %.1fs; proceeding with teardown anyway.",
+            "Shutdown drain did not finish within %.1fs; giving any still-running task one bounded extra chance to settle.",
             SHUTDOWN_DRAIN_BUDGET_S,
         )
         # quiesce_tasks() already cancelled every task it found once, but
         # asyncio.wait() does not cancel its own members just because the
-        # wait around it was cancelled - so a task whose own cleanup is
-        # still running when the budget above expires is still running
-        # now, with nothing further having asked it to stop. Re-cancel
-        # anything still registered here, in this function's own code,
-        # rather than relying on whatever the ASGI server or interpreter
-        # does with leftover tasks during its own teardown afterward -
-        # that is not something this function should depend on to make
-        # its own best effort bounded.
-        for leftover_task in list(cancellation_manager.active_tasks.values()):
-            if not leftover_task.done():
-                leftover_task.cancel()
+        # wait around it was cancelled - a task whose own cleanup is still
+        # running when the budget above expires has therefore only ever
+        # been cancelled that once, and merely re-cancelling it without
+        # also awaiting it would return from this function while that
+        # cleanup might still be genuinely, briefly in flight (its own
+        # per-step deadline can still have a little real time left even
+        # after this outer ceiling gives up). Calling quiesce_tasks()
+        # again - it re-cancels and awaits in one step, which is exactly
+        # what is needed here too - bounded to one more step's worth of
+        # time (DEFAULT_INGEST_WAIT_TIMEOUT_S) rather than its own full
+        # default, adds at most that much to the total (20s + 6s = 26s),
+        # still with real margin under the platform's assumed 30s grace
+        # period, instead of granting an unbounded or repeated extension.
+        # flush_pending_ingest_tasks() does not get a second bounded pass
+        # here: its own ingest is the one thing each task's cleanup above
+        # already treats as best-effort and optional, unlike the owner
+        # lease and concurrency slot quiesce_tasks() itself protects, so
+        # losing it only in this already-degraded double-timeout case is
+        # the smaller, already-accepted loss.
+        await cancellation_manager.quiesce_tasks(timeout=DEFAULT_INGEST_WAIT_TIMEOUT_S)
     await cancellation_manager.shutdown()
     logger.info("Shutting down storage backend connections...")
 

@@ -78,25 +78,29 @@ async def test_shutdown_drain_is_bounded_so_a_stuck_task_cannot_block_teardown(m
 
 @pytest.mark.timeout(2)
 @pytest.mark.anyio
-async def test_shutdown_re_cancels_a_task_still_running_after_the_budget_expires(monkeypatch):
+async def test_shutdown_awaits_a_task_still_running_after_the_budget_expires(monkeypatch):
     """quiesce_tasks() cancels every registered task exactly once, before
     its own (much larger) wait begins; asyncio.wait() does not cancel its
     members just because the wait around it is later cancelled by the
     outer SHUTDOWN_DRAIN_BUDGET_S ceiling. A task still running when that
     ceiling expires has therefore only ever been cancelled once, with
-    nothing further asking it to stop - whatever happens to it afterward
-    (the ASGI server's own teardown, or just the process exiting) is then
-    outside this function's control. Re-cancelling it explicitly here, in
-    this function's own code, removes that dependency entirely.
+    nothing further asking it to stop. Merely re-cancelling it without
+    also awaiting it would let this function return while that task's own
+    cleanup might still be genuinely, briefly in flight - its own per-step
+    deadline can still have a little real time left even after this outer
+    ceiling gives up - leaving whatever happens next (the ASGI server's
+    own teardown, or just the process exiting) outside this function's
+    control. Calling quiesce_tasks() again, bounded to a short fixed
+    extra step rather than an unbounded or repeated extension, both
+    re-cancels and actually awaits it.
 
     The registered task resists its first cancellation (standing in for a
     cancellation-safe cleanup step genuinely still in flight) and only
-    actually finishes on a second one, which must arrive before this
-    function returns."""
+    actually finishes on a second one, which must both arrive and be
+    awaited to completion before this function returns."""
     monkeypatch.setattr(main_module, "SHUTDOWN_DRAIN_BUDGET_S", 0.1)
 
     started = asyncio.Event()
-    finished = asyncio.Event()
     cancellations_received = 0
 
     async def finishes_only_on_its_second_cancellation():
@@ -109,7 +113,6 @@ async def test_shutdown_re_cancels_a_task_still_running_after_the_budget_expires
                 cancellations_received += 1
                 if cancellations_received < 2:
                     continue
-                finished.set()
                 raise
 
     task = None
@@ -119,11 +122,15 @@ async def test_shutdown_re_cancels_a_task_still_running_after_the_budget_expires
             cancellation_manager.register_task("op-needs-second-cancel", task)
             await started.wait()
 
-        await asyncio.wait_for(finished.wait(), timeout=1.0)
-        assert cancellations_received == 2, (
-            "a task still running when the shutdown budget expires must be re-cancelled, "
-            "not left to whatever happens to it outside this function's control"
+        # Checked immediately on exiting lifespan's shutdown phase, not
+        # after an additional grace wait: this is what distinguishes
+        # actually awaiting the task from merely firing a second
+        # cancellation at it and returning regardless.
+        assert task.done(), (
+            "a task still running when the shutdown budget expires must be awaited to completion, "
+            "not just re-cancelled and left running past this function's own return"
         )
+        assert cancellations_received == 2
     finally:
         if task is not None and not task.done():
             task.cancel()
