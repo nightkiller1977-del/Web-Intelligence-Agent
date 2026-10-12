@@ -1549,14 +1549,21 @@ async def test_cancel_refuses_already_terminal_operation(monkeypatch):
 
 
 @pytest.mark.anyio
-async def test_cancel_endpoint_returns_503_when_its_own_fallback_lookup_fails(monkeypatch):
+async def test_cancel_endpoint_reports_unknown_when_its_own_fallback_lookup_fails(monkeypatch):
     """cancel_task() itself already bounds its own status lookups against
     a hung or failing Redis read (app/cancellation.py), but /cancel's own
     fallback - called after cancel_task() reports it could not act, here
     because no task is registered for this op_id - reads storage again
     directly. That read needs the same protection: a storage outage that
     correctly made cancel_task() report failure would otherwise just hang
-    or raise unhandled right here instead, one call later."""
+    or raise unhandled right here instead, one call later.
+
+    Reports a 200 with status "unknown" rather than a 5xx: in the likely
+    case this is reached via a *local* cancel whose own post-cancel lookup
+    also failed, task.cancel() already ran and was awaited successfully
+    in-process - only confirming that against storage failed - so a
+    server-error response would misrepresent a request that was actually
+    handled."""
 
     async def fails(op_id):
         raise ConnectionError("connection reset by peer")
@@ -1569,7 +1576,55 @@ async def test_cancel_endpoint_returns_503_when_its_own_fallback_lookup_fails(mo
             "/v1/research/op-no-such-task/cancel", headers=_auth_headers()
         )
 
-    assert response.status_code == 503
+    assert response.status_code == 200
+    assert response.json() == {"operationId": "op-no-such-task", "status": "unknown"}
+
+
+@pytest.mark.anyio
+async def test_cancel_reports_unknown_not_an_error_for_a_real_cancellation_that_cannot_be_confirmed(monkeypatch):
+    """The actual case the previous test's double-lookup-failure path is
+    reached for in practice: a genuinely running, locally-owned task
+    really was cancelled - task.cancel() ran and was awaited successfully,
+    in-process - but confirming that against storage failed for the whole
+    request (a Redis blip spanning both cancel_task()'s own post-check and
+    this endpoint's own fallback). This must not be reported as a 5xx:
+    the cancellation itself was actually performed, only its storage
+    confirmation is what is unavailable."""
+    started = asyncio.Event()
+    cancelled_seen = asyncio.Event()
+
+    async def fake_conduct_web_research(**kwargs):
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled_seen.set()
+            raise
+
+    monkeypatch.setattr(api, "conduct_web_research", fake_conduct_web_research)
+    operation_id = "op-cancel-unconfirmable"
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(
+            "/v1/research", json=_payload(operation_id), headers=_auth_headers()
+        )
+        assert response.status_code == 202
+        await asyncio.wait_for(started.wait(), timeout=2)
+
+        async def fails(op_id):
+            raise ConnectionError("connection reset by peer")
+
+        monkeypatch.setattr(api.storage, "get_operation", fails)
+
+        cancel_response = await client.post(
+            f"/v1/research/{operation_id}/cancel", headers=_auth_headers()
+        )
+
+        await asyncio.wait_for(cancelled_seen.wait(), timeout=2)
+
+    assert cancel_response.status_code == 200
+    assert cancel_response.json() == {"operationId": operation_id, "status": "unknown"}
 
 
 def _completed_result(op_id, **overrides):

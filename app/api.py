@@ -844,8 +844,16 @@ async def cancel_research(operation_id: str):
         try:
             op = await asyncio.wait_for(storage.get_operation(operation_id), timeout=STATUS_LOOKUP_TIMEOUT_S)
         except Exception:
+            # A 5xx here would claim the *request* failed, but a local
+            # cancel_task() call that reaches this branch for the same
+            # reason (its own post-cancel lookup also failing) has, in the
+            # likely case, already run task.cancel() and awaited it
+            # successfully in-process - only confirming that against
+            # storage failed. Reporting "unknown" rather than a server
+            # error keeps that distinction: the request was handled, the
+            # outcome just cannot be confirmed right now.
             logger.warning("Failed to look up status for operation %s after cancel attempt.", operation_id, exc_info=True)
-            raise HTTPException(status_code=503, detail="Could not determine operation status; storage is unavailable")
+            return {"operationId": operation_id, "status": "unknown"}
         if op:
             return {"operationId": operation_id, "status": op.get("status")}
         raise HTTPException(status_code=404, detail="Operation task not running or found")
