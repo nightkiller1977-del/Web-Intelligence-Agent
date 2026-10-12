@@ -110,6 +110,19 @@ async def lifespan(app: FastAPI):
             "Shutdown drain did not finish within %.1fs; proceeding with teardown anyway.",
             SHUTDOWN_DRAIN_BUDGET_S,
         )
+        # quiesce_tasks() already cancelled every task it found once, but
+        # asyncio.wait() does not cancel its own members just because the
+        # wait around it was cancelled - so a task whose own cleanup is
+        # still running when the budget above expires is still running
+        # now, with nothing further having asked it to stop. Re-cancel
+        # anything still registered here, in this function's own code,
+        # rather than relying on whatever the ASGI server or interpreter
+        # does with leftover tasks during its own teardown afterward -
+        # that is not something this function should depend on to make
+        # its own best effort bounded.
+        for leftover_task in list(cancellation_manager.active_tasks.values()):
+            if not leftover_task.done():
+                leftover_task.cancel()
     await cancellation_manager.shutdown()
     logger.info("Shutting down storage backend connections...")
 

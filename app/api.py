@@ -16,7 +16,7 @@ from app.config import (
 )
 from app.storage import storage
 from app.schemas import ResearchRequestInput, ResearchResultResponse, CapabilitiesInfo
-from app.cancellation import cancellation_manager
+from app.cancellation import cancellation_manager, STATUS_LOOKUP_TIMEOUT_S
 from app.progress_adapter import ProgressReporter
 from app.researcher_adapter import conduct_web_research, _LeaseLostError, schedule_outcome_ingest_task, DEFAULT_INGEST_WAIT_TIMEOUT_S
 from app.security import is_gateway_destination_allowed, is_safe_url
@@ -836,8 +836,16 @@ async def get_research_result(operation_id: str):
 async def cancel_research(operation_id: str):
     success = await cancellation_manager.cancel_task(operation_id, storage.get_operation)
     if not success:
-        # Check if operation was already finalized
-        op = await storage.get_operation(operation_id)
+        # Check if operation was already finalized. cancel_task() itself
+        # already bounds its own lookups against a hung/failing Redis read
+        # (app/cancellation.py); this fallback lookup needs the same bound,
+        # or a storage outage that made cancel_task() correctly report
+        # "cannot confirm" would just hang again right here instead.
+        try:
+            op = await asyncio.wait_for(storage.get_operation(operation_id), timeout=STATUS_LOOKUP_TIMEOUT_S)
+        except Exception:
+            logger.warning("Failed to look up status for operation %s after cancel attempt.", operation_id, exc_info=True)
+            raise HTTPException(status_code=503, detail="Could not determine operation status; storage is unavailable")
         if op:
             return {"operationId": operation_id, "status": op.get("status")}
         raise HTTPException(status_code=404, detail="Operation task not running or found")

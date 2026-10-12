@@ -10,6 +10,16 @@ logger = logging.getLogger("web-intelligence")
 CANCEL_CHANNEL = "research:cancel"
 TERMINAL_STATUSES = {"completed", "partial", "failed", "cancelled"}
 
+# Bounds the operation_lookup() calls in cancel_task() below (and, for the
+# same reason, the /cancel endpoint's own fallback lookup in app/api.py).
+# A plain Redis HGET normally returns in milliseconds, so this is
+# deliberately its own, much smaller constant rather than reusing
+# DEFAULT_INGEST_WAIT_TIMEOUT_S (6s, tuned for a Brain Memory HTTP call) -
+# that constant is unrelated to how long a status check should ever
+# legitimately take, and reusing it would let a future retune of the
+# ingest wait silently change how long a /cancel request can stall.
+STATUS_LOOKUP_TIMEOUT_S = 1.0
+
 
 class CancellationManager:
     def __init__(self):
@@ -77,14 +87,24 @@ class CancellationManager:
             # already owns needs nothing from Redis at all. A hung status
             # check must never be the reason a cancel request for your own
             # task never reaches task.cancel(); on timeout, proceed exactly
-            # as if the lookup had found nothing to refuse on.
+            # as if the lookup had found nothing to refuse on. A hang is not
+            # the only way this can fail, either: a fast connection/reset
+            # error from Redis must get the same fallback, not propagate
+            # out of cancel_task() uncaught and keep task.cancel() from
+            # ever running at all.
             if operation_lookup:
                 try:
-                    op = await asyncio.wait_for(operation_lookup(op_id), timeout=DEFAULT_INGEST_WAIT_TIMEOUT_S)
+                    op = await asyncio.wait_for(operation_lookup(op_id), timeout=STATUS_LOOKUP_TIMEOUT_S)
                 except asyncio.TimeoutError:
                     logger.warning(
                         "Timed out checking stored status before cancelling operation %s; proceeding with cancellation.",
                         op_id
+                    )
+                    op = None
+                except Exception:
+                    logger.warning(
+                        "Failed to check stored status before cancelling operation %s; proceeding with cancellation.",
+                        op_id, exc_info=True
                     )
                     op = None
                 if op and op.get("status") in TERMINAL_STATUSES:
@@ -138,22 +158,33 @@ class CancellationManager:
             # ownership without it, and the real state belongs to whoever
             # wrote (or will write) that status.
             #
-            # Bounded for the same reason the pre-cancel check above is: the
-            # cancellation itself already happened (or didn't need to,
-            # task.cancel() having raced past a task that already finished)
-            # by this point, purely in-process - a hung Redis read here must
-            # not turn a cancel this replica actually carried out into a
-            # hang. On timeout, fall back to reporting what we're actually
-            # sure of: the local task was cancelled and awaited.
+            # Bounded for the same reason the pre-cancel check above is: a
+            # hung or failing Redis read here must not block this response
+            # the way it must not block task.cancel() itself above. But
+            # unlike the pre-check, a failure here cannot fall back to
+            # "proceed" - the action is already done; all that is left is
+            # what to report, and claiming "cancelled" without being able
+            # to confirm it risks exactly the spurious flip the check above
+            # exists to prevent, for an operation that may already be
+            # durably completed/partial/failed. So a failure here reports
+            # failure outward too (False) rather than guessing success -
+            # the caller (app/api.py's /cancel endpoint) then falls back to
+            # its own bounded status lookup instead of trusting a guess.
             if operation_lookup:
                 try:
-                    op = await asyncio.wait_for(operation_lookup(op_id), timeout=DEFAULT_INGEST_WAIT_TIMEOUT_S)
+                    op = await asyncio.wait_for(operation_lookup(op_id), timeout=STATUS_LOOKUP_TIMEOUT_S)
                 except asyncio.TimeoutError:
                     logger.warning(
-                        "Timed out checking stored status after cancelling operation %s; reporting cancelled based on the local task alone.",
+                        "Timed out checking stored status after cancelling operation %s; cannot confirm it took effect.",
                         op_id
                     )
-                    op = None
+                    return False
+                except Exception:
+                    logger.warning(
+                        "Failed to check stored status after cancelling operation %s; cannot confirm it took effect.",
+                        op_id, exc_info=True
+                    )
+                    return False
                 if op and op.get("status") != "cancelled":
                     logger.info(
                         "Operation %s is %s (not cancelled) after awaiting its task; reporting that instead",
@@ -178,11 +209,16 @@ class CancellationManager:
             # dropping a cancel request because Redis happened to be slow.
             if operation_lookup:
                 try:
-                    op = await asyncio.wait_for(operation_lookup(op_id), timeout=DEFAULT_INGEST_WAIT_TIMEOUT_S)
+                    op = await asyncio.wait_for(operation_lookup(op_id), timeout=STATUS_LOOKUP_TIMEOUT_S)
                 except asyncio.TimeoutError:
                     logger.warning(
                         "Timed out checking stored status before broadcasting cancel for operation %s; broadcasting anyway.",
                         op_id
+                    )
+                except Exception:
+                    logger.warning(
+                        "Failed to check stored status before broadcasting cancel for operation %s; broadcasting anyway.",
+                        op_id, exc_info=True
                     )
                 else:
                     if not op:

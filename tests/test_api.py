@@ -1548,6 +1548,30 @@ async def test_cancel_refuses_already_terminal_operation(monkeypatch):
     assert cancel_response.json() == {"operationId": operation_id, "status": "completed"}
 
 
+@pytest.mark.anyio
+async def test_cancel_endpoint_returns_503_when_its_own_fallback_lookup_fails(monkeypatch):
+    """cancel_task() itself already bounds its own status lookups against
+    a hung or failing Redis read (app/cancellation.py), but /cancel's own
+    fallback - called after cancel_task() reports it could not act, here
+    because no task is registered for this op_id - reads storage again
+    directly. That read needs the same protection: a storage outage that
+    correctly made cancel_task() report failure would otherwise just hang
+    or raise unhandled right here instead, one call later."""
+
+    async def fails(op_id):
+        raise ConnectionError("connection reset by peer")
+
+    monkeypatch.setattr(api.storage, "get_operation", fails)
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(
+            "/v1/research/op-no-such-task/cancel", headers=_auth_headers()
+        )
+
+    assert response.status_code == 503
+
+
 def _completed_result(op_id, **overrides):
     result = {
         "operationId": op_id,

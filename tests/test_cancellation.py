@@ -269,47 +269,106 @@ async def test_local_cancel_proceeds_when_the_pre_check_status_lookup_hangs(monk
     bounds that lookup and, on timeout, proceeds exactly as if nothing was
     found to refuse on.
 
-    Monkeypatches DEFAULT_INGEST_WAIT_TIMEOUT_S (the shared bound) to a tiny
-    value and makes operation_lookup never finish on its own, so the test
-    is fast and still proves the bound: without the fix, this would hang
-    rather than merely run slowly (the class 2s timeout above is the
-    backstop in case something regresses the fix entirely)."""
-    monkeypatch.setattr(cancellation, "DEFAULT_INGEST_WAIT_TIMEOUT_S", 0.05)
+    Monkeypatches STATUS_LOOKUP_TIMEOUT_S (the dedicated, small bound this
+    lookup uses) to a tiny value and makes operation_lookup never finish on
+    its own, so the test is fast and still proves the bound: without the
+    fix, this would hang rather than merely run slowly (the class 2s
+    timeout above is the backstop in case something regresses the fix
+    entirely)."""
+    monkeypatch.setattr(cancellation, "STATUS_LOOKUP_TIMEOUT_S", 0.05)
     manager = CancellationManager()
 
     started = asyncio.Event()
-    was_cancelled = asyncio.Event()
+    stored_status = {"value": "running"}
 
     async def long_running_work():
         started.set()
         try:
             await asyncio.Event().wait()
         except asyncio.CancelledError:
-            was_cancelled.set()
+            # Mirrors background_research_task's own handler, which
+            # persists "cancelled" before returning.
+            stored_status["value"] = "cancelled"
             raise
 
     task = asyncio.create_task(long_running_work())
     manager.register_task("op-pre-check-hangs", task)
     await started.wait()
 
-    async def hangs_forever(op_id):
-        await asyncio.Event().wait()
+    # Only the first call (the pre-check) hangs; the second (the post-check,
+    # after the real cancellation above) must resolve normally so this test
+    # isolates the pre-check's own fallback rather than also exercising the
+    # post-check's separate one.
+    calls = 0
 
-    result = await manager.cancel_task("op-pre-check-hangs", operation_lookup=hangs_forever)
+    async def lookup(op_id):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            await asyncio.Event().wait()
+        return {"status": stored_status["value"]}
+
+    result = await manager.cancel_task("op-pre-check-hangs", operation_lookup=lookup)
     assert result is True, "a hung pre-cancel status lookup must not prevent a legitimate local cancel"
-    await asyncio.wait_for(was_cancelled.wait(), timeout=1.0)
+    assert stored_status["value"] == "cancelled"
 
 
 @pytest.mark.timeout(2)
 @pytest.mark.anyio
-async def test_local_cancel_reports_success_when_the_post_check_status_lookup_hangs(monkeypatch):
-    """Companion to the pre-check test above: a hung Redis read in the
-    second, post-await status check must not turn a cancel this replica
-    actually carried out - purely in-process, already complete by this
-    point - into a hang either. On timeout, the fix falls back to
-    reporting what it's actually sure of: the local task was cancelled and
-    awaited."""
-    monkeypatch.setattr(cancellation, "DEFAULT_INGEST_WAIT_TIMEOUT_S", 0.05)
+async def test_local_cancel_proceeds_when_the_pre_check_status_lookup_fails_fast(monkeypatch):
+    """Companion to the hang test above: a hang is not the only way this
+    lookup can fail. A fast connection/reset error from Redis must get the
+    same fallback - proceed exactly as if nothing was found to refuse on -
+    not propagate out of cancel_task() uncaught, which would keep
+    task.cancel() from ever running and turn /cancel into a 500 for an
+    operation this replica could have cancelled immediately."""
+    manager = CancellationManager()
+
+    started = asyncio.Event()
+    stored_status = {"value": "running"}
+
+    async def long_running_work():
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            stored_status["value"] = "cancelled"
+            raise
+
+    task = asyncio.create_task(long_running_work())
+    manager.register_task("op-pre-check-fails-fast", task)
+    await started.wait()
+
+    # Only the first call (the pre-check) fails; the second (the
+    # post-check) must resolve normally so this test isolates the
+    # pre-check's own fallback, same reasoning as the hang test above.
+    calls = 0
+
+    async def lookup(op_id):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise ConnectionError("connection reset by peer")
+        return {"status": stored_status["value"]}
+
+    result = await manager.cancel_task("op-pre-check-fails-fast", operation_lookup=lookup)
+    assert result is True, "a fast-failing pre-cancel status lookup must not prevent a legitimate local cancel"
+    assert stored_status["value"] == "cancelled"
+
+
+@pytest.mark.timeout(2)
+@pytest.mark.anyio
+async def test_local_cancel_reports_failure_when_the_post_check_status_lookup_hangs(monkeypatch):
+    """Companion to the pre-check test above, but with the opposite
+    fallback: a hung Redis read in the second, post-await status check
+    cannot fall back to "proceed" the way the pre-check can, because the
+    cancellation has already happened by this point - all that is left is
+    what to report. Claiming "cancelled" without being able to confirm it
+    risks the exact spurious flip the whole terminal-status check exists
+    to prevent, for an operation that may already be durably completed.
+    The fix reports failure outward instead of guessing success, so the
+    caller (the /cancel endpoint) falls back to its own bounded lookup."""
+    monkeypatch.setattr(cancellation, "STATUS_LOOKUP_TIMEOUT_S", 0.05)
     manager = CancellationManager()
 
     started = asyncio.Event()
@@ -326,8 +385,35 @@ async def test_local_cancel_reports_success_when_the_post_check_status_lookup_ha
         await asyncio.Event().wait()
 
     result = await manager.cancel_task("op-post-check-hangs", operation_lookup=hangs_forever)
-    assert result is True, (
-        "a hung post-cancel status lookup must not turn a completed local cancellation into a failure"
+    assert result is False, (
+        "a hung post-cancel status lookup must not be reported as a confirmed cancellation"
+    )
+
+
+@pytest.mark.timeout(2)
+@pytest.mark.anyio
+async def test_local_cancel_reports_failure_when_the_post_check_status_lookup_fails_fast(monkeypatch):
+    """Companion to the hang test above: a fast connection/reset error in
+    the post-check lookup must get the same fallback (report failure, not
+    a guessed success) rather than propagate out of cancel_task() uncaught."""
+    manager = CancellationManager()
+
+    started = asyncio.Event()
+
+    async def long_running_work():
+        started.set()
+        await asyncio.Event().wait()
+
+    task = asyncio.create_task(long_running_work())
+    manager.register_task("op-post-check-fails-fast", task)
+    await started.wait()
+
+    async def fails_fast(op_id):
+        raise ConnectionError("connection reset by peer")
+
+    result = await manager.cancel_task("op-post-check-fails-fast", operation_lookup=fails_fast)
+    assert result is False, (
+        "a fast-failing post-cancel status lookup must not be reported as a confirmed cancellation"
     )
 
 
@@ -341,7 +427,7 @@ async def test_cross_instance_cancel_broadcasts_when_the_status_lookup_hangs(mon
     the refusal and broadcasts anyway: this instance has no task of its own
     at stake, and a redundant broadcast is harmless, unlike silently
     dropping a cancel request because Redis happened to be slow."""
-    monkeypatch.setattr(cancellation, "DEFAULT_INGEST_WAIT_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(cancellation, "STATUS_LOOKUP_TIMEOUT_S", 0.05)
     fake_redis = fakeredis_aioredis.FakeRedis(decode_responses=True)
     manager = CancellationManager()
     await manager.init(fake_redis)
@@ -352,6 +438,27 @@ async def test_cross_instance_cancel_broadcasts_when_the_status_lookup_hangs(mon
 
         result = await manager.cancel_task("op-cross-instance-lookup-hangs", operation_lookup=hangs_forever)
         assert result is True, "a hung pre-broadcast status lookup must not prevent the cross-instance broadcast"
+    finally:
+        await manager.shutdown()
+        await fake_redis.aclose()
+
+
+@pytest.mark.timeout(2)
+@pytest.mark.anyio
+async def test_cross_instance_cancel_broadcasts_when_the_status_lookup_fails_fast(monkeypatch):
+    """Companion to the hang test above: a fast connection/reset error
+    before broadcasting must get the same fallback (broadcast anyway)
+    rather than propagate out of cancel_task() uncaught."""
+    fake_redis = fakeredis_aioredis.FakeRedis(decode_responses=True)
+    manager = CancellationManager()
+    await manager.init(fake_redis)
+
+    try:
+        async def fails_fast(op_id):
+            raise ConnectionError("connection reset by peer")
+
+        result = await manager.cancel_task("op-cross-instance-lookup-fails-fast", operation_lookup=fails_fast)
+        assert result is True, "a fast-failing pre-broadcast status lookup must not prevent the cross-instance broadcast"
     finally:
         await manager.shutdown()
         await fake_redis.aclose()
