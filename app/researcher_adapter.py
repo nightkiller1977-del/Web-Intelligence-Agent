@@ -636,6 +636,15 @@ def append_input_sources(op_id: str, input_chunks: list[dict], sources: list[dic
 
 _pending_ingest_tasks: set = set()
 
+# Each Brain Memory HTTP call bounds its own socket operations (connect, each
+# send/recv) to 5s, which is not a bound on the call's total wall-clock time:
+# a connection that keeps sending some data, slowly, resets that per-operation
+# timeout on every partial read without the overall request ever finishing.
+# Callers that wait on an ingest task bound the wait itself to this, so a
+# stalled-but-still-trickling endpoint cannot hold a lease/concurrency slot or
+# the shutdown drain open indefinitely.
+DEFAULT_INGEST_WAIT_TIMEOUT_S = 6.0
+
 
 def _public_locator(raw: str) -> str:
     """Reduce a source locator to something safe to persist in shared memory.
@@ -883,12 +892,14 @@ def _retained_findings(verified_claims: list, evidence: list, sources: list, all
     return findings, withheld, secret_bearing
 
 
-def _schedule_outcome_ingest(client, result: Dict[str, Any], op_id: str, mode: str, allow_external_inputs: bool = False) -> None:
+def _schedule_outcome_ingest(client, result: Dict[str, Any], op_id: str, mode: str, allow_external_inputs: bool = False) -> asyncio.Task:
     """Persist an optional Brain outcome best-effort, off the critical path.
 
     The task is kept referenced so it is not garbage-collected mid-flight and
     tracked in ``_pending_ingest_tasks`` so tests and shutdown can await an
-    explicit completion signal.
+    explicit completion signal. Also returned directly, so a caller that
+    needs to await only *this* operation's ingest (background_research_task)
+    is not forced through the global set (see flush_pending_ingest_tasks).
     """
     # Count only claims carrying independently extracted source evidence.
     # The report-only fallback in build_structured_findings() manufactures
@@ -916,10 +927,20 @@ def _schedule_outcome_ingest(client, result: Dict[str, Any], op_id: str, mode: s
     ))
     _pending_ingest_tasks.add(task)
     task.add_done_callback(_pending_ingest_tasks.discard)
+    return task
 
 
-async def flush_pending_ingest_tasks(timeout: float = 6.0) -> int:
-    """Await best-effort ingestion tasks. Tests and shutdown call this."""
+async def flush_pending_ingest_tasks(timeout: float = DEFAULT_INGEST_WAIT_TIMEOUT_S) -> int:
+    """Await every outstanding ingest task, across every operation.
+
+    This drains the module-global set, so it is correct for actual shutdown
+    (app/main.py) where nothing else will ever observe these tasks again. It
+    is NOT what a single operation's own completion path should call: that
+    would wait on other concurrent operations' ingests too, holding this
+    operation's lease/concurrency slot for up to `timeout` over work that
+    has nothing to do with it. Use schedule_outcome_ingest_task()'s
+    returned task for that instead.
+    """
     pending = [task for task in _pending_ingest_tasks if not task.done()]
     if not pending:
         return 0
@@ -927,23 +948,23 @@ async def flush_pending_ingest_tasks(timeout: float = 6.0) -> int:
     return len(pending)
 
 
-def schedule_outcome_ingest(result: Dict[str, Any], op_id: str, mode: str, inputs: Dict[str, Any] | None = None) -> bool:
+def schedule_outcome_ingest_task(result: Dict[str, Any], op_id: str, mode: str, inputs: Dict[str, Any] | None = None) -> asyncio.Task | None:
     """Schedule the optional Brain outcome ingest once the result is durable.
 
     Called by the caller after a successful ``storage.save_operation`` so a
     completed/partial research run is never recorded in Brain unless it was
-    persisted. Returns True only when a task was scheduled.
+    persisted. Returns the created task so the caller can await precisely
+    this operation's ingest, or None when nothing was scheduled.
     """
     if result.get("status") not in ("completed", "partial"):
-        return False
+        return None
     client = brain_memory_client()
     if not client:
-        return False
+        return None
     # Consent is read from the request's own inputs, not from the result:
     # the result never carried the flag, which is how local passages reached
     # retention unchecked in the first place.
-    _schedule_outcome_ingest(client, result, op_id, mode, (inputs or {}).get("allowExternalUse") is True)
-    return True
+    return _schedule_outcome_ingest(client, result, op_id, mode, (inputs or {}).get("allowExternalUse") is True)
 
 
 async def conduct_web_research(
@@ -1071,8 +1092,9 @@ async def conduct_web_research(
         )
     # Outcome ingestion is intentionally NOT scheduled here. The caller
     # (app/api.py background_research_task) persists the result durably first
-    # and only then calls schedule_outcome_ingest(), so Brain can never record a
-    # completed/partial outcome for a result that was never durably stored.
+    # and only then calls schedule_outcome_ingest_task(), so Brain can never
+    # record a completed/partial outcome for a result that was never durably
+    # stored.
     return result
 
 async def _run_research(env_manager, callbacks, reporter, op_id, query, display_query, mode, profile, report_type, max_duration, max_searches, max_pages, max_sources, max_memory, query_domains, limits, require_claim_verification, headers, input_chunks, input_limitations, start_time):

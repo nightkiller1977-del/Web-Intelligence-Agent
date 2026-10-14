@@ -654,7 +654,7 @@ async def test_schedule_outcome_ingest_runs_only_after_durable_save(monkeypatch)
         ],
     }
 
-    assert researcher_adapter.schedule_outcome_ingest(result, "test-op", "standard") is True
+    assert researcher_adapter.schedule_outcome_ingest_task(result, "test-op", "standard") is not None
     assert await researcher_adapter.flush_pending_ingest_tasks() == 1
     # Only the independently evidenced claim is retained as knowledge, and it
     # carries the locator of the source its evidence came from.
@@ -690,7 +690,7 @@ async def test_schedule_outcome_ingest_reads_consent_from_the_request_inputs(mon
 
     withheld_spy = BrainMemorySpy()
     monkeypatch.setattr(researcher_adapter, "brain_memory_client", lambda: withheld_spy)
-    assert researcher_adapter.schedule_outcome_ingest(result, "test-op", "standard") is True
+    assert researcher_adapter.schedule_outcome_ingest_task(result, "test-op", "standard") is not None
     await researcher_adapter.flush_pending_ingest_tasks()
     assert withheld_spy.ingested[0]["findings"] == []
     assert withheld_spy.ingested[0]["withheld_findings"] == 1
@@ -701,9 +701,9 @@ async def test_schedule_outcome_ingest_reads_consent_from_the_request_inputs(mon
 
     consented_spy = BrainMemorySpy()
     monkeypatch.setattr(researcher_adapter, "brain_memory_client", lambda: consented_spy)
-    assert researcher_adapter.schedule_outcome_ingest(
+    assert researcher_adapter.schedule_outcome_ingest_task(
         result, "test-op", "standard", inputs={"allowExternalUse": True}
-    ) is True
+    ) is not None
     await researcher_adapter.flush_pending_ingest_tasks()
     assert consented_spy.ingested[0]["findings"] == [
         {"text": "a confidential local claim", "url": "", "sourceType": "document"}
@@ -963,11 +963,11 @@ def test_retained_findings_survive_a_malformed_port():
 
 
 @pytest.mark.anyio
-async def test_schedule_outcome_ingest_skips_non_durable_or_disabled(monkeypatch):
+async def test_schedule_outcome_ingest_task_skips_non_durable_or_disabled(monkeypatch):
     monkeypatch.setattr(researcher_adapter, "brain_memory_client", lambda: None)
-    assert researcher_adapter.schedule_outcome_ingest({"status": "completed"}, "op", "standard") is False
-    assert researcher_adapter.schedule_outcome_ingest({"status": "failed"}, "op", "standard") is False
-    assert researcher_adapter.schedule_outcome_ingest({"status": "cancelled"}, "op", "standard") is False
+    assert researcher_adapter.schedule_outcome_ingest_task({"status": "completed"}, "op", "standard") is None
+    assert researcher_adapter.schedule_outcome_ingest_task({"status": "failed"}, "op", "standard") is None
+    assert researcher_adapter.schedule_outcome_ingest_task({"status": "cancelled"}, "op", "standard") is None
 
 
 @pytest.mark.anyio
