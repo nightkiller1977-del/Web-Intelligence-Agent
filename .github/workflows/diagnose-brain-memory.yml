@@ -10,6 +10,12 @@ name: Diagnose Brain Memory data flow (read-only)
 on:
   workflow_dispatch: {}
 
+# One run per ref. A superseded run has nothing left to prove, and keeping it
+# alive only delays the run that does.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   id-token: write
   contents: read
